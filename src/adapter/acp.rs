@@ -245,6 +245,7 @@ fn apply_first_class_models(info: &mut DriverInfo, models: &Value) -> bool {
     info.details.config_options.push(ConfigOption {
         id: ConfigId::new("model"),
         name: "Model".into(),
+        category: Some("model".into()),
         kind: ConfigKind::Select { choices },
         current,
         live: true,
@@ -349,6 +350,7 @@ fn apply_session_config(
         info.details.config_options.push(ConfigOption {
             id: ConfigId::new("mode"),
             name: "Mode".into(),
+            category: Some("mode".into()),
             kind: ConfigKind::Select {
                 choices: modes
                     .available_modes
@@ -390,10 +392,24 @@ fn apply_session_config(
         info.details.config_options.push(ConfigOption {
             id: ConfigId::new(option.id.0.as_ref()),
             name: option.name.clone(),
+            category: option.category.as_ref().map(config_category),
             kind,
             current,
             live: true,
         });
+    }
+}
+
+/// The wire category as its canonical string (spec ids, `Other` verbatim).
+fn config_category(category: &acp::SessionConfigOptionCategory) -> String {
+    use acp::SessionConfigOptionCategory as C;
+    match category {
+        C::Mode => "mode".into(),
+        C::Model => "model".into(),
+        C::ModelConfig => "model_config".into(),
+        C::ThoughtLevel => "thought_level".into(),
+        C::Other(other) => other.clone(),
+        _ => "other".into(),
     }
 }
 

@@ -288,6 +288,10 @@ impl Capabilities {
 pub struct ConfigOption {
     pub id: ConfigId,
     pub name: String,
+    /// The wire's semantic category ("mode", "model", "thought_level", …) —
+    /// how apps route options without guessing from ids. `None` when the
+    /// agent doesn't say.
+    pub category: Option<String>,
     pub kind: ConfigKind,
     pub current: Option<ConfigValue>,
     /// `false` means creation-only: set it with `SessionOptions::configure`.

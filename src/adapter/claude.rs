@@ -220,6 +220,7 @@ fn effort_option(models: &Value, model: &str, configured: Option<String>) -> Opt
     (!choices.is_empty()).then(|| ConfigOption {
         id: ConfigId::new("effort"),
         name: "Reasoning effort".into(),
+        category: Some("thought_level".into()),
         kind: ConfigKind::Select { choices },
         // `None`: the CLI keeps its own default and never reports it.
         current: configured.map(ConfigValue::Text),
@@ -285,6 +286,7 @@ fn driver_info(init: &Value, version: Option<String>, request: &ConnectRequest) 
     let mode_option = ConfigOption {
         id: ConfigId::new("mode"),
         name: "Permission mode".into(),
+        category: Some("mode".into()),
         kind: ConfigKind::Select {
             choices: ["default", "acceptEdits", "plan", "bypassPermissions"]
                 .map(|value| ConfigChoice {
@@ -303,6 +305,7 @@ fn driver_info(init: &Value, version: Option<String>, request: &ConnectRequest) 
     let model_option = ConfigOption {
         id: ConfigId::new("model"),
         name: "Model".into(),
+        category: Some("model".into()),
         kind: ConfigKind::Select {
             choices: model_choices(&init["models"]),
         },
