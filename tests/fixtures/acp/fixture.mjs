@@ -24,6 +24,9 @@ async function onRequest(m) {
     case 'session/new':
       if (flag('--auth-required')) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32000, message: 'authentication required' } });
       mcpDecl = m.params.mcpServers ?? [];
+      // --grok-models: the first-class models state (no model configOption);
+      // switching must ride session/set_model.
+      if (flag('--grok-models')) return reply({ sessionId: 'sess-1', models: { currentModelId: 'grok-4.5', availableModels: [{ modelId: 'grok-4.5', name: 'Grok 4.5', description: 'fast' }, { modelId: 'grok-4.6', name: 'Grok 4.6' }] } });
       return reply({ sessionId: 'sess-1', modes: { currentModeId: 'default', availableModes: [{ id: 'default', name: 'Default' }, { id: 'plan', name: 'Plan' }] }, configOptions: [{ id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'sonnet', options: [{ value: 'sonnet', name: 'Sonnet' }] }], _meta: { claude: { sessionId: 'uuid-1' } } });
     case 'session/load': return reply({ _meta: { loaded: m.params.sessionId } });
     case 'session/set_mode': {
@@ -31,7 +34,12 @@ async function onRequest(m) {
       return notify(m.params.sessionId, { sessionUpdate: 'current_mode_update', currentModeId: m.params.modeId });
     }
     case 'session/set_config_option':
-      if (m.params.configId !== 'model') return send({ jsonrpc: '2.0', id: m.id, error: { code: -32602, message: `unknown config ${m.params.configId}` } });
+      // Under --grok-models there is no model configOption: only set_model works.
+      if (m.params.configId !== 'model' || flag('--grok-models')) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32602, message: `unknown config ${m.params.configId}` } });
+      return reply({});
+    case 'session/set_model':
+      if (!flag('--grok-models')) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32601, message: 'method not found' } });
+      if (!['grok-4.5', 'grok-4.6'].includes(m.params.modelId)) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32602, message: `unknown model ${m.params.modelId}` } });
       return reply({});
     case 'session/prompt': return runTurn(m);
     case 'session/cancel': if (turn) { turn.cancelled = true; } return;

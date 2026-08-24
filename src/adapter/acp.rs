@@ -62,7 +62,7 @@ impl Adapter for AcpAdapter {
         let mut wire = Wire::over(&mut child);
 
         let handshake = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut wire, &request));
-        let (info, session_id, login) = match handshake.await {
+        let (info, session_id, login, first_class_model) = match handshake.await {
             Ok(Ok(ok)) => ok,
             Ok(Err(e)) => {
                 child.shutdown(CLOSE_GRACE).await;
@@ -91,6 +91,7 @@ impl Adapter for AcpAdapter {
                 prompt_seq: 0,
                 steer_id: None,
                 config: None,
+                first_class_model,
                 login,
             }
             .run(cmd_rx),
@@ -109,7 +110,7 @@ impl Adapter for AcpAdapter {
 async fn handshake(
     wire: &mut Wire,
     request: &ConnectRequest,
-) -> Result<(DriverInfo, String, Vec<LoginMethod>), AgentError> {
+) -> Result<(DriverInfo, String, Vec<LoginMethod>, bool), AgentError> {
     let init = wire
         .roundtrip(
             "initialize",
@@ -144,6 +145,7 @@ async fn handshake(
         .map_err(|e| e.into_error(&init.auth_methods, &request.installation.executable))?;
 
     let mut info = driver_info(&init, &request.installation.auth);
+    let first_class_models = response.get("models").cloned();
     let session_id = if session_id.is_empty() {
         let new: acp::NewSessionResponse = parse(response, "session/new response")?;
         apply_session_config(&mut info, new.modes.as_ref(), new.config_options.as_deref());
@@ -151,11 +153,13 @@ async fn handshake(
     } else {
         session_id
     };
+    let first_class_model =
+        first_class_models.is_some_and(|models| apply_first_class_models(&mut info, &models));
     info.resume_token = Some(ResumeToken::new(&session_id));
     // Creation-time config: apply each requested option before the first
     // turn; a refusal fails the open instead of silently running misconfigured.
     for (id, value) in &request.options.configure {
-        let (method, params) = config_call(&session_id, id, value);
+        let (method, params) = config_call(&session_id, id, value, first_class_model);
         wire.roundtrip(method, params).await.map_err(|e| match e {
             WireError::Rpc { message, .. } => {
                 AgentError::InvalidConfiguration(format!("agent rejected `{id}`: {message}"))
@@ -169,16 +173,26 @@ async fn handshake(
         .iter()
         .filter_map(|m| login_method(m, &request.installation.executable))
         .collect();
-    Ok((info, session_id, login))
+    Ok((info, session_id, login, first_class_model))
 }
 
 /// One config selection as its wire call: the well-known `mode` id maps to
-/// session/set_mode; anything else goes to session/set_config_option.
-fn config_call(session_id: &str, id: &ConfigId, value: &ConfigValue) -> (&'static str, Value) {
+/// session/set_mode, `model` to session/set_model on agents with the
+/// first-class surface (grok), anything else to session/set_config_option.
+fn config_call(
+    session_id: &str,
+    id: &ConfigId,
+    value: &ConfigValue,
+    first_class_model: bool,
+) -> (&'static str, Value) {
     match value {
         ConfigValue::Text(mode) if id.as_str() == "mode" => (
             "session/set_mode",
             json!({ "sessionId": session_id, "modeId": mode }),
+        ),
+        ConfigValue::Text(model) if id.as_str() == "model" && first_class_model => (
+            "session/set_model",
+            json!({ "sessionId": session_id, "modelId": model }),
         ),
         ConfigValue::Text(chosen) => (
             "session/set_config_option",
@@ -189,6 +203,53 @@ fn config_call(session_id: &str, id: &ConfigId, value: &ConfigValue) -> (&'stati
             json!({ "sessionId": session_id, "configId": id.as_str(), "type": "boolean", "value": on }),
         ),
     }
+}
+
+/// Grok's first-class model surface: `session/new` carries
+/// `models: {currentModelId, availableModels}` instead of a config option,
+/// and switching requires `session/set_model`. Not in the typed schema yet,
+/// so it is read raw (shape verified against grok by comet and T3 Code).
+/// Skipped when the agent already advertises a `model` config option.
+fn apply_first_class_models(info: &mut DriverInfo, models: &Value) -> bool {
+    let choices: Vec<ConfigChoice> = models["availableModels"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(|m| {
+                    let id = m["modelId"].as_str()?;
+                    Some(ConfigChoice {
+                        value: id.to_owned(),
+                        label: m["name"].as_str().unwrap_or(id).to_owned(),
+                        description: m["description"].as_str().map(str::to_owned),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let already_advertised = info
+        .details
+        .config_options
+        .iter()
+        .any(|o| o.id.as_str() == "model");
+    if choices.is_empty() || already_advertised {
+        return false;
+    }
+    let current = models["currentModelId"]
+        .as_str()
+        .map(|c| ConfigValue::Text(c.to_owned()));
+    if let Some(current) = &current {
+        info.configuration
+            .options
+            .insert(ConfigId::new("model"), current.clone());
+    }
+    info.details.config_options.push(ConfigOption {
+        id: ConfigId::new("model"),
+        name: "Model".into(),
+        kind: ConfigKind::Select { choices },
+        current,
+        live: true,
+    });
+    true
 }
 
 /// What `initialize` tells us, folded into the engine's vocabulary.
@@ -391,6 +452,9 @@ struct Drive {
     steer_id: Option<u64>,
     /// An in-flight configure: wire id plus the selection to apply on success.
     config: Option<(u64, ConfigId, ConfigValue)>,
+    /// The agent advertises the first-class `models` state (grok): `model`
+    /// selections ride `session/set_model`.
+    first_class_model: bool,
     /// Runnable login methods from `initialize`, for mid-session auth loss.
     login: Vec<LoginMethod>,
 }
@@ -469,7 +533,8 @@ impl Drive {
                 }
             }
             DriverCommand::Configure(ConfigSelection::Option { id, value }) => {
-                let (method, params) = config_call(&self.session_id, &id, &value);
+                let (method, params) =
+                    config_call(&self.session_id, &id, &value, self.first_class_model);
                 let wire_id = self.wire.request(method, params).await?;
                 self.config = Some((wire_id, id, value));
             }

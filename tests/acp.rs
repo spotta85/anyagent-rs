@@ -589,3 +589,39 @@ async fn grok_questions_surface_typed_and_answers_return_labels() {
     // The answer went back keyed by question text, valued by option LABEL.
     assert_eq!(text, r#"q={"Pick a fruit":["Grape"]} "#);
 }
+
+#[tokio::test]
+async fn grok_first_class_models_surface_as_the_model_option_and_switch_via_set_model() {
+    let (session, mut events) = open(&["--grok-models"]).await;
+    let details = session.info().details;
+    let model = details
+        .config_options
+        .iter()
+        .find(|o| o.id.as_str() == "model")
+        .expect("model option from the first-class models state");
+    assert!(model.live);
+    assert_eq!(model.current, Some(ConfigValue::Text("grok-4.5".into())));
+    let anyagent::ConfigKind::Select { choices } = &model.kind else {
+        panic!("expected select");
+    };
+    assert_eq!(choices.len(), 2);
+    assert_eq!(choices[0].label, "Grok 4.5");
+    assert_eq!(choices[0].description.as_deref(), Some("fast"));
+
+    // The fixture rejects session/set_config_option for models under
+    // --grok-models, so this passing proves the session/set_model route.
+    session
+        .configure(ConfigSelection::option("model", "grok-4.6"))
+        .await
+        .unwrap();
+    loop {
+        let event = next(&mut events).await;
+        if let EventKind::SessionUpdated(info) = event.kind {
+            assert_eq!(
+                info.configuration.options.get(&ConfigId::new("model")),
+                Some(&ConfigValue::Text("grok-4.6".into()))
+            );
+            break;
+        }
+    }
+}
