@@ -7,9 +7,10 @@ use std::time::Duration;
 use futures::StreamExt;
 
 use anyagent::{
-    AgentError, AgentInstallation, Answer, Capability, ConfigId, ConfigSelection, ConfigValue,
-    DeliveryKind, Event, EventKind, Events, Input, LoginMethod, McpServer, McpTransport,
-    PermissionChoice, Request, ResumeToken, Runtime, Session, SessionOptions, StopReason,
+    AgentError, AgentInstallation, Answer, Capability, ChoiceId, ConfigId, ConfigSelection,
+    ConfigValue, DeliveryKind, Event, EventKind, Events, Input, LoginMethod, McpServer,
+    McpTransport, PermissionChoice, QuestionAnswer, Request, ResumeToken, Runtime, Session,
+    SessionOptions, StopReason,
 };
 
 fn fixture(extra: &[&str]) -> AgentInstallation {
@@ -511,4 +512,80 @@ async fn creation_time_config_applies_at_open_and_a_refusal_fails_it() {
         panic!("expected InvalidConfiguration");
     };
     assert!(message.contains("bogus"), "got: {message}");
+}
+
+#[tokio::test]
+async fn grok_prompt_complete_ends_a_hung_turn_and_stale_ids_are_ignored() {
+    let (session, mut events) = open(&[]).await;
+    session.prompt("grok-hang").await.unwrap();
+    let mut text = String::new();
+    loop {
+        let event = next(&mut events).await;
+        match event.kind {
+            EventKind::TextDelta { text: t, .. } => text.push_str(&t),
+            EventKind::TurnEnded { stop, .. } => {
+                // The stale frame carried `refusal`; only the frame echoing
+                // our promptId may settle the turn.
+                assert_eq!(
+                    stop,
+                    StopReason::Completed {
+                        source: anyagent::CompletionSource::Protocol
+                    }
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(text, "grok ");
+
+    // The abandoned session/prompt RPC never responds; the session still
+    // runs full turns afterwards.
+    session.prompt("hi").await.unwrap();
+    let mut text = String::new();
+    loop {
+        let event = next(&mut events).await;
+        match event.kind {
+            EventKind::TextDelta { text: t, .. } => text.push_str(&t),
+            EventKind::RequestOpened(Request::Permission(request)) => {
+                session.answer(request.id, allow()).await.unwrap();
+            }
+            EventKind::TurnEnded { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(text.starts_with("Hello"), "got: {text}");
+}
+
+#[tokio::test]
+async fn grok_questions_surface_typed_and_answers_return_labels() {
+    let (session, mut events) = open(&[]).await;
+    session.prompt("grok-question").await.unwrap();
+    let mut text = String::new();
+    loop {
+        let event = next(&mut events).await;
+        match event.kind {
+            EventKind::RequestOpened(Request::Question(request)) => {
+                let q = &request.questions[0];
+                assert_eq!(q.text, "Pick a fruit");
+                assert!(!q.multi_select);
+                assert_eq!(q.choices[0].label, "Grape");
+                assert_eq!(q.choices[0].description.as_deref(), Some("purple"));
+                // Mango has no id: the label doubles as the choice id.
+                assert_eq!(q.choices[1].id.as_str(), "Mango");
+                session
+                    .answer(
+                        request.id,
+                        Answer::Question(vec![QuestionAnswer::Choices(vec![ChoiceId::new("g")])]),
+                    )
+                    .await
+                    .unwrap();
+            }
+            EventKind::TextDelta { text: t, .. } => text.push_str(&t),
+            EventKind::TurnEnded { .. } => break,
+            _ => {}
+        }
+    }
+    // The answer went back keyed by question text, valued by option LABEL.
+    assert_eq!(text, r#"q={"Pick a fruit":["Grape"]} "#);
 }

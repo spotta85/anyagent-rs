@@ -22,9 +22,10 @@ use crate::agent::{
 };
 use crate::error::AgentError;
 use crate::event::{
-    CompletionSource, Diagnostic, DiagnosticLevel, EventKind, Extensions, FileDiff, MessageId,
-    PermissionChoice, PermissionRequest, PlanEntry, PlanStatus, RawTool, Request, RequestId,
-    StopReason, ToolId, ToolInput, ToolKind, ToolStatus, ToolUpdate,
+    Choice, ChoiceId, CompletionSource, Diagnostic, DiagnosticLevel, EventKind, Extensions,
+    FileDiff, MessageId, PermissionChoice, PermissionRequest, PlanEntry, PlanStatus, Question,
+    QuestionAnswer, QuestionId, QuestionRequest, RawTool, Request, RequestId, StopReason, ToolId,
+    ToolInput, ToolKind, ToolStatus, ToolUpdate,
 };
 use crate::process::{self, Spawn};
 
@@ -84,7 +85,10 @@ impl Adapter for AcpAdapter {
                 info: info.clone(),
                 tools: HashMap::new(),
                 permissions: HashMap::new(),
+                questions: HashMap::new(),
                 prompt_id: None,
+                prompt_meta: None,
+                prompt_seq: 0,
                 steer_id: None,
                 config: None,
                 login,
@@ -360,6 +364,13 @@ struct PendingPermission {
     options: Vec<(PermissionChoice, String)>,
 }
 
+/// A grok `_x.ai/ask_user_question` waiting for `answer`: its wire id and the
+/// raw question objects, so choice ids map back to the labels grok expects.
+struct PendingQuestion {
+    wire_id: Value,
+    questions: Vec<Value>,
+}
+
 struct Drive {
     wire: Wire,
     child: process::Child,
@@ -370,7 +381,13 @@ struct Drive {
     /// Cumulative tool snapshots, merged from partial wire updates.
     tools: HashMap<String, ToolUpdate>,
     permissions: HashMap<RequestId, PendingPermission>,
+    questions: HashMap<RequestId, PendingQuestion>,
     prompt_id: Option<u64>,
+    /// `_meta.promptId` minted for the outstanding prompt. Grok echoes it in
+    /// `_x.ai/session/prompt_complete`, so a stale replay can't end a newer
+    /// turn (verified live against grok 1.0.4 by comet).
+    prompt_meta: Option<String>,
+    prompt_seq: u64,
     steer_id: Option<u64>,
     /// An in-flight configure: wire id plus the selection to apply on success.
     config: Option<(u64, ConfigId, ConfigValue)>,
@@ -410,11 +427,17 @@ impl Drive {
     async fn handle_command(&mut self, cmd: DriverCommand) -> Result<(), Gone> {
         match cmd {
             DriverCommand::StartTurn { input } => {
+                // `_meta.promptId` lets grok's prompt-complete extension name
+                // this exact prompt; spec-conformant agents ignore `_meta`.
+                self.prompt_seq += 1;
+                let pid = format!("p{}", self.prompt_seq);
                 let params = json!({
                     "sessionId": self.session_id,
                     "prompt": self.prompt_blocks(&input).await?,
+                    "_meta": { "promptId": pid, "requestId": pid },
                 });
                 self.prompt_id = Some(self.wire.request("session/prompt", params).await?);
+                self.prompt_meta = Some(pid);
             }
             DriverCommand::Steer { input } => {
                 let params = json!({
@@ -437,6 +460,11 @@ impl Drive {
                             pending.wire_id,
                             json!({ "outcome": { "outcome": "cancelled" } }),
                         )
+                        .await?;
+                }
+                for (_, pending) in std::mem::take(&mut self.questions) {
+                    self.wire
+                        .respond(pending.wire_id, json!({ "outcome": "cancelled" }))
                         .await?;
                 }
             }
@@ -463,6 +491,14 @@ impl Drive {
         match method {
             Some("session/update") => self.on_update(frame).await,
             Some("session/request_permission") => self.on_permission(frame).await,
+            // Grok extensions (also implemented by T3 Code; wire shapes
+            // cross-checked against both consumers).
+            Some("_x.ai/ask_user_question" | "x.ai/ask_user_question")
+                if frame.get("id").is_some() =>
+            {
+                self.on_question(frame).await
+            }
+            Some("_x.ai/session/prompt_complete") => self.on_prompt_complete(&frame).await,
             Some(other) => {
                 if frame.get("id").is_some() {
                     let other = other.to_owned();
@@ -640,6 +676,59 @@ impl Drive {
         .await
     }
 
+    /// Grok's `_x.ai/ask_user_question` extension request: typed questions
+    /// the agent blocks on (params sometimes arrive wrapped as
+    /// `{method, params}`; both shapes are in the field).
+    async fn on_question(&mut self, frame: Value) -> Result<(), Gone> {
+        let wire_id = frame["id"].clone();
+        let params = &frame["params"];
+        let params = params.get("params").unwrap_or(params);
+        let Some(list) = params.get("questions").and_then(Value::as_array).cloned() else {
+            self.wire
+                .respond_error(wire_id, -32602, "unparseable request")
+                .await?;
+            return self
+                .diagnostic(DiagnosticLevel::Warning, "bad ask_user_question request")
+                .await;
+        };
+        let questions = list.iter().map(typed_question).collect();
+        let id = RequestId::new(format!("r{wire_id}"));
+        self.questions.insert(
+            id.clone(),
+            PendingQuestion {
+                wire_id,
+                questions: list,
+            },
+        );
+        self.emit(DriverEvent::event(EventKind::RequestOpened(
+            Request::Question(QuestionRequest { id, questions }),
+        )))
+        .await
+    }
+
+    /// Grok's AUTHORITATIVE turn end: its `session/prompt` RPC can hang after
+    /// the turn really finished. Guards: session match, an outstanding
+    /// prompt, and (when present) an exact promptId echo — a stale replay of
+    /// an earlier prompt must never end a newer turn. The abandoned RPC
+    /// response arrives later and is ignored (its id no longer matches).
+    async fn on_prompt_complete(&mut self, frame: &Value) -> Result<(), Gone> {
+        let params = &frame["params"];
+        let session_matches = params["sessionId"].as_str() == Some(self.session_id.as_str());
+        let pid = params["promptId"].as_str();
+        let fresh = pid.is_none() || pid == self.prompt_meta.as_deref();
+        if self.prompt_id.is_none() || !session_matches || !fresh {
+            return Ok(());
+        }
+        self.prompt_id = None;
+        self.prompt_meta = None;
+        self.tools.clear();
+        let stop = params["stopReason"].as_str().unwrap_or("end_turn");
+        self.emit(DriverEvent::TurnEnded(stop_reason(
+            &json!({ "result": { "stopReason": stop } }),
+        )))
+        .await
+    }
+
     /// The prompt response ends the turn; the steering response reports back.
     async fn on_response(&mut self, frame: Value) -> Result<(), Gone> {
         let Some(id) = frame.get("id").and_then(Value::as_u64) else {
@@ -692,24 +781,35 @@ impl Drive {
         Ok(())
     }
 
-    /// Answers one stored permission request on the wire.
+    /// Answers one stored permission or question request on the wire.
     async fn answer(
         &mut self,
         request: RequestId,
         answer: crate::event::Answer,
     ) -> Result<(), Gone> {
-        let Some(pending) = self.permissions.remove(&request) else {
+        if let Some(pending) = self.permissions.remove(&request) {
+            let outcome = match answer {
+                crate::event::Answer::Permission(choice) => option_for(choice, &pending.options)
+                    .map(|option_id| json!({ "outcome": "selected", "optionId": option_id })),
+                crate::event::Answer::Question(_) => None,
+            };
+            let outcome = outcome.unwrap_or(json!({ "outcome": "cancelled" }));
+            self.wire
+                .respond(pending.wire_id, json!({ "outcome": outcome }))
+                .await?;
+            return Ok(());
+        }
+        let Some(pending) = self.questions.remove(&request) else {
             return Ok(());
         };
-        let outcome = match answer {
-            crate::event::Answer::Permission(choice) => option_for(choice, &pending.options)
-                .map(|option_id| json!({ "outcome": "selected", "optionId": option_id })),
-            crate::event::Answer::Question(_) => None,
+        let response = match answer {
+            crate::event::Answer::Question(answers) => {
+                question_response(&pending.questions, &answers)
+            }
+            crate::event::Answer::Permission(_) => None,
         };
-        let outcome = outcome.unwrap_or(json!({ "outcome": "cancelled" }));
-        self.wire
-            .respond(pending.wire_id, json!({ "outcome": outcome }))
-            .await?;
+        let response = response.unwrap_or(json!({ "outcome": "cancelled" }));
+        self.wire.respond(pending.wire_id, response).await?;
         Ok(())
     }
 
@@ -935,6 +1035,69 @@ fn option_for(choice: PermissionChoice, options: &[(PermissionChoice, String)]) 
         .find(|(c, _)| *c == choice)
         .or_else(|| options.iter().find(|(c, _)| allow(c) == allow(&choice)))
         .map(|(_, id)| id.clone())
+}
+
+/// One raw grok question object as the typed [`Question`]. Ids fall back to
+/// the question/label text (grok marks them optional).
+fn typed_question(q: &Value) -> Question {
+    let text = q["question"].as_str().unwrap_or_default();
+    Question {
+        id: QuestionId::new(q["id"].as_str().unwrap_or(text)),
+        text: text.to_owned(),
+        header: None,
+        choices: q["options"]
+            .as_array()
+            .map(|options| {
+                options
+                    .iter()
+                    .map(|o| {
+                        let label = o["label"].as_str().unwrap_or_default();
+                        Choice {
+                            id: ChoiceId::new(o["id"].as_str().unwrap_or(label)),
+                            label: label.to_owned(),
+                            description: o["description"].as_str().map(str::to_owned),
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        multi_select: q["multiSelect"].as_bool().unwrap_or(false),
+        allows_free_text: false,
+    }
+}
+
+/// Grok's accepted answer: `answers` keyed by question text, values the
+/// selected option LABELS (choice ids map back through the raw options).
+/// `None` (mismatched shapes) degrades to `cancelled` — never a fabricated
+/// answer.
+fn question_response(questions: &[Value], answers: &[QuestionAnswer]) -> Option<Value> {
+    if answers.len() != questions.len() {
+        return None;
+    }
+    let empty = Vec::new();
+    let mut map = serde_json::Map::new();
+    for (q, answer) in questions.iter().zip(answers) {
+        let options = q["options"].as_array().unwrap_or(&empty);
+        let labels: Vec<Value> = match answer {
+            QuestionAnswer::Choices(ids) => ids
+                .iter()
+                .filter_map(|id| {
+                    options.iter().find(|o| {
+                        o["id"].as_str() == Some(id.as_str())
+                            || o["label"].as_str() == Some(id.as_str())
+                    })
+                })
+                .filter_map(|o| o["label"].as_str())
+                .map(|label| Value::String(label.to_owned()))
+                .collect(),
+            QuestionAnswer::Text(text) => vec![Value::String(text.clone())],
+        };
+        map.insert(
+            q["question"].as_str().unwrap_or_default().to_owned(),
+            Value::Array(labels),
+        );
+    }
+    Some(json!({ "outcome": "accepted", "answers": map }))
 }
 
 fn stop_reason(frame: &Value) -> StopReason {

@@ -106,6 +106,27 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         extra_paths: &[".local/bin"],
     },
     AgentProfile {
+        id: "grok",
+        name: "Grok",
+        cli: "grok",
+        executable_env: "ANYAGENT_GROK_BIN",
+        config_dir: ".grok",
+        config_home_env: None,
+        // Flag placement verified against grok 1.0.4 (comet field notes):
+        // `--no-auto-update` is TOP-LEVEL and kills a silent multi-second
+        // launch-time update check; `--no-leader` (on the subcommand) starts
+        // a fresh agent instead of attaching to a shared leader process via
+        // ~/.grok/leader.sock — a wedged/stale leader reads as total silence.
+        connection: Connection::Acp {
+            args: &["--no-auto-update", "agent", "--no-leader", "stdio"],
+        },
+        auth_markers: &[AuthMarker::ApiKeyEnv("XAI_API_KEY")],
+        login_args: &[],
+        install_hint: "npm install -g @xai-official/grok \
+             (or `curl -fsSL https://x.ai/cli/install.sh | bash`)",
+        extra_paths: &[".local/bin", ".grok/bin", ".npm-global/bin"],
+    },
+    AgentProfile {
         id: "hermes",
         name: "Hermes Agent",
         cli: "hermes",

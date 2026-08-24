@@ -47,6 +47,24 @@ async function runTurn(m) {
   // Errored prompts: "die-auth" loses the credentials, "die-rpc" is a plain failure.
   if (ptext.includes('die-auth')) { send({ jsonrpc: '2.0', id: m.id, error: { code: -32000, message: 'credentials expired' } }); turn = null; return; }
   if (ptext.includes('die-rpc')) { send({ jsonrpc: '2.0', id: m.id, error: { code: -32603, message: 'kaput' } }); turn = null; return; }
+  // Grok extensions (wire shapes cross-checked against comet + t3code).
+  if (ptext.includes('grok-question')) {
+    const q = await request('_x.ai/ask_user_question', { sessionId: sid, toolCallId: 'call_q', mode: 'default', questions: [{ id: 'q1', question: 'Pick a fruit', options: [{ id: 'g', label: 'Grape', description: 'purple' }, { label: 'Mango' }], multiSelect: false }] });
+    const answers = q.result?.answers ? JSON.stringify(q.result.answers) : (q.result?.outcome ?? 'error');
+    notify(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `q=${answers} ` } });
+    done('end_turn');
+    return;
+  }
+  if (ptext.includes('grok-hang')) {
+    // A stale prompt_complete (wrong promptId; refusal would be visible in
+    // the stop reason) must be ignored; the frame echoing _meta.promptId ends
+    // the turn. The session/prompt RPC then NEVER responds — the hang.
+    notify(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'grok ' } });
+    send({ jsonrpc: '2.0', method: '_x.ai/session/prompt_complete', params: { sessionId: sid, promptId: 'stale-0', stopReason: 'refusal' } });
+    send({ jsonrpc: '2.0', method: '_x.ai/session/prompt_complete', params: { sessionId: sid, promptId: m.params._meta?.promptId, stopReason: 'end_turn' } });
+    turn = null;
+    return;
+  }
   notify(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Hello ' } });
   if (mcpDecl.length) notify(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `mcp=${mcpDecl.map(s => `${s.type ?? 'stdio'}:${s.name}`).join(',')} ` } });
   // Echo attachments so tests can assert the wire shape.

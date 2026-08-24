@@ -1904,6 +1904,39 @@ round-2 cancel fix at work). Known limitation, bridge-documented: the
 extension knob. Next comet slices: ACP agents onto the bridge, then codex
 (P3) and cursor.
 
+**Grok landed in the catalog with its wire quirks (same day).** Approved by
+Sid for the comet ACP migration. Grok is ACP but its wire is buggy in ways
+two consumers (comet, T3 Code) fixed independently — the two-consumer test
+for owning it here:
+
+- Launch args `--no-auto-update agent --no-leader stdio` (flag placement
+  comet-verified against grok 1.0.4): the update check stalls launch
+  silently; leader mode attaches to a shared process via
+  `~/.grok/leader.sock` and a wedged leader reads as total silence.
+- `_x.ai/session/prompt_complete` is the AUTHORITATIVE turn end: the
+  `session/prompt` RPC can hang after the turn really finished. Every ACP
+  prompt now carries `_meta.promptId` (grok echoes it; conformant agents
+  ignore `_meta` — hermes verified live); the notification ends the turn
+  only on an exact session + promptId match, so stale replays can't end a
+  newer turn.
+- `_x.ai/ask_user_question` extension requests map to `Request::Question`
+  (wire shape from T3's schema: questions with options/labels/multiSelect;
+  accepted answers keyed by question text, valued by option labels).
+  Answers ride the existing `Session::answer`; cancel answers pending
+  questions `cancelled`.
+
+Auth marker `XAI_API_KEY` (T3-verified); no login args (flow unverified).
+**pi stays out of the catalog**: its ACP adapter is a community npm package
+(`pi-acp`) needing a managed install — apps own npm state and hand the
+installed entry to `AgentInstallation::acp` (comet does exactly this).
+Noted as a potential future feature (Sid, same day): **subagent transcript
+visibility for ACP agents** — grok writes subagent transcripts under
+`~/.grok/sessions` and opencode serves them over a local SSE bus; neither
+rides the ACP wire. Comet's ~1.9k-line tailing machinery is deleted with
+the migration, not ported; if two consumers want subagent panes on ACP
+agents, that becomes an anyagent feature (likely `EventKind` +
+`parent_tool_id`, sourced off-wire).
+
 ## Decided 2026-08-22
 
 1. **Native Claude ships in P0, right after the ACP adapter; no ACP bridge
