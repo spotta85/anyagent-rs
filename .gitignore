@@ -1,0 +1,7 @@
+target/
+.agents/
+.claude/
+.scratch
+spikes
+CLAUDE.md
+research
