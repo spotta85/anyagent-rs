@@ -1889,6 +1889,21 @@ entry; probed live). (2) **pre-session model catalog** for settings pickers
 Comet's claude "StepBoundary steering" is the queue-reported-as-steer
 illusion this review removed; the engine queue covers it honestly.
 
+**Comet claude slice landed (same day).** On comet's `anyagent-integration`
+branch: `harness/bridge.rs` implements comet's `Harness` trait over anyagent
+and replaces the native claude driver (~2.9k lines deleted; `claude/` keeps
+only the curated catalog and CLI resolver). The bridge emits `Steered` when
+a mailbox-routed prompt's turn starts (descriptor now honestly
+`TurnBoundary`), auto-approves via `PermissionMode::AutoApprove`, and
+bridges `AskUserQuestion` through comet's input bridge. All comet tests
+pass; live probe: tool call/result with the file on disk, `Done` per turn
+with the session parked, steer into the parked session, mid-turn interrupt
+settling in 8ms (the interrupt landed in the pre-`started` window — the
+round-2 cancel fix at work). Known limitation, bridge-documented: the
+`--settings` overrides (fastMode/thinking/ultracode) need an anyagent
+extension knob. Next comet slices: ACP agents onto the bridge, then codex
+(P3) and cursor.
+
 ## Decided 2026-08-22
 
 1. **Native Claude ships in P0, right after the ACP adapter; no ACP bridge
