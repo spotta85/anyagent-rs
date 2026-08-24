@@ -1412,7 +1412,7 @@ resume token exists at open instead of after the first turn.
 | `PlanUsageUpdated` / `plan_usage()` | `get_usage` control request → `rate_limits.{five_hour, seven_day, ...}.{utilization, resets_at}` and `limits[]` (documented experimental); `rate_limit_event` only pushes `status` + `resetsAt` + `rateLimitType` |
 | `TurnEnded` | exactly one `result` per turn: `subtype success` → Completed(Protocol); `error_during_execution` + `terminal_reason aborted_streaming` → Cancelled; other `error_*` → Failed; `background` falls out of tool tracking: a `tool_result` carrying `backgroundTaskId` keeps its tool Running past the turn, and `task_notification` completes it (slice 4 — simpler than mirroring `background_tasks_changed`) |
 | `cancel(clear_queue)` | `control_request {subtype: interrupt, cancel_queued}`; response lists `still_queued` / `cancelled`; a running Bash is moved to background, not killed. If the interrupt lands before the turn's `command_lifecycle started`, the prompt is cancelled out of the CLI's queue and no `result` comes — the receipt naming the turn's uuid is the turn end (probed 2026-08-24) |
-| `configure` model / mode / effort | `set_model {model}`, `set_permission_mode {mode}`, `/effort <level>` as a user message; `list_models` for the catalog |
+| `configure` model / mode / effort | Live: `set_model {model}`, `set_permission_mode {mode}`. Effort is creation-only (`--effort`; option `live: false`): there is no effort control request, and `/effort` as a user message runs as its own synthetic local turn (probed 2026-08-24) — a live change is a reopen with the resume token. Catalog (models + per-model `supportedEffortLevels`) from `initialize` |
 | `open` resume / fork / fork at | `--resume ID` (same id, history not replayed on the wire); `--fork-session` (new id); `--resume-session-at=UUID` (history cut after that message) |
 | file rewind | `rewind_files {user_message_id, dry_run}` with env `CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING=true`; files only, no conversation rollback |
 | `probe` | `claude --version` (0.06 s), `claude auth status --json` (0.2 s, offline; `loggedIn`, `authMethod`, `email`, `subscriptionType`; exit 1 when logged out), then `initialize` for models/commands |
@@ -1873,6 +1873,21 @@ Verified live in its `--repl` against installed claude: session ready with
 honest capabilities (steering false), a text turn, and the Write approval
 flow ending with the file on disk. Remaining for P1: Windows
 resolution/shutdown; Comet is the next consumer.
+
+**Comet mapping (same day) and the effort gap.** The comet integration is a
+single bridge implementing its `Harness` trait over anyagent: deletes its
+claude native + ACP drivers, jsonrpc, shell_env, adapter_install (~9–10k
+lines); codex and cursor stay native behind the same trait until P3. Its
+quiesce watchdog, steering mailbox, interrupt escalation, and
+persistent-session parking all fold into the engine's existing rules. Three
+gaps surfaced: (1) **effort** — fixed: claude advertises `effort` as a
+creation-only option (`--effort`, levels from the current model's catalog
+entry; probed live). (2) **pre-session model catalog** for settings pickers
+— bridge-side for now (open-and-close a throwaway session, comet's
+`commands()` already pays this cost); `Runtime::probe` is the eventual home.
+(3) **usage split for rate limits** — already the P2 rate-limit slice.
+Comet's claude "StepBoundary steering" is the queue-reported-as-steer
+illusion this review removed; the engine queue covers it honestly.
 
 ## Decided 2026-08-22
 

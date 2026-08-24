@@ -90,6 +90,10 @@ impl Adapter for ClaudeAdapter {
                     args.push("--model".into());
                     args.push(model.clone());
                 }
+                ("effort", ConfigValue::Text(effort)) => {
+                    args.push("--effort".into());
+                    args.push(effort.clone());
+                }
                 _ => {
                     return Err(AgentError::InvalidConfiguration(format!(
                         "`{id}` is not a creation-time option of this agent"
@@ -195,6 +199,34 @@ fn creation_option(request: &ConnectRequest, id: &str) -> Option<String> {
     })
 }
 
+/// The current model's effort levels as a creation-only option; `None` when
+/// the catalog has no levels for it.
+fn effort_option(models: &Value, model: &str, configured: Option<String>) -> Option<ConfigOption> {
+    let entries = models.as_array()?;
+    let entry = entries
+        .iter()
+        .find(|m| m["value"].as_str() == Some(model))
+        .or_else(|| entries.first())?;
+    let choices: Vec<ConfigChoice> = entry["supportedEffortLevels"]
+        .as_array()?
+        .iter()
+        .filter_map(|level| level.as_str())
+        .map(|level| ConfigChoice {
+            value: level.to_owned(),
+            label: level.to_owned(),
+            description: None,
+        })
+        .collect();
+    (!choices.is_empty()).then(|| ConfigOption {
+        id: ConfigId::new("effort"),
+        name: "Reasoning effort".into(),
+        kind: ConfigKind::Select { choices },
+        // `None`: the CLI keeps its own default and never reports it.
+        current: configured.map(ConfigValue::Text),
+        live: false,
+    })
+}
+
 /// The `initialize` model catalog as config choices.
 fn model_choices(models: &Value) -> Vec<ConfigChoice> {
     models
@@ -277,6 +309,10 @@ fn driver_info(init: &Value, version: Option<String>, request: &ConnectRequest) 
         current: Some(ConfigValue::Text(model.clone())),
         live: true,
     };
+    // Effort is creation-only (`--effort`): the wire has no live switch — the
+    // `/effort` command runs as its own synthetic turn (probed 2026-08-24).
+    // A live change is a reopen with the resume token.
+    let effort_option = effort_option(&init["models"], &model, creation_option(request, "effort"));
     let mut configuration = SessionConfiguration::default();
     configuration
         .options
@@ -284,6 +320,11 @@ fn driver_info(init: &Value, version: Option<String>, request: &ConnectRequest) 
     configuration
         .options
         .insert(ConfigId::new("model"), ConfigValue::Text(model));
+    if let Some(current) = effort_option.as_ref().and_then(|o| o.current.clone()) {
+        configuration
+            .options
+            .insert(ConfigId::new("effort"), current);
+    }
     DriverInfo {
         details: AgentDetails {
             version,
@@ -304,7 +345,10 @@ fn driver_info(init: &Value, version: Option<String>, request: &ConnectRequest) 
                     vec![McpTransport::Stdio, McpTransport::Http, McpTransport::Sse];
                 capabilities
             },
-            config_options: vec![mode_option, model_option],
+            config_options: [Some(mode_option), Some(model_option), effort_option]
+                .into_iter()
+                .flatten()
+                .collect(),
             commands,
         },
         configuration,

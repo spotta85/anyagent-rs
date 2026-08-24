@@ -181,6 +181,20 @@ async fn the_handshake_fills_details() {
         sonnet.description.as_deref(),
         Some("Fast for everyday tasks")
     );
+    // Effort: creation-only, levels from the current model's catalog entry,
+    // no current value until configured.
+    let effort = details
+        .config_options
+        .iter()
+        .find(|o| o.id.as_str() == "effort")
+        .unwrap();
+    assert!(!effort.live);
+    assert_eq!(effort.current, None);
+    let ConfigKind::Select { choices } = &effort.kind else {
+        panic!("expected Select, got {:?}", effort.kind);
+    };
+    let levels: Vec<&str> = choices.iter().map(|c| c.value.as_str()).collect();
+    assert_eq!(levels, ["low", "medium", "high", "xhigh", "max"]);
     // The adapter mints the session id, so the token exists before any turn.
     assert!(session.info().resume_token.is_some());
     session.close().await.unwrap();
@@ -619,7 +633,8 @@ async fn creation_time_config_rides_the_launch_args_and_unknown_ids_are_refused(
             &agent,
             SessionOptions::in_dir(std::env::temp_dir())
                 .configure("mode", "plan")
-                .configure("model", "sonnet"),
+                .configure("model", "sonnet")
+                .configure("effort", "low"),
         )
         .await
         .unwrap();
@@ -633,6 +648,10 @@ async fn creation_time_config_rides_the_launch_args_and_unknown_ids_are_refused(
     assert_eq!(
         info.configuration.options.get(&ConfigId::new("model")),
         Some(&ConfigValue::Text("sonnet".into()))
+    );
+    assert_eq!(
+        info.configuration.options.get(&ConfigId::new("effort")),
+        Some(&ConfigValue::Text("low".into()))
     );
     assert!(info.resume_token.is_some());
     session.close().await.unwrap();

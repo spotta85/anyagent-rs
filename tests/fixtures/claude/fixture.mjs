@@ -49,8 +49,8 @@ function onControl(m) {
       return reply({
         commands: [{ name: 'compact', description: 'Compact context', argumentHint: '' }],
         models: [
-          { value: 'default', displayName: 'Default (recommended)', description: 'Opus 5 with 1M context' },
-          { value: 'sonnet', displayName: 'Sonnet', description: 'Fast for everyday tasks' },
+          { value: 'default', displayName: 'Default (recommended)', description: 'Opus 5 with 1M context', supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'] },
+          { value: 'sonnet', displayName: 'Sonnet', description: 'Fast for everyday tasks', supportedEffortLevels: ['low', 'high'] },
         ],
         account: { email: 'user@example.com', organization: 'Example Org', subscriptionType: 'Claude Max', apiProvider: 'firstParty' },
         current_permission_mode: pm > -1 ? process.argv[pm + 1] : 'default',
