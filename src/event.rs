@@ -23,14 +23,17 @@ string_id!(ChoiceId);
 /// `provider/name`, for example `codex/thread_status`.
 pub type Extensions = BTreeMap<String, serde_json::Value>;
 
-/// One normalized event. Streamed from provider, produced by anyagent
+/// One normalized event produced by anyagent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
-    pub sequence: u64, // starts at 1, ordering
+    /// Starts at 1 and increases for every session event.
+    pub sequence: u64,
     pub session_id: SessionId,
-    pub turn_info: Option<TurnContext>, // is this event part of a turn
+    /// Present when the event belongs to a turn.
+    pub turn_info: Option<TurnContext>,
     pub kind: EventKind,
-    pub extensions: Extensions, // provider-specific data incase i dont update :)
+    /// Provider-specific data that has not been normalized.
+    pub extensions: Extensions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,21 +126,20 @@ pub enum CompletionSource {
 }
 
 // ---------------------------------------------------------------------------
-// Tools and plans and stuff
+// Tools and plans
 // ---------------------------------------------------------------------------
 
+/// Cumulative snapshot of one tool call.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-/// Snapshot of tools
-/// TODO: Hermes doesnt always update tool status if something finished.
 pub struct ToolUpdate {
     pub id: ToolId,
     pub kind: ToolKind,
-    pub title: String, // agent's own words "Read src/bob.rs"
+    pub title: String,
     pub status: ToolStatus,
     pub input: ToolInput,
-    pub output: Option<String>,  // capped
-    pub diffs: Vec<FileDiff>,    // if the tool edited files, the diffs
-    pub locations: Vec<PathBuf>, // files touched
+    pub output: Option<String>,
+    pub diffs: Vec<FileDiff>,
+    pub locations: Vec<PathBuf>,
     /// Agent's own tool name and raw input, for unknown or MCP tools.
     pub raw: Option<RawTool>,
 }
@@ -304,11 +306,11 @@ pub enum QuestionAnswer {
 }
 
 // ---------------------------------------------------------------------------
-// Usage, diagnostics because im paranoid and imo this is very importnant.
+// Usage and diagnostics
 // ---------------------------------------------------------------------------
 
+/// Plan quota windows for the logged-in account.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-/// Tibo reset please
 pub struct PlanUsage {
     pub windows: Vec<UsageWindow>,
     pub fetched_at: SystemTime,
@@ -316,7 +318,7 @@ pub struct PlanUsage {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageWindow {
-    /// "Session" (5h), "Week", or custom like fable or month idk.
+    /// "Session" (5h), "Week", or an agent-provided label.
     pub label: String,
     pub used_percent: u8,
     pub resets_at: Option<SystemTime>,
@@ -336,7 +338,7 @@ pub enum DiagnosticLevel {
     Error,
 }
 
-/// Return value of prompt, tells you what happned immediately.
+/// Immediate result of submitting a prompt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Delivery {
     /// Stable across immediate delivery and later queue promotion.
@@ -354,6 +356,7 @@ pub enum DeliveryKind {
         turn_id: TurnId,
     },
     Queued {
-        position: u32, // how many are ahead.
+        /// Number of prompts ahead of this one.
+        position: u32,
     },
 }

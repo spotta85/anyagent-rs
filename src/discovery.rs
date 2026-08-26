@@ -1,6 +1,6 @@
 //! Finds installed agents and reads their login markers. Never launches an
 //! agent and never touches the network.
-//! Isn't 100% bc some agents dont have offiline markers and they can be stale obv
+//! Marker state is best effort because markers can be absent or stale.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -19,24 +19,20 @@ pub(crate) async fn discover(profiles: &[AgentProfile]) -> DiscoveryReport {
         missing: Vec::new(),
         diagnostics: Vec::new(),
     };
-    if profiles.is_empty() { // no profiles = no agents.
+    if profiles.is_empty() {
         return report;
     }
-    // shared env info
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default();
     let path = std::env::var("PATH").ok();
-    let login = login_shell_path().await; // for .zshrc and .bashrc PATHs that aren't in the current env
-    // find all the agents
+    let login = login_shell_path().await;
     for profile in profiles {
-        // Check env override (ex: ANYAGENT_CLAUDE_BIN=/custom/path/claude)
         if let Some(exe) = env_override(profile, &mut report.diagnostics) {
             let agent = installation(profile, exe, InstallationSource::EnvOverride, &home).await;
             report.agents.push(agent);
             continue;
         }
-        // create list of dirs to look. 
         let dirs = search_dirs(profile, &home, path.as_deref(), login.as_deref());
         match resolve(profile.cli, &dirs) {
             Some((exe, source)) => {

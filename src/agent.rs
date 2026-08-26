@@ -1,4 +1,4 @@
-// Structs and stuff for discover, and session management and stuff.
+//! Public types for discovery, sessions, configuration, and input.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -37,21 +37,20 @@ macro_rules! string_id {
 }
 pub(crate) use string_id;
 
-string_id!(AgentId); // "Claude", "Codex" etc. 
-string_id!(ConfigId); // session settings like "model", "effort"
-string_id!(ResumeToken); // session resume token
+string_id!(AgentId); // Agent catalog id, such as "claude" or "codex".
+string_id!(ConfigId); // Session option id, such as "model" or "effort".
+string_id!(ResumeToken); // Opaque token owned by the agent.
 
 /// Where discovery found an executable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
-/// Source of agents installation
 pub enum InstallationSource {
-    EnvOverride,    // ANYAGENT_<ID>_BIN env var pointed here
-    Path,           // found on  $PATH
-    LoginShellPath, // found on PATH from a login shell
-    VersionManager, // via a version manager (nvm, asdff, etc.)
-    KnownLocation,  // a standard install dir we check
-    Pinned,         // app gave
+    EnvOverride,
+    Path,
+    LoginShellPath,
+    VersionManager,
+    KnownLocation,
+    Pinned,
 }
 
 /// One installed agent, as returned by `Runtime::discover`.
@@ -63,11 +62,11 @@ pub struct AgentInstallation {
     pub source: InstallationSource,
     pub auth: Option<AuthStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) acp_args: Option<Vec<String>>, // launch args for acp harness
+    pub(crate) acp_args: Option<Vec<String>>,
 }
 
 impl AgentInstallation {
-    /// Uses an exact executable, for catalog agents if we know path.
+    /// Uses an exact executable for a catalog agent.
     pub fn at(id: impl Into<AgentId>, executable: impl Into<PathBuf>) -> Self {
         let id = id.into();
         Self {
@@ -80,8 +79,7 @@ impl AgentInstallation {
         }
     }
 
-    /// Any ACP agent not in the catalog: generic ACP launch with the given
-    /// args. For new agents not in catalog.
+    /// Launches an ACP agent that is not yet in the catalog.
     pub fn acp(name: impl Into<String>, executable: impl Into<PathBuf>, args: Vec<String>) -> Self {
         let name = name.into();
         Self {
@@ -116,7 +114,7 @@ pub enum AuthKind {
     Subscription,
     ApiKey,
     CloudProvider,
-    Other(String), // I hate dealing with auth
+    Other(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,8 +123,7 @@ pub struct AccountInfo {
     pub plan: Option<String>,
 }
 
-/// How the user can log in - for login hints
-/// Feature: think on how we can allow login through us.
+/// A login method the application can show to the user.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum LoginMethod {
@@ -140,8 +137,7 @@ pub enum LoginMethod {
     EnvVar { name: String },
 }
 
-/// Basic harness capabilities. Filled by harness on supports()
-/// TODO: need ot explore and add more.
+/// Optional actions supported by an agent or session.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Capability {
@@ -275,14 +271,13 @@ impl Capabilities {
 /// `mode`, `sandbox`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigOption {
-    pub id: ConfigId,                 // "model", "effort", "mode", "sandbox"
-    pub name: String,                 // human label
-    pub category: Option<String>,     // wire's own grouping ("model", "mode"...)
-    pub kind: ConfigKind,             // what values it accepts
-    pub current: Option<ConfigValue>, // what it's set to now
-    pub live: bool,                   // can it change mid-session?
+    pub id: ConfigId,
+    pub name: String,
+    pub category: Option<String>,
+    pub kind: ConfigKind,
+    pub current: Option<ConfigValue>,
+    pub live: bool,
 }
-//TODO: Look into implementation of changing non-live ones and if we should make interface useage the same.
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -362,13 +357,14 @@ impl ConfigSelection {
     }
 }
 
-/// Who answers tool permission requests. ANYAGENT POLICY not harness.
+/// How anyagent handles tool permission requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum PermissionMode {
-    // TODO: Review to see if we need this simplification.
-    Ask,         // sends evey request to your app
-    AutoApprove, // auto approve every request.
+    /// Forward each request to the application.
+    Ask,
+    /// Allow each permission request once without forwarding it.
+    AutoApprove,
 }
 
 /// Creation-time settings for `Runtime::open`.
@@ -392,7 +388,6 @@ pub(crate) enum SessionStart {
         at: Option<crate::event::MessageId>,
     },
 }
-// Stuff you start the session with.
 impl SessionOptions {
     /// Working directory the agent runs in. Required.
     pub fn in_dir(cwd: impl Into<PathBuf>) -> Self {
@@ -426,11 +421,7 @@ impl SessionOptions {
     /// the adapter documents (claude: the `claude/fork_point` extension on
     /// `MessageEnded`). Requires `Capability::Fork`; `open` fails typed
     /// without it.
-    pub fn fork_from(
-        mut self,
-        token: ResumeToken,
-        at: Option<crate::event::MessageId>,
-    ) -> Self {
+    pub fn fork_from(mut self, token: ResumeToken, at: Option<crate::event::MessageId>) -> Self {
         self.start = SessionStart::Fork { from: token, at };
         self
     }

@@ -1,5 +1,4 @@
 //! Per-agent facts, kept as data.
-//! Is this file not just beautiful. Credit to sid and of course, our good friend fable.
 
 use crate::agent::AuthKind;
 
@@ -43,7 +42,7 @@ pub(crate) enum NativeKind {
     Antigravity,
 }
 
-/// Offiline auth markers for fast discovery
+/// Offline auth markers for fast discovery.
 pub(crate) enum AuthMarker {
     /// File under the agent's config home.
     ConfigFile(&'static str, AuthKind),

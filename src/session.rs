@@ -1,5 +1,5 @@
-//! Session management  - super long ass file.
-//! This is the main engine.
+//! The session engine owns the adapter connection, turn state, and prompt
+//! queue. Applications hold only `Session` and `Events`.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroU32;
@@ -26,14 +26,14 @@ use crate::event::{
     StopReason, ToolId, TurnContext, TurnId, TurnOrigin,
 };
 
-const EVENT_BUFFER: usize = 256; // more than enough.
+const EVENT_BUFFER: usize = 256;
 const CLOSE_GRACE: Duration = Duration::from_secs(5);
 const QUIET_USER_TURN: Duration = Duration::from_secs(120);
 const QUIET_AGENT_TURN: Duration = Duration::from_secs(20);
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
-/// Metadata of a live session.
+/// Snapshot of a live session. Also carried by `EventKind::SessionUpdated`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: SessionId,
@@ -41,22 +41,22 @@ pub struct SessionInfo {
     pub details: AgentDetails,
     pub configuration: SessionConfiguration,
     pub resume_token: Option<ResumeToken>,
-    /// Agent-suggested title (if harness supports)
+    /// Agent-suggested title when the wire provides one.
     pub title: Option<String>,
 }
 
-/// Lightweight Command handle only (dont contiain queue, requets, active turn - those are in engine)
+/// Command handle. Cheap to clone; every clone talks to the same engine task.
 #[derive(Clone)]
 pub struct Session {
     id: SessionId,
-    commands: mpsc::Sender<Command>, // sent to engine 
+    commands: mpsc::Sender<Command>,
     info: Arc<Mutex<SessionInfo>>,
 }
 
-
-/// Stream of udpates from session
-/// Lets callers use normal async steram messages
-/// Engine feeds, application reads.
+/// Ordered event stream. Buffers 256 events, then applies backpressure.
+///
+/// Drain it continuously. A full buffer parks the engine, so session commands
+/// wait until the application reads events again.
 pub struct Events(mpsc::Receiver<Result<Event, AgentError>>);
 
 impl Stream for Events {
@@ -66,9 +66,10 @@ impl Stream for Events {
         self.0.poll_recv(cx)
     }
 }
-/// Response from engine to session when session does prompt()
+/// One reply from the engine to a session command.
 type Reply<T> = oneshot::Sender<Result<T, AgentError>>;
-/// What caller can beg engine to do :)
+
+/// Commands accepted by the session engine.
 enum Command {
     Prompt(Input, Reply<Delivery>),
     Dequeue(PromptId, Reply<()>),
@@ -89,7 +90,7 @@ impl Session {
         self.info.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// Starts. If running, then steer / queueu. Closed -> `SessionClosed`.
+    /// Starts a turn when idle. During a turn, steers when possible or queues.
     pub async fn prompt(&self, input: impl Into<Input>) -> Result<Delivery, AgentError> {
         self.send(|reply| Command::Prompt(input.into(), reply))
             .await
@@ -107,14 +108,14 @@ impl Session {
     }
 
     /// Applies one model or option selection; confirmed by `SessionUpdated`.
-    /// TODO: Look closer at this for config changes. 
     pub async fn configure(&self, selection: ConfigSelection) -> Result<(), AgentError> {
         self.send(|reply| Command::Configure(selection, reply))
             .await
     }
 
-    /// Rewinds the session ONLY, NOT file changes. Only if Capability::Rollback is supported. 
-    /// FILe rollbak will be implemented soon :)
+    /// Rewinds provider-owned conversation context by completed turns.
+    /// Files stay unchanged. Requires an idle session and rollback support.
+    /// `SessionUpdated` confirms success; a diagnostic reports rejection.
     pub async fn rollback(&self, turns: NonZeroU32) -> Result<(), AgentError> {
         self.send(|reply| Command::Rollback(turns, reply)).await
     }
@@ -126,8 +127,8 @@ impl Session {
             .await
     }
 
-    /// Ends the provider session and child process. Dropping every handle
-    /// does the same; `close` lets the caller wait for it.
+    /// Ends the agent session and waits for cleanup, capped by a grace period.
+    /// Agent-spawned background processes may outlive the session.
     pub async fn close(&self) -> Result<(), AgentError> {
         self.send(Command::Close).await
     }

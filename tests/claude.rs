@@ -163,7 +163,13 @@ async fn rollback_forks_at_the_cut_point_and_renews_the_token() {
     for prompt in ["one", "two"] {
         session.prompt(prompt).await.unwrap();
         let text = complete_turn(&session, &mut events).await;
-        let uuid = text.split("uuid=").nth(1).unwrap().split(' ').next().unwrap();
+        let uuid = text
+            .split("uuid=")
+            .nth(1)
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap();
         uuids.push(uuid.to_owned());
     }
     assert_eq!(session.info().resume_token.unwrap().as_str(), "sess-c1");

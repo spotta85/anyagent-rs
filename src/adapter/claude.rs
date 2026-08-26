@@ -822,7 +822,8 @@ impl Drive {
             }))
             .await?;
         }
-        self.emit(DriverEvent::TurnEnded(stop_reason(frame))).await?;
+        self.emit(DriverEvent::TurnEnded(stop_reason(frame)))
+            .await?;
         // Refresh plan quota after every turn; the receipt becomes
         // `PlanUsageUpdated` in `on_control_response`.
         self.usage_request = Some(self.wire.control(json!({ "subtype": "get_usage" })).await?);
@@ -1410,8 +1411,8 @@ fn parse_rfc3339(s: &str) -> Option<std::time::SystemTime> {
     let offset = match tz.as_bytes()[0] {
         b'Z' => 0,
         sign => {
-            let secs = tz.get(1..3)?.parse::<i64>().ok()? * 3600
-                + tz.get(4..6)?.parse::<i64>().ok()? * 60;
+            let secs =
+                tz.get(1..3)?.parse::<i64>().ok()? * 3600 + tz.get(4..6)?.parse::<i64>().ok()? * 60;
             if sign == b'-' { -secs } else { secs }
         }
     };

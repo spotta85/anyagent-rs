@@ -1,4 +1,4 @@
-//! Launching and cleaning up harness processes. Harness is a child process, communicating via stdin/stdout. 
+//! Launches agent processes and guarantees child cleanup.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -15,32 +15,30 @@ use crate::error::AgentError;
 const STDERR_TAIL_LINES: usize = 6;
 const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Harness Process Config.
+/// Everything needed to launch one agent process.
 pub(crate) struct Spawn {
     pub exec_path: PathBuf,
     pub args: Vec<String>,
     pub cwd: PathBuf,
-    pub env: Vec<(String, String)>, // any extra env vars 
+    pub env: Vec<(String, String)>,
 }
 
-/// A running agent process. Killed on drop
+/// A running agent process. Dropping it kills the direct child.
 pub(crate) struct Child {
     pub stdin: Option<ChildStdin>,
     pub stdout: Option<ChildStdout>,
-    inner: tokio::process::Child, // the actual os process
+    inner: tokio::process::Child,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
     stderr_task: Option<tokio::task::JoinHandle<()>>,
 }
 
-/// Launches the program using Spawn config. Returns a Child handle.
+/// Launches an agent with a PATH suitable for GUI applications.
 pub(crate) async fn spawn(spec: Spawn) -> Result<Child, AgentError> {
-    // build child path with exec dir, current PATH, and login-shell PATH. 
     let path = compose_path(
         &spec.exec_path,
         std::env::var("PATH").ok().as_deref(),
         login_shell_path().await.as_deref(),
     );
-    // basic tokio process spawn
     let mut child = Command::new(&spec.exec_path)
         .args(&spec.args)
         .current_dir(&spec.cwd)
@@ -83,7 +81,7 @@ impl Child {
         tail.iter().cloned().collect::<Vec<_>>().join("\n")
     }
 
-    /// Wait for child to exit w grace period and get exit status and kill stderr tail task.
+    /// Waits for the child and stderr reader for at most `grace` each.
     pub async fn exit_status(&mut self, grace: Duration) -> String {
         let status = tokio::time::timeout(grace, self.inner.wait()).await;
         if let Some(task) = self.stderr_task.take() {
@@ -108,7 +106,7 @@ impl Child {
     }
 }
 
-/// PATH for a child: combines the exec dir, the current PATH, and the login-shell PATH. 
+/// Child PATH in lookup order, with duplicates removed.
 fn compose_path(exec_path: &Path, own: Option<&str>, login: Option<&str>) -> String {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
@@ -130,13 +128,13 @@ fn split_path(path: Option<&str>) -> impl Iterator<Item = String> + '_ {
     path.unwrap_or_default().split(':').map(str::to_owned)
 }
 
-/// Get users shell path once and cache for future calls.
+/// Returns the login-shell PATH, captured once per process.
 pub(crate) async fn login_shell_path() -> Option<String> {
     static CACHE: OnceCell<Option<String>> = OnceCell::const_new();
     CACHE.get_or_init(capture_login_shell_path).await.clone()
 }
 
-/// Runs `$SHELL -lic 'echo $PATH'` (fallback `-lc`).
+/// Runs the login shell with a non-interactive fallback.
 async fn capture_login_shell_path() -> Option<String> {
     if std::env::var("ANYAGENT_NO_LOGIN_SHELL").is_ok_and(|v| v == "1") {
         return None;
@@ -150,7 +148,7 @@ async fn capture_login_shell_path() -> Option<String> {
     None
 }
 
-/// Get login shell path by running `$SHELL -lic 'echo $PATH'` (fallback `-lc`).
+/// Runs one shell command and extracts PATH past the output marker.
 async fn shell_path(shell: &str, flags: &str) -> Option<String> {
     let output = tokio::time::timeout(
         LOGIN_SHELL_TIMEOUT,

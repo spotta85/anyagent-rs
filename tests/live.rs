@@ -582,7 +582,12 @@ async fn plan_usage_arrives_after_a_turn() {
         };
         assert!(!usage.windows.is_empty(), "{h}: quota with no windows");
         for w in &usage.windows {
-            assert!(w.used_percent <= 100, "{h}: {} at {}%", w.label, w.used_percent);
+            assert!(
+                w.used_percent <= 100,
+                "{h}: {} at {}%",
+                w.label,
+                w.used_percent
+            );
         }
         assert!(
             usage.windows.iter().any(|w| w.resets_at.is_some()),
@@ -631,8 +636,14 @@ async fn rollback_forgets_the_rolled_back_turn() {
             .await
             .unwrap();
         let text = drain_to_turn_end(&session, &mut events, &format!("{h}: recall turn")).await;
-        assert!(text.contains("ALPHA9"), "{h}: kept turn forgotten: {text:?}");
-        assert!(!text.contains("ZULU7"), "{h}: rolled-back turn recalled: {text:?}");
+        assert!(
+            text.contains("ALPHA9"),
+            "{h}: kept turn forgotten: {text:?}"
+        );
+        assert!(
+            !text.contains("ZULU7"),
+            "{h}: rolled-back turn recalled: {text:?}"
+        );
         // The emulated fork renames the provider session.
         let after = session.info().resume_token.expect("token after rollback");
         assert_ne!(after.as_str(), before.as_str(), "{h}: token did not change");
@@ -700,8 +711,14 @@ async fn fork_from_branches_at_a_point_and_at_the_tip() {
             .unwrap();
         forked.prompt(recall).await.unwrap();
         let text = drain_to_turn_end(&forked, &mut fork_events, &format!("{h}: cut fork")).await;
-        assert!(text.contains("ALPHA9"), "{h}: cut fork lost turn 1: {text:?}");
-        assert!(!text.contains("ZULU7"), "{h}: cut fork kept turn 2: {text:?}");
+        assert!(
+            text.contains("ALPHA9"),
+            "{h}: cut fork lost turn 1: {text:?}"
+        );
+        assert!(
+            !text.contains("ZULU7"),
+            "{h}: cut fork kept turn 2: {text:?}"
+        );
         let fork_token = forked.info().resume_token.expect("fork token");
         assert_ne!(fork_token.as_str(), token.as_str(), "{h}: fork kept the id");
         forked.close().await.unwrap();
@@ -738,7 +755,10 @@ async fn runtime_plan_usage_probes_without_a_session() {
                 assert!(!usage.windows.is_empty(), "{h}: quota with no windows");
                 let cached = runtime.plan_usage(agent).await.unwrap();
                 assert_eq!(cached.fetched_at, usage.fetched_at, "{h}: cache missed");
-                pass(h, &format!("probe returned {} windows, cached", usage.windows.len()));
+                pass(
+                    h,
+                    &format!("probe returned {} windows, cached", usage.windows.len()),
+                );
             }
             Err(AgentError::UnsupportedFeature(_)) => {
                 println!("SKIP {h}: plan usage unsupported (typed)");
