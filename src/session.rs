@@ -880,7 +880,7 @@ impl Engine {
         let event = Event {
             sequence: self.seq,
             session_id: self.id.clone(),
-            turn,
+            turn_info: turn,
             kind,
             extensions,
         };

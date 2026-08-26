@@ -1,4 +1,4 @@
-//! Child process lifecycle: environment, spawn, stderr tail, and shutdown.
+//! Luancing and cleaning up harness processes. Harness is child process, communicating via stdin/stdout. 
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -15,9 +15,9 @@ use crate::error::AgentError;
 const STDERR_TAIL_LINES: usize = 6;
 const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// What to launch. `env` is applied on top of the inherited environment.
+/// What to launch
 pub(crate) struct Spawn {
-    pub program: PathBuf,
+    pub exec_path: PathBuf,
     pub args: Vec<String>,
     pub cwd: PathBuf,
     pub env: Vec<(String, String)>,
@@ -36,11 +36,11 @@ pub(crate) struct Child {
 /// the executable's directory, this process's PATH, the login-shell PATH.
 pub(crate) async fn spawn(spec: Spawn) -> Result<Child, AgentError> {
     let path = compose_path(
-        &spec.program,
+        &spec.exec_path,
         std::env::var("PATH").ok().as_deref(),
         login_shell_path().await.as_deref(),
     );
-    let mut child = Command::new(&spec.program)
+    let mut child = Command::new(&spec.exec_path)
         .args(&spec.args)
         .current_dir(&spec.cwd)
         .env("PATH", path)
@@ -50,7 +50,7 @@ pub(crate) async fn spawn(spec: Spawn) -> Result<Child, AgentError> {
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| AgentError::SpawnFailed(format!("{}: {e}", spec.program.display())))?;
+        .map_err(|e| AgentError::SpawnFailed(format!("{}: {e}", spec.exec_path.display())))?;
 
     let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
     let stderr_task = child.stderr.take().map(|stderr| {
@@ -110,10 +110,10 @@ impl Child {
 
 /// PATH for a child: executable's directory, own PATH, login-shell PATH;
 /// deduped, order kept.
-fn compose_path(program: &Path, own: Option<&str>, login: Option<&str>) -> String {
+fn compose_path(exec_path: &Path, own: Option<&str>, login: Option<&str>) -> String {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    let dirs = program
+    let dirs = exec_path
         .parent()
         .map(|d| d.to_string_lossy().into_owned())
         .into_iter()
@@ -181,7 +181,7 @@ mod tests {
 
     fn sh(script: &str) -> Spawn {
         Spawn {
-            program: PathBuf::from("/bin/sh"),
+            exec_path: PathBuf::from("/bin/sh"),
             args: vec!["-c".into(), script.into()],
             cwd: std::env::temp_dir(),
             env: Vec::new(),

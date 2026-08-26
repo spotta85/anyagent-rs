@@ -23,15 +23,14 @@ string_id!(ChoiceId);
 /// `provider/name`, for example `codex/thread_status`.
 pub type Extensions = BTreeMap<String, serde_json::Value>;
 
-/// One normalized event. Ordered by `sequence` within a session.
+/// One normalized event. Streamed from provider, produced by anyagent
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
-    pub sequence: u64,
+    pub sequence: u64, // starts at 1, ordering
     pub session_id: SessionId,
-    /// `None` for session-level bookkeeping outside any turn.
-    pub turn: Option<TurnContext>,
+    pub turn_info: Option<TurnContext>, // is this event part of a turn
     pub kind: EventKind,
-    pub extensions: Extensions,
+    pub extensions: Extensions, // provider-specific data incase i dont update :)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,19 +93,14 @@ pub enum EventKind {
     Diagnostic(Diagnostic),
     TurnEnded {
         stop: StopReason,
-        /// Tools still running when the turn ended (subagents, background
-        /// shells). A later agent-originated turn links back through
-        /// `parent_tool_id`.
-        background: Vec<ToolId>,
+        background: Vec<ToolId>, // still running after the turn ended
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum TurnOrigin {
-    /// A prompt started immediately or was promoted from the queue.
     Prompt(PromptId),
-    /// The provider began meaningful work without a new client prompt.
     Agent,
 }
 
@@ -129,23 +123,21 @@ pub enum CompletionSource {
 }
 
 // ---------------------------------------------------------------------------
-// Tools and plans
+// Tools and plans and stuff
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Snapshot of tools
+/// TODO: Hermes doesnt always update tool status if something finished.
 pub struct ToolUpdate {
     pub id: ToolId,
     pub kind: ToolKind,
-    /// Human title from the agent ("Read src/main.rs", "cargo test").
-    pub title: String,
+    pub title: String, // agent's own words "Read src/bob.rs"
     pub status: ToolStatus,
     pub input: ToolInput,
-    /// Output text, capped by Anyagent.
-    pub output: Option<String>,
-    /// File changes this call produced.
-    pub diffs: Vec<FileDiff>,
-    /// Files the call touched, for editors that follow the agent.
-    pub locations: Vec<PathBuf>,
+    pub output: Option<String>,  // capped
+    pub diffs: Vec<FileDiff>,    // if the tool edited files, the diffs
+    pub locations: Vec<PathBuf>, // files touched
     /// Agent's own tool name and raw input, for unknown or MCP tools.
     pub raw: Option<RawTool>,
 }
@@ -312,10 +304,11 @@ pub enum QuestionAnswer {
 }
 
 // ---------------------------------------------------------------------------
-// Usage, diagnostics, delivery
+// Usage, diagnostics because im paranoid and imo this is very importnant.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Tibo reset please
 pub struct PlanUsage {
     pub windows: Vec<UsageWindow>,
     pub fetched_at: SystemTime,
@@ -323,7 +316,7 @@ pub struct PlanUsage {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageWindow {
-    /// "Session" (5h), "Week", or the agent's own label.
+    /// "Session" (5h), "Week", or custom like fable or month idk.
     pub label: String,
     pub used_percent: u8,
     pub resets_at: Option<SystemTime>,
@@ -343,7 +336,7 @@ pub enum DiagnosticLevel {
     Error,
 }
 
-/// What `Session::prompt` did with the input.
+/// Return value of prompt, tells you what happned immediately.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Delivery {
     /// Stable across immediate delivery and later queue promotion.
@@ -360,8 +353,7 @@ pub enum DeliveryKind {
     Steered {
         turn_id: TurnId,
     },
-    /// `position` is how many prompts are ahead of it; 0 means next up.
     Queued {
-        position: u32,
+        position: u32, // how many are ahead.
     },
 }

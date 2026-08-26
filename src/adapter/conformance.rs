@@ -281,7 +281,7 @@ async fn bookkeeping_after_turn_end_is_not_a_turn_and_late_stops_are_diagnostics
     ));
     let late_tool = next(&mut events).await;
     assert!(matches!(late_tool.kind, EventKind::ToolUpdated(_)));
-    assert!(late_tool.turn.is_none(), "bookkeeping carries no turn");
+    assert!(late_tool.turn_info.is_none(), "bookkeeping carries no turn");
     let late_stop = next(&mut events).await;
     assert!(matches!(late_stop.kind, EventKind::Diagnostic(_)));
 }

@@ -102,7 +102,7 @@ impl Adapter for ClaudeAdapter {
             }
         }
         let mut child = process::spawn(Spawn {
-            program: request.installation.executable.clone(),
+            exec_path: request.installation.executable_path.clone(),
             args,
             cwd: request.options.cwd().clone(),
             env: Vec::new(),
@@ -175,7 +175,7 @@ fn login_methods(installation: &crate::agent::AgentInstallation) -> Vec<LoginMet
     crate::catalog::PROFILES
         .iter()
         .find(|p| p.id == installation.id.as_str())
-        .map(|p| crate::discovery::login_methods(p, &installation.executable))
+        .map(|p| crate::discovery::login_methods(p, &installation.executable_path))
         .unwrap_or_default()
 }
 

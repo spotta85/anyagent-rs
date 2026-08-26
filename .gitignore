@@ -5,3 +5,7 @@ target/
 spikes
 CLAUDE.md
 research
+/PLAN.md
+/V0_LIVE_TESTS.md
+/V0_LIVE_TEST_RESULTS.md
+.kiro/

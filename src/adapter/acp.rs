@@ -53,7 +53,7 @@ impl Adapter for AcpAdapter {
     /// and hands the live wire to the drive task.
     async fn connect(&self, request: ConnectRequest) -> Result<DriverConnection, AgentError> {
         let mut child = process::spawn(Spawn {
-            program: request.installation.executable.clone(),
+            exec_path: request.installation.executable_path.clone(),
             args: self.args.clone(),
             cwd: request.options.cwd().clone(),
             env: Vec::new(),
@@ -117,7 +117,7 @@ async fn handshake(
             json!({ "protocolVersion": 1, "clientCapabilities": {} }),
         )
         .await
-        .map_err(|e| e.into_error(&[], &request.installation.executable))?;
+        .map_err(|e| e.into_error(&[], &request.installation.executable_path))?;
     let init: acp::InitializeResponse = parse(init, "initialize response")?;
 
     let resume = request.options.resume.as_ref();
@@ -142,7 +142,7 @@ async fn handshake(
     let response = wire
         .roundtrip(method, params)
         .await
-        .map_err(|e| e.into_error(&init.auth_methods, &request.installation.executable))?;
+        .map_err(|e| e.into_error(&init.auth_methods, &request.installation.executable_path))?;
 
     let mut info = driver_info(&init, &request.installation.auth);
     let first_class_models = response.get("models").cloned();
@@ -164,14 +164,14 @@ async fn handshake(
             WireError::Rpc { message, .. } => {
                 AgentError::InvalidConfiguration(format!("agent rejected `{id}`: {message}"))
             }
-            e => e.into_error(&init.auth_methods, &request.installation.executable),
+            e => e.into_error(&init.auth_methods, &request.installation.executable_path),
         })?;
         crate::adapter::apply_selection(&mut info, id, value);
     }
     let login = init
         .auth_methods
         .iter()
-        .filter_map(|m| login_method(m, &request.installation.executable))
+        .filter_map(|m| login_method(m, &request.installation.executable_path))
         .collect();
     Ok((info, session_id, login, first_class_model))
 }

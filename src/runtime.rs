@@ -63,7 +63,7 @@ impl Runtime {
         runtime.pinned.push(AgentInstallation {
             name: "Mock".into(),
             id,
-            executable: PathBuf::from("mock"),
+            executable_path: PathBuf::from("mock"),
             source: InstallationSource::Pinned,
             auth: None,
             acp_args: None,

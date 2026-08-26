@@ -15,7 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = Runtime::new();
     let report = runtime.discover().await;
     let agent = report.require(&id)?;
-    println!("· {} at {}", agent.name, agent.executable.display());
+    println!("· {} at {}", agent.name, agent.executable_path.display());
 
     let (session, mut events) = runtime.open(agent, SessionOptions::in_dir(".")).await?;
     println!("· connected — type a message\n");

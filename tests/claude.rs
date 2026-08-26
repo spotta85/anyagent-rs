@@ -534,7 +534,7 @@ async fn a_background_task_wakes_an_agent_originated_turn() {
         match event.kind {
             EventKind::ToolUpdated(tool) if tool.id.as_str() == "toolu_bg" => {
                 assert_eq!(tool.status, ToolStatus::Completed);
-                assert!(event.turn.is_none());
+                assert!(event.turn_info.is_none());
                 background_done = true;
             }
             EventKind::TurnStarted { origin } => {
@@ -567,7 +567,7 @@ async fn subagent_events_carry_the_parent_tool_id() {
     let mut nested_user = None;
     loop {
         let event = next(&mut events).await;
-        let parented = event.turn.as_ref().is_some_and(|t| {
+        let parented = event.turn_info.as_ref().is_some_and(|t| {
             t.parent_tool_id
                 .as_ref()
                 .is_some_and(|p| p.as_str() == "toolu_task")

@@ -1,4 +1,5 @@
-//! Per-agent facts, kept as data. Adding a supported agent is one entry here.
+//! Per-agent facts, kept as data.
+//! Is this file not just beautiful. Credit to sid and of course, our good friend fable.
 
 use crate::agent::AuthKind;
 
@@ -34,6 +35,7 @@ pub(crate) enum Connection {
 }
 
 pub(crate) enum NativeKind {
+    // Current native supported agents.
     Claude,
     Codex,
     /// Antigravity's `agy` CLI: its own stream-json event dialect
@@ -41,7 +43,7 @@ pub(crate) enum NativeKind {
     Antigravity,
 }
 
-/// One offline sign that the user is logged in, and what kind of login it is.
+/// Offiline auth markers for fast discovery
 pub(crate) enum AuthMarker {
     /// File under the agent's config home.
     ConfigFile(&'static str, AuthKind),

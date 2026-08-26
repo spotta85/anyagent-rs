@@ -5,7 +5,7 @@ async fn discover_smoke() {
         println!(
             "FOUND {} at {} ({:?})",
             a.id,
-            a.executable.display(),
+            a.executable_path.display(),
             a.source
         );
     }
