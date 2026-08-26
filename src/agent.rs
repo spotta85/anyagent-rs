@@ -375,11 +375,22 @@ pub enum PermissionMode {
 #[derive(Debug, Clone)]
 pub struct SessionOptions {
     pub(crate) cwd: PathBuf,
-    pub(crate) resume: Option<ResumeToken>,
+    pub(crate) start: SessionStart,
     pub(crate) permission_mode: PermissionMode,
     pub(crate) quiet_window: Option<Duration>,
     pub(crate) mcp_servers: Vec<McpServer>,
     pub(crate) configure: Vec<(ConfigId, ConfigValue)>,
+}
+
+/// How `open` binds to a provider session.
+#[derive(Debug, Clone)]
+pub(crate) enum SessionStart {
+    New,
+    Resume(ResumeToken),
+    Fork {
+        from: ResumeToken,
+        at: Option<crate::event::MessageId>,
+    },
 }
 // Stuff you start the session with.
 impl SessionOptions {
@@ -387,7 +398,7 @@ impl SessionOptions {
     pub fn in_dir(cwd: impl Into<PathBuf>) -> Self {
         Self {
             cwd: cwd.into(),
-            resume: None,
+            start: SessionStart::New,
             permission_mode: PermissionMode::Ask,
             quiet_window: None,
             mcp_servers: Vec::new(),
@@ -405,7 +416,22 @@ impl SessionOptions {
 
     /// Resume a provider session instead of creating a new one.
     pub fn resume(mut self, token: ResumeToken) -> Self {
-        self.resume = Some(token);
+        self.start = SessionStart::Resume(token);
+        self
+    }
+
+    /// Branch a provider session into a new one that starts with its
+    /// conversation; the original stays untouched. `None` forks at the tip.
+    /// `at` cuts the copied history after that message, in the id currency
+    /// the adapter documents (claude: the `claude/fork_point` extension on
+    /// `MessageEnded`). Requires `Capability::Fork`; `open` fails typed
+    /// without it.
+    pub fn fork_from(
+        mut self,
+        token: ResumeToken,
+        at: Option<crate::event::MessageId>,
+    ) -> Self {
+        self.start = SessionStart::Fork { from: token, at };
         self
     }
 

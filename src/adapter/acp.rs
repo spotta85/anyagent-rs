@@ -18,7 +18,7 @@ use crate::adapter::{
 use crate::agent::{
     AgentDetails, AuthStatus, Capabilities, Capability, ConfigChoice, ConfigId, ConfigKind,
     ConfigOption, ConfigSelection, ConfigValue, Input, LoginMethod, McpConnection, McpServer,
-    McpTransport, ResumeToken, SessionConfiguration, SlashCommand,
+    McpTransport, ResumeToken, SessionConfiguration, SessionStart, SlashCommand,
 };
 use crate::error::AgentError;
 use crate::event::{
@@ -120,7 +120,15 @@ async fn handshake(
         .map_err(|e| e.into_error(&[], &request.installation.executable_path))?;
     let init: acp::InitializeResponse = parse(init, "initialize response")?;
 
-    let resume = request.options.resume.as_ref();
+    let resume = match &request.options.start {
+        SessionStart::Resume(token) => Some(token),
+        SessionStart::Fork { .. } => {
+            return Err(AgentError::UnsupportedFeature(
+                "fork (no ACP agent advertises it)".into(),
+            ));
+        }
+        SessionStart::New => None,
+    };
     if resume.is_some() && !init.agent_capabilities.load_session {
         return Err(AgentError::ResumeFailed(
             "this agent does not support session/load".into(),

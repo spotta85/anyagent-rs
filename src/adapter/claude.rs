@@ -15,14 +15,15 @@ use crate::adapter::{
 use crate::agent::{
     AccountInfo, AgentDetails, AuthKind, AuthStatus, Capabilities, Capability, ConfigChoice,
     ConfigId, ConfigKind, ConfigOption, ConfigSelection, ConfigValue, Input, LoginMethod,
-    McpConnection, McpServer, McpTransport, ResumeToken, SessionConfiguration, SlashCommand,
+    McpConnection, McpServer, McpTransport, ResumeToken, SessionConfiguration, SessionStart,
+    SlashCommand,
 };
 use crate::error::AgentError;
 use crate::event::{
     Answer, Choice, ChoiceId, CompletionSource, Diagnostic, DiagnosticLevel, EventKind, Extensions,
-    FileDiff, MessageId, PermissionChoice, PermissionRequest, PlanEntry, PlanStatus, Question,
-    QuestionAnswer, QuestionId, QuestionRequest, RawTool, Request, RequestId, StopReason, ToolId,
-    ToolInput, ToolKind, ToolStatus, ToolUpdate,
+    FileDiff, MessageId, PermissionChoice, PermissionRequest, PlanEntry, PlanStatus, PlanUsage,
+    Question, QuestionAnswer, QuestionId, QuestionRequest, RawTool, Request, RequestId, StopReason,
+    ToolId, ToolInput, ToolKind, ToolStatus, ToolUpdate, UsageWindow,
 };
 use crate::process::{self, Spawn};
 
@@ -30,6 +31,20 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const CLOSE_GRACE: Duration = Duration::from_secs(2);
 const FRAME_BUFFER: usize = 64;
 const OUTPUT_CAP: usize = 16 * 1024;
+
+/// Puts the CLI in stream-json mode with a stdio control channel.
+const BASE_ARGS: [&str; 10] = [
+    "-p",
+    "--output-format",
+    "stream-json",
+    "--input-format",
+    "stream-json",
+    "--verbose",
+    "--include-partial-messages",
+    "--permission-prompt-tool",
+    "stdio",
+    "--replay-user-messages",
+];
 
 /// Launches `claude` in stream-json mode; one instance serves every session.
 pub(crate) struct ClaudeAdapter;
@@ -45,90 +60,7 @@ impl Adapter for ClaudeAdapter {
     /// Spawns the CLI, runs the `initialize` control handshake, and hands the
     /// live wire to the drive task.
     async fn connect(&self, request: ConnectRequest) -> Result<DriverConnection, AgentError> {
-        let mut args: Vec<String> = [
-            "-p",
-            "--output-format",
-            "stream-json",
-            "--input-format",
-            "stream-json",
-            "--verbose",
-            "--include-partial-messages",
-            "--permission-prompt-tool",
-            "stdio",
-            "--replay-user-messages",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
-        // Mint the session id so the resume token exists at open; the CLI
-        // only reports its own with the first prompt's `system/init`.
-        let minted = match &request.options.resume {
-            Some(token) => {
-                args.push("--resume".into());
-                args.push(token.as_str().to_owned());
-                None
-            }
-            None => {
-                let uuid = mint_uuid(0);
-                args.push("--session-id".into());
-                args.push(uuid.clone());
-                Some(uuid)
-            }
-        };
-        if !request.options.mcp_servers.is_empty() {
-            args.push("--mcp-config".into());
-            args.push(mcp_config(&request.options.mcp_servers).to_string());
-        }
-        // Creation-time config rides the launch flags.
-        for (id, value) in &request.options.configure {
-            match (id.as_str(), value) {
-                ("mode", ConfigValue::Text(mode)) => {
-                    args.push("--permission-mode".into());
-                    args.push(mode.clone());
-                }
-                ("model", ConfigValue::Text(model)) => {
-                    args.push("--model".into());
-                    args.push(model.clone());
-                }
-                ("effort", ConfigValue::Text(effort)) => {
-                    args.push("--effort".into());
-                    args.push(effort.clone());
-                }
-                _ => {
-                    return Err(AgentError::InvalidConfiguration(format!(
-                        "`{id}` is not a creation-time option of this agent"
-                    )));
-                }
-            }
-        }
-        let mut child = process::spawn(Spawn {
-            exec_path: request.installation.executable_path.clone(),
-            args,
-            cwd: request.options.cwd().clone(),
-            env: Vec::new(),
-        })
-        .await?;
-        let mut wire = Wire::over(&mut child);
-
-        let handshake = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut wire, &request));
-        let info = match handshake.await {
-            Ok(Ok(mut info)) => {
-                if let Some(uuid) = minted {
-                    info.resume_token = Some(ResumeToken::new(&uuid));
-                }
-                info
-            }
-            Ok(Err(e)) => {
-                let e = with_stderr(e, &child);
-                child.shutdown(CLOSE_GRACE).await;
-                return Err(e);
-            }
-            Err(_) => {
-                child.shutdown(CLOSE_GRACE).await;
-                return Err(AgentError::HandshakeTimeout);
-            }
-        };
-
+        let (child, wire, info) = launch(&request, &request.options.start).await?;
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
         let (ev_tx, ev_rx) = mpsc::channel(FRAME_BUFFER);
         tokio::spawn(
@@ -141,10 +73,13 @@ impl Adapter for ClaudeAdapter {
                 requests: HashMap::new(),
                 messages: HashMap::new(),
                 config: None,
+                usage_request: None,
                 turn_uuid: None,
-                login: login_methods(&request.installation),
+                turn_assistant: None,
+                history: Vec::new(),
                 last_usage: None,
                 next_uuid: 1,
+                request,
             }
             .run(cmd_rx),
         );
@@ -153,6 +88,94 @@ impl Adapter for ClaudeAdapter {
             commands: cmd_tx,
             events: ev_rx,
         })
+    }
+
+    /// Quota probe: spawn, `initialize`, `get_usage`, shut down (~1-2 s).
+    async fn plan_usage(
+        &self,
+        installation: &crate::agent::AgentInstallation,
+    ) -> Result<PlanUsage, AgentError> {
+        let mut child = process::spawn(Spawn {
+            exec_path: installation.executable_path.clone(),
+            args: BASE_ARGS.iter().map(|s| (*s).to_owned()).collect(),
+            cwd: std::env::temp_dir(),
+            env: Vec::new(),
+        })
+        .await?;
+        let mut wire = Wire::over(&mut child);
+        let fetch = async {
+            wire.roundtrip(json!({ "subtype": "initialize", "hooks": {} }))
+                .await?;
+            wire.roundtrip(json!({ "subtype": "get_usage" })).await
+        };
+        let result = match tokio::time::timeout(HANDSHAKE_TIMEOUT, fetch).await {
+            Ok(Ok(response)) => parse_plan_usage(&response).ok_or_else(|| {
+                AgentError::UnsupportedFeature("no plan quota for this login".into())
+            }),
+            Ok(Err(e)) => Err(with_stderr(e.into_error(), &child)),
+            Err(_) => Err(AgentError::HandshakeTimeout),
+        };
+        child.shutdown(CLOSE_GRACE).await;
+        result
+    }
+}
+
+/// Spawns the CLI bound to `start` and handshakes within the timeout: the
+/// one launch recipe for `connect` and rollback's respawn.
+async fn launch(
+    request: &ConnectRequest,
+    start: &SessionStart,
+) -> Result<(process::Child, Wire, DriverInfo), AgentError> {
+    let mut args: Vec<String> = BASE_ARGS.iter().map(|s| (*s).to_owned()).collect();
+    // Mint the session id so the resume token exists at open; the CLI only
+    // reports its own — and a fork's — with the first prompt's `system/init`.
+    let minted = match start {
+        SessionStart::Resume(token) => {
+            args.push("--resume".into());
+            args.push(token.as_str().to_owned());
+            None
+        }
+        SessionStart::Fork { from, at } => {
+            args.push("--resume".into());
+            args.push(from.as_str().to_owned());
+            args.push("--fork-session".into());
+            if let Some(at) = at {
+                args.push(format!("--resume-session-at={at}"));
+            }
+            None
+        }
+        SessionStart::New => {
+            let uuid = mint_uuid(0);
+            args.push("--session-id".into());
+            args.push(uuid.clone());
+            Some(uuid)
+        }
+    };
+    args.extend(option_args(&request.options)?);
+    let mut child = process::spawn(Spawn {
+        exec_path: request.installation.executable_path.clone(),
+        args,
+        cwd: request.options.cwd().clone(),
+        env: Vec::new(),
+    })
+    .await?;
+    let mut wire = Wire::over(&mut child);
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut wire, request)).await {
+        Ok(Ok(mut info)) => {
+            if let Some(uuid) = minted {
+                info.resume_token = Some(ResumeToken::new(&uuid));
+            }
+            Ok((child, wire, info))
+        }
+        Ok(Err(e)) => {
+            let e = with_stderr(e, &child);
+            child.shutdown(CLOSE_GRACE).await;
+            Err(e)
+        }
+        Err(_) => {
+            child.shutdown(CLOSE_GRACE).await;
+            Err(AgentError::HandshakeTimeout)
+        }
     }
 }
 
@@ -168,6 +191,37 @@ async fn handshake(wire: &mut Wire, request: &ConnectRequest) -> Result<DriverIn
         .ok()
         .and_then(|v| v["version"].as_str().map(str::to_owned));
     Ok(driver_info(&init, version, request))
+}
+
+/// MCP declarations and creation-time config as launch flags.
+fn option_args(options: &crate::agent::SessionOptions) -> Result<Vec<String>, AgentError> {
+    let mut args = Vec::new();
+    if !options.mcp_servers.is_empty() {
+        args.push("--mcp-config".into());
+        args.push(mcp_config(&options.mcp_servers).to_string());
+    }
+    for (id, value) in &options.configure {
+        match (id.as_str(), value) {
+            ("mode", ConfigValue::Text(mode)) => {
+                args.push("--permission-mode".into());
+                args.push(mode.clone());
+            }
+            ("model", ConfigValue::Text(model)) => {
+                args.push("--model".into());
+                args.push(model.clone());
+            }
+            ("effort", ConfigValue::Text(effort)) => {
+                args.push("--effort".into());
+                args.push(effort.clone());
+            }
+            _ => {
+                return Err(AgentError::InvalidConfiguration(format!(
+                    "`{id}` is not a creation-time option of this agent"
+                )));
+            }
+        }
+    }
+    Ok(args)
 }
 
 /// Runnable login methods from the catalog, for mid-session auth loss.
@@ -341,6 +395,9 @@ fn driver_info(init: &Value, version: Option<String>, request: &ConnectRequest) 
                     Capability::Questions,
                     Capability::Subagents,
                     Capability::ContextUsage,
+                    Capability::PlanUsage,
+                    Capability::Rollback,
+                    Capability::Fork,
                     Capability::SlashCommands,
                     Capability::Resume,
                 ]);
@@ -355,8 +412,12 @@ fn driver_info(init: &Value, version: Option<String>, request: &ConnectRequest) 
             commands,
         },
         configuration,
-        // Resuming keeps the token; a new session's arrives with `system/init`.
-        resume_token: request.options.resume.clone(),
+        // Resuming keeps the token; a new session's or a fork's arrives
+        // with `system/init`.
+        resume_token: match &request.options.start {
+            SessionStart::Resume(token) => Some(token.clone()),
+            SessionStart::New | SessionStart::Fork { .. } => None,
+        },
         title: None,
         // Every turn shape ends with its own `result` frame.
         deterministic_turn_end: true,
@@ -393,15 +454,24 @@ struct Drive {
     messages: HashMap<Option<String>, MessageId>,
     /// An in-flight configure: wire id plus the selection to apply on success.
     config: Option<(String, ConfigId, ConfigValue)>,
+    /// An in-flight `get_usage`, sent after each `result` frame.
+    usage_request: Option<String>,
     /// Context occupancy of the latest assistant message.
     last_usage: Option<u64>,
     /// The running turn's user-message uuid. An interrupt that lands before
     /// the CLI starts the turn cancels the message out of its queue and never
     /// sends a `result`; the interrupt receipt names this uuid instead.
     turn_uuid: Option<String>,
+    /// The running turn's last main-transcript assistant frame uuid.
+    turn_assistant: Option<String>,
+    /// One entry per completed turn, oldest first: its last assistant frame
+    /// uuid. Rollback cuts at the last *kept* turn's entry — forking at a
+    /// user message re-runs it, and result uuids are not transcript
+    /// messages (probed 2026-08-25).
+    history: Vec<Option<String>>,
+    /// The original connect request: the relaunch recipe for rollback.
+    request: ConnectRequest,
     next_uuid: u64,
-    /// Runnable login methods from the catalog, for mid-session auth loss.
-    login: Vec<LoginMethod>,
 }
 
 impl Drive {
@@ -474,13 +544,7 @@ impl Drive {
                 let wire_id = self.wire.control(request).await?;
                 self.config = Some((wire_id, id, value));
             }
-            DriverCommand::Rollback(turns) => {
-                self.diagnostic(
-                    DiagnosticLevel::Warning,
-                    format!("rollback({turns}) is not supported by the Claude adapter yet"),
-                )
-                .await?;
-            }
+            DriverCommand::Rollback(turns) => self.rollback(turns).await?,
             DriverCommand::Close => unreachable!("handled in run"),
         }
         Ok(())
@@ -540,7 +604,22 @@ impl Drive {
             "message_stop" => {
                 let message_id = self.message_id(&parent);
                 self.messages.remove(&parent);
-                Some(EventKind::MessageEnded { message_id })
+                // The transcript frame uuid is the only id
+                // `--resume-session-at` accepts (probed 2026-08-25); it
+                // rides as the fork anchor for `fork_from(_, at)`.
+                let mut extensions = Extensions::new();
+                if parent.is_none()
+                    && let Some(uuid) = &self.turn_assistant
+                {
+                    extensions.insert("claude/fork_point".into(), Value::from(uuid.clone()));
+                }
+                return self
+                    .emit(DriverEvent::Event {
+                        kind: EventKind::MessageEnded { message_id },
+                        parent_tool_id: parent.map(ToolId::new),
+                        extensions,
+                    })
+                    .await;
             }
             _ => None,
         };
@@ -555,14 +634,19 @@ impl Drive {
     async fn on_assistant(&mut self, frame: &Value) -> Result<(), Gone> {
         // A synthetic API-error message with the typed auth marker means the
         // credentials died; the engine fails the turn and closes the session.
-        if frame["error"].as_str() == Some("authentication_failed") && !self.login.is_empty() {
-            return self
-                .emit(DriverEvent::AuthLost {
-                    login: self.login.clone(),
-                })
-                .await;
+        if frame["error"].as_str() == Some("authentication_failed")
+            && let login = login_methods(&self.request.installation)
+            && !login.is_empty()
+        {
+            return self.emit(DriverEvent::AuthLost { login }).await;
         }
         let parent = parent_of(frame);
+        // Main-transcript assistant frames are the valid rollback cut points.
+        if parent.is_none()
+            && let Some(uuid) = frame["uuid"].as_str()
+        {
+            self.turn_assistant = Some(uuid.to_owned());
+        }
         if let Some(used) = context_tokens(&frame["message"]["usage"]) {
             self.last_usage = Some(used);
         }
@@ -688,6 +772,20 @@ impl Drive {
                 .emit(DriverEvent::TurnEnded(StopReason::Cancelled))
                 .await;
         }
+        let for_usage = self
+            .usage_request
+            .as_ref()
+            .is_some_and(|id| response["request_id"].as_str() == Some(id));
+        if for_usage {
+            // Errors stay silent: API-key logins have no quota to report.
+            self.usage_request = None;
+            if let Some(usage) = parse_plan_usage(&response["response"]) {
+                return self
+                    .emit(DriverEvent::event(EventKind::PlanUsageUpdated(usage)))
+                    .await;
+            }
+            return Ok(());
+        }
         let for_config = self
             .config
             .as_ref()
@@ -713,6 +811,7 @@ impl Drive {
     /// Exactly one `result` per turn.
     async fn on_result(&mut self, frame: &Value) -> Result<(), Gone> {
         self.turn_uuid = None;
+        self.history.push(self.turn_assistant.take());
         // Backgrounded tools stay tracked; `task_notification` finishes them.
         self.tools.retain(|_, tool| tool.status.is_active());
         if let Some(used) = self.last_usage.take() {
@@ -723,7 +822,84 @@ impl Drive {
             }))
             .await?;
         }
-        self.emit(DriverEvent::TurnEnded(stop_reason(frame))).await
+        self.emit(DriverEvent::TurnEnded(stop_reason(frame))).await?;
+        // Refresh plan quota after every turn; the receipt becomes
+        // `PlanUsageUpdated` in `on_control_response`.
+        self.usage_request = Some(self.wire.control(json!({ "subtype": "get_usage" })).await?);
+        Ok(())
+    }
+
+    /// Emulated rollback (the CLI has none in place): respawn forked at the
+    /// last kept turn's final assistant message, dropping the last `turns`
+    /// completed turns. The engine guarantees the session is idle. The
+    /// resume token clears until the fork names itself on the next prompt's
+    /// `system/init`; the old session stays resumable on disk. A failed
+    /// respawn closes the session.
+    async fn rollback(&mut self, turns: std::num::NonZeroU32) -> Result<(), Gone> {
+        let n = turns.get() as usize;
+        if n >= self.history.len() {
+            return self
+                .diagnostic(
+                    DiagnosticLevel::Warning,
+                    format!(
+                        "rollback({n}) rejected: {} completed turns, and at least one must \
+                         remain (open a new session instead)",
+                        self.history.len()
+                    ),
+                )
+                .await;
+        }
+        let Some(cut) = self.history[self.history.len() - n - 1].clone() else {
+            return self
+                .diagnostic(
+                    DiagnosticLevel::Warning,
+                    "rollback rejected: the turn at the cut point produced no assistant message",
+                )
+                .await;
+        };
+        let Some(token) = self.info.resume_token.clone() else {
+            return self
+                .diagnostic(
+                    DiagnosticLevel::Warning,
+                    "rollback rejected: no provider session id yet",
+                )
+                .await;
+        };
+        // The old process goes first so its transcript is flushed before the
+        // fork reads it.
+        self.child.shutdown(CLOSE_GRACE).await;
+        match self.respawn_forked(&token, &cut).await {
+            Ok(()) => {
+                self.history.truncate(self.history.len() - n);
+                // In-flight state died with the old wire; the new one reuses
+                // its control ids, so stale ones would mis-match receipts.
+                self.messages.clear();
+                self.tools.clear();
+                self.usage_request = None;
+                self.config = None;
+                self.info.resume_token = None;
+                self.emit(DriverEvent::InfoChanged(self.info.clone())).await
+            }
+            Err(e) => {
+                self.diagnostic(DiagnosticLevel::Error, format!("rollback failed: {e}"))
+                    .await?;
+                self.report_exit().await;
+                Err(Gone)
+            }
+        }
+    }
+
+    /// Launches a fork of `token` cut at `cut`, swapping in the new child
+    /// on success.
+    async fn respawn_forked(&mut self, token: &ResumeToken, cut: &str) -> Result<(), AgentError> {
+        let start = SessionStart::Fork {
+            from: token.clone(),
+            at: Some(MessageId::new(cut)),
+        };
+        let (child, wire, _) = launch(&self.request, &start).await?;
+        self.child = child;
+        self.wire = wire;
+        Ok(())
     }
 
     /// `system/init` carries the provider session id (= resume token).
@@ -1184,6 +1360,71 @@ fn context_tokens(usage: &Value) -> Option<u64> {
     .filter_map(|k| usage[*k].as_u64())
     .sum();
     Some(sum)
+}
+
+/// `get_usage` receipt → quota windows, from `rate_limits.limits`.
+fn parse_plan_usage(response: &Value) -> Option<PlanUsage> {
+    let limits = response["rate_limits"]["limits"].as_array()?;
+    let windows: Vec<UsageWindow> = limits
+        .iter()
+        .filter_map(|limit| {
+            Some(UsageWindow {
+                label: window_label(limit),
+                used_percent: limit["percent"].as_u64()?.min(100) as u8,
+                resets_at: limit["resets_at"].as_str().and_then(parse_rfc3339),
+            })
+        })
+        .collect();
+    (!windows.is_empty()).then(|| PlanUsage {
+        windows,
+        fetched_at: std::time::SystemTime::now(),
+    })
+}
+
+/// "Session", "Week", or "Week (Fable)" for model-scoped windows.
+fn window_label(limit: &Value) -> String {
+    let base = match limit["group"].as_str() {
+        Some("session") => "Session",
+        Some("weekly") => "Week",
+        _ => limit["kind"].as_str().unwrap_or("Unknown"),
+    };
+    match limit["scope"]["model"]["display_name"].as_str() {
+        Some(model) => format!("{base} ({model})"),
+        None => base.to_owned(),
+    }
+}
+
+/// "2026-08-23T08:59:59.746+00:00" → SystemTime. Fractional seconds are
+/// dropped; quota resets do not need them.
+fn parse_rfc3339(s: &str) -> Option<std::time::SystemTime> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 19 || bytes[10] != b'T' {
+        return None;
+    }
+    let num = |range: std::ops::Range<usize>| s.get(range)?.parse::<i64>().ok();
+    let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (h, mi, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    // Offset is "Z" or "±HH:MM", after any ".fraction".
+    let rest = &s[19..];
+    let tz = rest.find(['Z', '+', '-']).map(|i| &rest[i..])?;
+    let offset = match tz.as_bytes()[0] {
+        b'Z' => 0,
+        sign => {
+            let secs = tz.get(1..3)?.parse::<i64>().ok()? * 3600
+                + tz.get(4..6)?.parse::<i64>().ok()? * 60;
+            if sign == b'-' { -secs } else { secs }
+        }
+    };
+    // Days since 1970-01-01 (Howard Hinnant's civil-date algorithm).
+    let y = if mo <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if mo > 2 { mo - 3 } else { mo + 9 }) + 2) / 5 + d - 1;
+    let days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
+    let epoch = days * 86400 + h * 3600 + mi * 60 + sec - offset;
+    u64::try_from(epoch)
+        .ok()
+        .map(|secs| std::time::UNIX_EPOCH + Duration::from_secs(secs))
 }
 
 fn context_window(model_usage: &Value) -> Option<u64> {

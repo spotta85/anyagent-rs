@@ -21,7 +21,7 @@ use std::time::Duration;
 use futures::StreamExt;
 
 use anyagent::{
-    AgentError, Answer, AuthStatus, Capability, DeliveryKind, Event, EventKind, Events,
+    AgentError, Answer, AuthStatus, Capability, DeliveryKind, Event, EventKind, Events, MessageId,
     PermissionChoice, QuestionAnswer, Request, RequestId, Runtime, Session, SessionOptions,
     StopReason, ToolStatus, TurnOrigin,
 };
@@ -553,6 +553,203 @@ async fn resume_recalls_without_replaying() {
 
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
+async fn plan_usage_arrives_after_a_turn() {
+    for h in enabled() {
+        let (session, mut events, _dir) = open(h).await;
+        if !session
+            .info()
+            .details
+            .capabilities
+            .supports(Capability::PlanUsage)
+        {
+            println!("SKIP {h}: plan usage not advertised");
+            session.close().await.unwrap();
+            continue;
+        }
+        session.prompt("Say OK. No tools.").await.unwrap();
+        drain_to_turn_end(&session, &mut events, &format!("{h}: usage turn")).await;
+        // The adapter refreshes quota right after the turn.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let usage = loop {
+            let event = tokio::time::timeout_at(deadline, events.next())
+                .await
+                .unwrap_or_else(|_| panic!("{h}: no PlanUsageUpdated within 10s of turn end"))
+                .expect("stream ended")
+                .unwrap();
+            if let EventKind::PlanUsageUpdated(usage) = event.kind {
+                break usage;
+            }
+        };
+        assert!(!usage.windows.is_empty(), "{h}: quota with no windows");
+        for w in &usage.windows {
+            assert!(w.used_percent <= 100, "{h}: {} at {}%", w.label, w.used_percent);
+        }
+        assert!(
+            usage.windows.iter().any(|w| w.resets_at.is_some()),
+            "{h}: no window carries a reset time"
+        );
+        session.close().await.unwrap();
+        let summary: Vec<_> = usage
+            .windows
+            .iter()
+            .map(|w| format!("{} {}%", w.label, w.used_percent))
+            .collect();
+        pass(h, &format!("plan usage pushed: {}", summary.join(", ")));
+    }
+}
+
+#[tokio::test]
+#[ignore = "live: talks to real agents"]
+async fn rollback_forgets_the_rolled_back_turn() {
+    for h in enabled() {
+        let (session, mut events, _dir) = open(h).await;
+        if !session
+            .info()
+            .details
+            .capabilities
+            .supports(Capability::Rollback)
+        {
+            println!("SKIP {h}: rollback not advertised");
+            session.close().await.unwrap();
+            continue;
+        }
+        session
+            .prompt("Remember this codeword: ALPHA9. Just confirm. No tools.")
+            .await
+            .unwrap();
+        drain_to_turn_end(&session, &mut events, &format!("{h}: codeword one")).await;
+        session
+            .prompt("Remember a second codeword: ZULU7. Just confirm. No tools.")
+            .await
+            .unwrap();
+        drain_to_turn_end(&session, &mut events, &format!("{h}: codeword two")).await;
+        let before = session.info().resume_token.expect("token before rollback");
+
+        session.rollback(NonZeroU32::new(1).unwrap()).await.unwrap();
+        session
+            .prompt("List every codeword I told you, comma separated, nothing else. No tools.")
+            .await
+            .unwrap();
+        let text = drain_to_turn_end(&session, &mut events, &format!("{h}: recall turn")).await;
+        assert!(text.contains("ALPHA9"), "{h}: kept turn forgotten: {text:?}");
+        assert!(!text.contains("ZULU7"), "{h}: rolled-back turn recalled: {text:?}");
+        // The emulated fork renames the provider session.
+        let after = session.info().resume_token.expect("token after rollback");
+        assert_ne!(after.as_str(), before.as_str(), "{h}: token did not change");
+        session.close().await.unwrap();
+        pass(h, "rollback forgot exactly the last turn");
+    }
+}
+
+#[tokio::test]
+#[ignore = "live: talks to real agents"]
+async fn fork_from_branches_at_a_point_and_at_the_tip() {
+    for h in enabled() {
+        let (session, mut events, dir) = open(h).await;
+        if !session
+            .info()
+            .details
+            .capabilities
+            .supports(Capability::Fork)
+        {
+            println!("SKIP {h}: fork not advertised");
+            session.close().await.unwrap();
+            continue;
+        }
+        // Two codeword turns; keep each turn's last fork anchor
+        // (`claude/fork_point` on MessageEnded).
+        let mut anchors = Vec::new();
+        for codeword in ["ALPHA9", "ZULU7"] {
+            session
+                .prompt(format!(
+                    "Remember this codeword: {codeword}. Just confirm. No tools."
+                ))
+                .await
+                .unwrap();
+            let mut anchor = None;
+            loop {
+                let event = next(&mut events, &format!("{h}: codeword turn")).await;
+                match event.kind {
+                    EventKind::MessageEnded { .. } => {
+                        if let Some(point) = event.extensions.get("claude/fork_point") {
+                            anchor = point.as_str().map(str::to_owned);
+                        }
+                    }
+                    EventKind::TurnEnded { .. } => break,
+                    _ => {}
+                }
+            }
+            anchors.push(anchor.expect("fork anchor on the turn's messages"));
+        }
+        let token = session.info().resume_token.expect("token after turns");
+        session.close().await.unwrap();
+
+        let runtime = Runtime::new();
+        let report = runtime.discover().await;
+        let agent = report.require(h).unwrap();
+        let recall = "List every codeword I told you, comma separated, nothing else. No tools.";
+
+        // Fork at turn one's anchor: the branch forgets ZULU7.
+        let (forked, mut fork_events) = runtime
+            .open(
+                agent,
+                SessionOptions::in_dir(dir.path())
+                    .fork_from(token.clone(), Some(MessageId::new(&anchors[0]))),
+            )
+            .await
+            .unwrap();
+        forked.prompt(recall).await.unwrap();
+        let text = drain_to_turn_end(&forked, &mut fork_events, &format!("{h}: cut fork")).await;
+        assert!(text.contains("ALPHA9"), "{h}: cut fork lost turn 1: {text:?}");
+        assert!(!text.contains("ZULU7"), "{h}: cut fork kept turn 2: {text:?}");
+        let fork_token = forked.info().resume_token.expect("fork token");
+        assert_ne!(fork_token.as_str(), token.as_str(), "{h}: fork kept the id");
+        forked.close().await.unwrap();
+
+        // Fork at the tip: the branch knows both — which also proves the
+        // original transcript survived the first fork untouched.
+        let (tip, mut tip_events) = runtime
+            .open(
+                agent,
+                SessionOptions::in_dir(dir.path()).fork_from(token.clone(), None),
+            )
+            .await
+            .unwrap();
+        tip.prompt(recall).await.unwrap();
+        let text = drain_to_turn_end(&tip, &mut tip_events, &format!("{h}: tip fork")).await;
+        assert!(
+            text.contains("ALPHA9") && text.contains("ZULU7"),
+            "{h}: tip fork lost history: {text:?}"
+        );
+        tip.close().await.unwrap();
+        pass(h, "forked at a point and at the tip; original untouched");
+    }
+}
+
+#[tokio::test]
+#[ignore = "live: talks to real agents"]
+async fn runtime_plan_usage_probes_without_a_session() {
+    for h in enabled() {
+        let runtime = Runtime::new();
+        let report = runtime.discover().await;
+        let agent = report.require(h).unwrap();
+        match runtime.plan_usage(agent).await {
+            Ok(usage) => {
+                assert!(!usage.windows.is_empty(), "{h}: quota with no windows");
+                let cached = runtime.plan_usage(agent).await.unwrap();
+                assert_eq!(cached.fetched_at, usage.fetched_at, "{h}: cache missed");
+                pass(h, &format!("probe returned {} windows, cached", usage.windows.len()));
+            }
+            Err(AgentError::UnsupportedFeature(_)) => {
+                println!("SKIP {h}: plan usage unsupported (typed)");
+            }
+            Err(e) => panic!("{h}: plan usage probe failed: {e:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "live: talks to real agents"]
 async fn a_killed_agent_fails_the_turn_and_closes_the_session() {
     for h in enabled() {
         if h == "hermes" {
@@ -623,21 +820,22 @@ async fn errors_are_typed() {
             continue;
         }
         let (session, mut events, _dir) = open(h).await;
-        // (a) an unadvertised feature refuses typed.
-        assert!(
-            !session
-                .info()
-                .details
-                .capabilities
-                .supports(Capability::Rollback)
-        );
-        assert!(
-            matches!(
-                session.rollback(NonZeroU32::new(1).unwrap()).await,
-                Err(AgentError::UnsupportedFeature(_))
-            ),
-            "{h}: rollback should be UnsupportedFeature"
-        );
+        // (a) an unadvertised feature refuses typed (claude advertises
+        // rollback now, so it proves this elsewhere).
+        if !session
+            .info()
+            .details
+            .capabilities
+            .supports(Capability::Rollback)
+        {
+            assert!(
+                matches!(
+                    session.rollback(NonZeroU32::new(1).unwrap()).await,
+                    Err(AgentError::UnsupportedFeature(_))
+                ),
+                "{h}: rollback should be UnsupportedFeature"
+            );
+        }
         // (b) answering a request that is not open refuses typed.
         assert!(
             matches!(

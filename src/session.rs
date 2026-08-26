@@ -1,6 +1,5 @@
-//! The session engine: one task per session that owns the adapter connection,
-//! the turn state machine, and the prompt queue. `Session` and `Events` are
-//! the two channel ends an application holds.
+//! Session management  - super long ass file.
+//! This is the main engine.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroU32;
@@ -27,14 +26,14 @@ use crate::event::{
     StopReason, ToolId, TurnContext, TurnId, TurnOrigin,
 };
 
-const EVENT_BUFFER: usize = 256;
+const EVENT_BUFFER: usize = 256; // more than enough.
 const CLOSE_GRACE: Duration = Duration::from_secs(5);
 const QUIET_USER_TURN: Duration = Duration::from_secs(120);
 const QUIET_AGENT_TURN: Duration = Duration::from_secs(20);
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
-/// Snapshot of a live session. Also carried by `EventKind::SessionUpdated`.
+/// Metadata of a live session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: SessionId,
@@ -42,23 +41,22 @@ pub struct SessionInfo {
     pub details: AgentDetails,
     pub configuration: SessionConfiguration,
     pub resume_token: Option<ResumeToken>,
-    /// Agent-suggested title when the protocol provides one.
+    /// Agent-suggested title (if harness supports)
     pub title: Option<String>,
 }
 
-/// Command handle. Cheap to clone; every clone talks to the same engine task.
+/// Lightweight Command handle only (dont contiain queue, requets, active turn - those are in engine)
 #[derive(Clone)]
 pub struct Session {
     id: SessionId,
-    commands: mpsc::Sender<Command>,
+    commands: mpsc::Sender<Command>, // sent to engine 
     info: Arc<Mutex<SessionInfo>>,
 }
 
-/// Ordered event stream. Buffers 256 events, then applies backpressure.
-///
-/// Drain it continuously. The engine is one task, so a full buffer parks it
-/// mid-send and it stops reading commands: `answer`, `cancel`, and `close`
-/// will not return until the consumer reads again.
+
+/// Stream of udpates from session
+/// Lets callers use normal async steram messages
+/// Engine feeds, application reads.
 pub struct Events(mpsc::Receiver<Result<Event, AgentError>>);
 
 impl Stream for Events {
@@ -68,9 +66,9 @@ impl Stream for Events {
         self.0.poll_recv(cx)
     }
 }
-
+/// Response from engine to session when session does prompt()
 type Reply<T> = oneshot::Sender<Result<T, AgentError>>;
-
+/// What caller can beg engine to do :)
 enum Command {
     Prompt(Input, Reply<Delivery>),
     Dequeue(PromptId, Reply<()>),
@@ -91,8 +89,7 @@ impl Session {
         self.info.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// Starts a turn when idle. During a live turn, steers when possible or
-    /// queues the input. The return value reports the chosen delivery.
+    /// Starts. If running, then steer / queueu. Closed -> `SessionClosed`.
     pub async fn prompt(&self, input: impl Into<Input>) -> Result<Delivery, AgentError> {
         self.send(|reply| Command::Prompt(input.into(), reply))
             .await
@@ -110,19 +107,20 @@ impl Session {
     }
 
     /// Applies one model or option selection; confirmed by `SessionUpdated`.
+    /// TODO: Look closer at this for config changes. 
     pub async fn configure(&self, selection: ConfigSelection) -> Result<(), AgentError> {
         self.send(|reply| Command::Configure(selection, reply))
             .await
     }
 
-    /// Rewinds provider-owned conversation context by completed turns.
-    /// Requires an idle session and `Capability::Rollback`.
+    /// Rewinds the session ONLY, NOT file changes. Only if Capability::Rollback is supported. 
+    /// FILe rollbak will be implemented soon :)
     pub async fn rollback(&self, turns: NonZeroU32) -> Result<(), AgentError> {
         self.send(|reply| Command::Rollback(turns, reply)).await
     }
 
-    /// Idempotently interrupts the active turn. The session and the queue
-    /// survive; the next queued prompt starts unless `clear_queue` is set.
+    /// Stops the active turn. The session and the queue survive; the next
+    /// queued prompt starts unless `clear_queue` is set.
     pub async fn cancel(&self, clear_queue: bool) -> Result<(), AgentError> {
         self.send(|reply| Command::Cancel { clear_queue, reply })
             .await

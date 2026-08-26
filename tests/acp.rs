@@ -376,6 +376,21 @@ async fn resuming_an_agent_without_load_session_fails() {
 }
 
 #[tokio::test]
+async fn forking_an_acp_agent_fails_typed() {
+    let runtime = Runtime::new();
+    let error = runtime
+        .open(
+            &fixture(&[]),
+            SessionOptions::in_dir(std::env::temp_dir())
+                .fork_from(ResumeToken::new("sess-1"), None),
+        )
+        .await
+        .err()
+        .expect("fork must be refused, not silently replaced");
+    assert!(matches!(error, AgentError::UnsupportedFeature(_)));
+}
+
+#[tokio::test]
 async fn auth_required_carries_runnable_login_methods() {
     let runtime = Runtime::new();
     let result = runtime

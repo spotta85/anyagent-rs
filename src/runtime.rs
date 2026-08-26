@@ -2,15 +2,18 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use crate::adapter::{Adapter, ConnectRequest};
 use crate::agent::{AgentId, AgentInstallation, SessionOptions};
 use crate::error::AgentError;
-use crate::event::Diagnostic;
+use crate::event::{Diagnostic, PlanUsage};
 use crate::session::{self, Events, Session};
+
+const USAGE_CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// The one object an application creates. Holds the adapter registry.
 pub struct Runtime {
@@ -18,6 +21,8 @@ pub struct Runtime {
     /// Installations known without discovery (tests and pinned agents).
     pinned: Vec<AgentInstallation>,
     profiles: &'static [crate::catalog::AgentProfile],
+    /// `plan_usage` results, kept for `USAGE_CACHE_TTL`.
+    usage_cache: Mutex<HashMap<AgentId, (Instant, PlanUsage)>>,
 }
 
 impl Default for Runtime {
@@ -48,6 +53,7 @@ impl Runtime {
             adapters,
             pinned: Vec::new(),
             profiles: crate::catalog::PROFILES,
+            usage_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -111,6 +117,45 @@ impl Runtime {
             .await?;
         Ok(session::start(agent.clone(), connection, &options))
     }
+
+    /// Plan quota windows for the logged-in account. Agents without quota
+    /// (or with an API-key login) return `UnsupportedFeature`. May spawn a
+    /// short-lived agent process; results are cached for 60 s.
+    pub async fn plan_usage(&self, agent: &AgentInstallation) -> Result<PlanUsage, AgentError> {
+        if let Some((at, usage)) = self.usage_cache.lock().unwrap().get(&agent.id)
+            && at.elapsed() < USAGE_CACHE_TTL
+        {
+            return Ok(usage.clone());
+        }
+        let adapter = self
+            .adapters
+            .get(&agent.id)
+            .ok_or_else(|| AgentError::UnsupportedFeature("plan usage".into()))?;
+        let usage = adapter.plan_usage(agent).await?;
+        self.usage_cache
+            .lock()
+            .unwrap()
+            .insert(agent.id.clone(), (Instant::now(), usage.clone()));
+        Ok(usage)
+    }
+
+    /// One call for a usage page: every discovered agent with its quota or
+    /// the typed reason it has none. Per-agent probes run concurrently.
+    pub async fn plan_usage_all(&self) -> Vec<AgentPlanUsage> {
+        let report = self.discover().await;
+        let probes = report.agents.into_iter().map(|agent| async move {
+            let usage = self.plan_usage(&agent).await;
+            AgentPlanUsage { agent, usage }
+        });
+        futures::future::join_all(probes).await
+    }
+}
+
+/// One row of a usage page: the agent and its quota, or why it has none.
+#[derive(Debug)]
+pub struct AgentPlanUsage {
+    pub agent: AgentInstallation,
+    pub usage: Result<PlanUsage, AgentError>,
 }
 
 /// What `discover` found and what it could not read.

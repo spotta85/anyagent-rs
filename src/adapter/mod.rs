@@ -120,6 +120,7 @@ pub(crate) fn apply_selection(
     true
 }
 
+#[derive(Clone)]
 pub(crate) struct ConnectRequest {
     pub installation: AgentInstallation,
     pub options: SessionOptions,
@@ -135,4 +136,14 @@ pub(crate) struct DriverConnection {
 pub(crate) trait Adapter: Send + Sync {
     /// Launch, handshake, and create the provider session.
     async fn connect(&self, request: ConnectRequest) -> Result<DriverConnection, AgentError>;
+
+    /// Plan quota for the logged-in account, from a short-lived process.
+    /// Default: this agent has no quota to report.
+    async fn plan_usage(
+        &self,
+        installation: &AgentInstallation,
+    ) -> Result<crate::event::PlanUsage, AgentError> {
+        let _ = installation;
+        Err(AgentError::UnsupportedFeature("plan usage".into()))
+    }
 }

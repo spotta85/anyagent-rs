@@ -23,7 +23,7 @@ claude -p --output-format stream-json --input-format stream-json --verbose
 | 06-control-requests-and-compact | `initialize`, `get_context_usage`, `get_usage`, `list_models`, `mcp_status`, `set_model`, `set_permission_mode`, `get_binary_version`, unknown subtype error; `/compact` over stdin |
 | 07-ask-user-question | `AskUserQuestion` arrives as `can_use_tool` with `requires_user_interaction` |
 | 08-resume | `--resume <id>`: same session id, no history replay |
-| 09-fork-at | `--resume <id> --fork-session --resume-session-at=<uuid>`: new id, history cut at the uuid |
+| 09-fork-at | `--resume <id> --fork-session --resume-session-at=<uuid>`: new id, resumes AT the uuid: a user-message uuid re-runs that message; cut by naming the last KEPT assistant frame (result uuids hang) |
 | 10-rewind-files | `rewind_files` with `CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING=true` |
 
 Authoritative types: `@anthropic-ai/claude-agent-sdk` `sdk.d.ts` (same version

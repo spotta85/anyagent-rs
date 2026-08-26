@@ -7,7 +7,10 @@ import { createInterface } from 'node:readline';
 const flag = (name) => process.argv.includes(name);
 const send = (m) => process.stdout.write(JSON.stringify(m) + '\n');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const S = 'sess-c1';
+// A fork launch (`--fork-session`, optionally `--resume-session-at=<uuid>`)
+// is a fresh process with a new session id, like the real CLI (recording 09).
+const FORK_AT = (process.argv.find((a) => a.startsWith('--resume-session-at=')) ?? '').slice(20) || null;
+const S = flag('--fork-session') ? 'sess-fork-1' : 'sess-c1';
 let n = 0;
 const uid = () => `f${n++}`;
 const USAGE = { input_tokens: 2, cache_creation_input_tokens: 198, cache_read_input_tokens: 1000, output_tokens: 0 };
@@ -16,7 +19,7 @@ const ev = (event, parent = null) => send({ type: 'stream_event', event, session
 const delta = (d, parent = null) => ev({ type: 'content_block_delta', index: 0, delta: d }, parent);
 const msgStart = (id, parent = null) => ev({ type: 'message_start', message: { id, model: 'claude-sonnet-5', role: 'assistant', content: [], usage: USAGE } }, parent);
 const life = (cu, state) => send({ type: 'command_lifecycle', command_uuid: cu, state, uuid: uid(), session_id: S });
-const assistantTool = (id, name, input) => send({ type: 'assistant', message: { id: 'msg_1', model: 'claude-sonnet-5', role: 'assistant', content: [{ type: 'tool_use', id, name, input }], usage: USAGE }, session_id: S, uuid: uid(), parent_tool_use_id: null });
+const assistantTool = (id, name, input, frameUuid) => send({ type: 'assistant', message: { id: 'msg_1', model: 'claude-sonnet-5', role: 'assistant', content: [{ type: 'tool_use', id, name, input }], usage: USAGE }, session_id: S, uuid: frameUuid ?? uid(), parent_tool_use_id: null });
 const resultFrame = (extra) => send({ type: 'result', session_id: S, uuid: uid(), subtype: 'success', is_error: false, stop_reason: 'end_turn', terminal_reason: 'completed', num_turns: 1, total_cost_usd: 0.01, usage: {}, modelUsage: { 'claude-sonnet-5': { contextWindow: 200000 } }, result: 'done', ...extra });
 
 let ctrlWaiters = {}, turn = null, inited = false, reqN = 0, queue = [];
@@ -62,6 +65,13 @@ function onControl(m) {
       return reply({});
     case 'get_binary_version':
       return reply({ version: '2.1.241', buildTime: '2026-08-22T22:46:48Z' });
+    case 'get_usage':
+      // Recorded 2026-08-23 (issue 04); only `rate_limits.limits` matters.
+      return reply({ subscription_type: 'max', rate_limits_available: true, rate_limits: { limits: [
+        { kind: 'session', group: 'session', percent: 42, severity: 'normal', resets_at: '2026-08-23T08:59:59.746028+00:00', scope: null, is_active: true },
+        { kind: 'weekly_all', group: 'weekly', percent: 5, severity: 'normal', resets_at: '2026-08-24T18:59:59.746057+00:00', scope: null, is_active: false },
+        { kind: 'weekly_scoped', group: 'weekly', percent: 9, severity: 'normal', resets_at: '2026-08-24T18:59:59.746461+00:00', scope: { model: { id: null, display_name: 'Fable' }, surface: null }, is_active: false },
+      ] } });
     case 'interrupt': {
       const cancelled = [];
       if (turn) turn.interrupted = true;
@@ -166,6 +176,9 @@ async function runTurn(m) {
   msgStart('msg_1');
   delta({ type: 'thinking_delta', thinking: 'thinking…' });
   delta({ type: 'text_delta', text: 'Hello ' });
+  // Echo identity so rollback tests can assert the fork cut point.
+  if (flag('--echo-uuid')) delta({ type: 'text_delta', text: `uuid=${u} ` });
+  if (FORK_AT) delta({ type: 'text_delta', text: `fork=${FORK_AT} ` });
   // Echo --mcp-config so tests can assert the launch shape.
   const mi = process.argv.indexOf('--mcp-config');
   if (mi > -1) {
@@ -189,7 +202,9 @@ async function runTurn(m) {
   }
   delta({ type: 'text_delta', text: `perm=${behavior} ` });
   if (flag('--eof')) { process.stderr.write('boom: fixture died\n'); process.exit(3); }
-  assistantTool('toolu_todo', 'TodoWrite', { todos: [{ content: 'step 1', status: 'in_progress' }] });
+  // Deterministic last-assistant uuid (`a-<user uuid>`): the rollback cut
+  // point a test can predict.
+  assistantTool('toolu_todo', 'TodoWrite', { todos: [{ content: 'step 1', status: 'in_progress' }] }, `a-${u}`);
   delta({ type: 'text_delta', text: 'done' });
   ev({ type: 'message_stop' });
   send({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed', resetsAt: 1, rateLimitType: 'five_hour' }, uuid: uid(), session_id: S });

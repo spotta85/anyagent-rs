@@ -19,5 +19,5 @@ mod session;
 pub use agent::*;
 pub use error::AgentError;
 pub use event::*;
-pub use runtime::{DiscoveryReport, MissingAgent, Runtime};
+pub use runtime::{AgentPlanUsage, DiscoveryReport, MissingAgent, Runtime};
 pub use session::{Events, Session, SessionInfo};

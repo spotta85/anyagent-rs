@@ -12,8 +12,8 @@ use futures::StreamExt;
 use anyagent::{
     AgentError, AgentInstallation, Answer, AuthStatus, Capability, ConfigId, ConfigKind,
     ConfigSelection, ConfigValue, DeliveryKind, Event, EventKind, Events, Input, McpServer,
-    PermissionChoice, PlanStatus, QuestionAnswer, Request, Runtime, Session, SessionOptions,
-    StopReason, ToolKind, ToolStatus, TurnOrigin,
+    MessageId, PermissionChoice, PlanStatus, QuestionAnswer, Request, Runtime, Session,
+    SessionOptions, StopReason, ToolKind, ToolStatus, TurnOrigin,
 };
 
 /// A temp dir holding one inlineable png, one pdf, and nothing else.
@@ -64,6 +64,22 @@ async fn next(events: &mut Events) -> Event {
 
 fn allow() -> Answer {
     Answer::Permission(PermissionChoice::AllowOnce)
+}
+
+/// Drives one default-fixture turn: answers the Write permission, collects
+/// text, and returns it at turn end.
+async fn complete_turn(session: &Session, events: &mut Events) -> String {
+    let mut text = String::new();
+    loop {
+        match next(events).await.kind {
+            EventKind::TextDelta { text: t, .. } => text.push_str(&t),
+            EventKind::RequestOpened(Request::Permission(request)) => {
+                session.answer(request.id, allow()).await.unwrap();
+            }
+            EventKind::TurnEnded { .. } => return text,
+            _ => {}
+        }
+    }
 }
 
 #[tokio::test]
@@ -141,6 +157,154 @@ async fn a_full_turn_maps_every_frame_kind() {
 }
 
 #[tokio::test]
+async fn rollback_forks_at_the_cut_point_and_renews_the_token() {
+    let (session, mut events) = open("rollback", "--echo-uuid").await;
+    let mut uuids = Vec::new();
+    for prompt in ["one", "two"] {
+        session.prompt(prompt).await.unwrap();
+        let text = complete_turn(&session, &mut events).await;
+        let uuid = text.split("uuid=").nth(1).unwrap().split(' ').next().unwrap();
+        uuids.push(uuid.to_owned());
+    }
+    assert_eq!(session.info().resume_token.unwrap().as_str(), "sess-c1");
+
+    // Dropping the last turn respawns forked at turn one's final assistant
+    // message; the token clears until the fork names itself.
+    session
+        .rollback(std::num::NonZeroU32::new(1).unwrap())
+        .await
+        .unwrap();
+    loop {
+        if let EventKind::SessionUpdated(info) = next(&mut events).await.kind {
+            assert!(info.resume_token.is_none());
+            break;
+        }
+    }
+
+    session.prompt("three").await.unwrap();
+    let text = complete_turn(&session, &mut events).await;
+    assert!(
+        text.contains(&format!("fork=a-{}", uuids[0])),
+        "expected the fork at turn one's last assistant frame, got: {text}"
+    );
+    assert_eq!(session.info().resume_token.unwrap().as_str(), "sess-fork-1");
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn fork_from_branches_at_a_message_and_at_the_tip() {
+    let (session, mut events) = open("fork", "--echo-uuid").await;
+    // Two turns; each MessageEnded carries the fork anchor as an extension.
+    let mut anchors = Vec::new();
+    for prompt in ["one", "two"] {
+        session.prompt(prompt).await.unwrap();
+        loop {
+            let event = next(&mut events).await;
+            match event.kind {
+                EventKind::RequestOpened(Request::Permission(request)) => {
+                    session.answer(request.id, allow()).await.unwrap();
+                }
+                EventKind::MessageEnded { .. } => anchors.push(
+                    event.extensions["claude/fork_point"]
+                        .as_str()
+                        .expect("fork anchor on MessageEnded")
+                        .to_owned(),
+                ),
+                EventKind::TurnEnded { .. } => break,
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(anchors.len(), 2);
+    let token = session.info().resume_token.unwrap();
+    session.close().await.unwrap();
+
+    let runtime = Runtime::new();
+    let agent = AgentInstallation::at("claude", wrapper("fork", "--echo-uuid"));
+
+    // Fork at turn one's last message: the fixture echoes the cut id.
+    let (forked, mut fork_events) = runtime
+        .open(
+            &agent,
+            SessionOptions::in_dir(std::env::temp_dir())
+                .fork_from(token.clone(), Some(MessageId::new(&anchors[0]))),
+        )
+        .await
+        .unwrap();
+    assert!(forked.info().resume_token.is_none(), "no token before init");
+    forked.prompt("three").await.unwrap();
+    let text = complete_turn(&forked, &mut fork_events).await;
+    assert!(
+        text.contains(&format!("fork={}", anchors[0])),
+        "expected the cut at turn one's message, got: {text}"
+    );
+    assert_eq!(forked.info().resume_token.unwrap().as_str(), "sess-fork-1");
+    forked.close().await.unwrap();
+
+    // Fork at the tip: new provider session, no cut flag.
+    let (tip, mut tip_events) = runtime
+        .open(
+            &agent,
+            SessionOptions::in_dir(std::env::temp_dir()).fork_from(token, None),
+        )
+        .await
+        .unwrap();
+    tip.prompt("four").await.unwrap();
+    let text = complete_turn(&tip, &mut tip_events).await;
+    assert!(!text.contains("fork="), "tip fork must not cut: {text}");
+    assert_eq!(tip.info().resume_token.unwrap().as_str(), "sess-fork-1");
+    tip.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn plan_usage_is_refreshed_after_each_turn() {
+    let (session, mut events) = open("usage", "").await;
+    session.prompt("hi").await.unwrap();
+    loop {
+        match next(&mut events).await.kind {
+            EventKind::RequestOpened(Request::Permission(request)) => {
+                session.answer(request.id, allow()).await.unwrap();
+            }
+            EventKind::TurnEnded { .. } => break,
+            _ => {}
+        }
+    }
+    // The adapter fetches `get_usage` after the turn and pushes the windows.
+    let usage = loop {
+        if let EventKind::PlanUsageUpdated(usage) = next(&mut events).await.kind {
+            break usage;
+        }
+    };
+    let windows: Vec<_> = usage
+        .windows
+        .iter()
+        .map(|w| (w.label.as_str(), w.used_percent))
+        .collect();
+    assert_eq!(
+        windows,
+        vec![("Session", 42), ("Week", 5), ("Week (Fable)", 9)]
+    );
+    // 2026-08-23T08:59:59.746028+00:00, fraction dropped.
+    assert_eq!(
+        usage.windows[0].resets_at,
+        Some(std::time::UNIX_EPOCH + Duration::from_secs(1_787_475_599))
+    );
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn runtime_plan_usage_probes_without_a_session_and_caches() {
+    let runtime = Runtime::new();
+    let agent = AgentInstallation::at("claude", wrapper("usage-probe", ""));
+    let usage = runtime.plan_usage(&agent).await.unwrap();
+    assert_eq!(usage.windows[0].label, "Session");
+    assert_eq!(usage.windows[0].used_percent, 42);
+    // Inside the 60s TTL the same fetch comes back, no second spawn.
+    let again = runtime.plan_usage(&agent).await.unwrap();
+    assert_eq!(again.fetched_at, usage.fetched_at);
+}
+
+#[tokio::test]
 async fn the_handshake_fills_details() {
     let (session, _events) = open("handshake", "").await;
     let details = session.info().details;
@@ -157,7 +321,10 @@ async fn the_handshake_fills_details() {
         Capability::Questions,
         Capability::Subagents,
         Capability::ContextUsage,
+        Capability::PlanUsage,
         Capability::Resume,
+        Capability::Rollback,
+        Capability::Fork,
     ] {
         assert!(details.capabilities.supports(capability));
     }
