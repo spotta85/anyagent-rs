@@ -16,8 +16,8 @@ use crate::adapter::{
 use crate::agent::{
     AccountInfo, AgentDetails, AuthKind, AuthStatus, Capabilities, Capability, ConfigChoice,
     ConfigId, ConfigKind, ConfigOption, ConfigSelection, ConfigValue, Input, LoginMethod,
-    McpConnection, McpServer, McpTransport, ResumeToken, SessionConfiguration, SessionStart,
-    SlashCommand,
+    McpConnection, McpServer, McpTransport, ResumeToken, RollbackScope, SessionConfiguration,
+    SessionStart, SlashCommand,
 };
 use crate::error::AgentError;
 use crate::event::{
@@ -30,6 +30,7 @@ use crate::process::{self, Spawn};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const CLOSE_GRACE: Duration = Duration::from_secs(2);
+const REWIND_TIMEOUT: Duration = Duration::from_secs(10);
 const FRAME_BUFFER: usize = 64;
 const OUTPUT_CAP: usize = 16 * 1024;
 
@@ -160,11 +161,18 @@ async fn launch(
         }
     };
     args.extend(option_args(&request.options)?);
+    let mut env = crate::adapter::config_home_env(&request.installation, &request.options)?;
+    // Free until used (probed 2026-08-27): enables `rewind_files` for the
+    // files rollback scope. Env-only, so it must be set at spawn.
+    env.push((
+        "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING".into(),
+        "true".into(),
+    ));
     let mut child = process::spawn(Spawn {
         exec_path: request.installation.executable_path.clone(),
         args,
         cwd: request.options.cwd().clone(),
-        env: crate::adapter::config_home_env(&request.installation, &request.options)?,
+        env,
     })
     .await?;
     let mut wire = Wire::over(&mut child, recorder);
@@ -474,6 +482,7 @@ fn driver_info(init: &Value, version: Option<String>, request: &ConnectRequest) 
                     Capability::ContextUsage,
                     Capability::PlanUsage,
                     Capability::Rollback,
+                    Capability::RollbackFiles,
                     Capability::Fork,
                     Capability::SlashCommands,
                     Capability::Resume,
@@ -518,6 +527,13 @@ struct PendingRequest {
     questions: Option<Vec<Question>>,
 }
 
+/// One completed turn's rollback anchors; either can be missing (an
+/// agent-originated turn has no user message, a no-output turn no assistant).
+struct Turn {
+    user: Option<String>,
+    assistant: Option<String>,
+}
+
 struct Drive {
     wire: Wire,
     child: process::Child,
@@ -541,11 +557,12 @@ struct Drive {
     turn_uuid: Option<String>,
     /// The running turn's last main-transcript assistant frame uuid.
     turn_assistant: Option<String>,
-    /// One entry per completed turn, oldest first: its last assistant frame
-    /// uuid. Rollback cuts at the last *kept* turn's entry — forking at a
-    /// user message re-runs it, and result uuids are not transcript
-    /// messages (probed 2026-08-25).
-    history: Vec<Option<String>>,
+    /// One entry per completed turn, oldest first. Rollback forks at the
+    /// last *kept* turn's assistant uuid — forking at a user message re-runs
+    /// it, and result uuids are not transcript messages (probed 2026-08-25).
+    /// The files scope rewinds at the first *dropped* turn's user uuid, the
+    /// CLI's checkpoint key (probed 2026-08-27).
+    history: Vec<Turn>,
     /// The original connect request: the relaunch recipe for rollback.
     request: ConnectRequest,
     /// Kept so a rollback respawn keeps teeing to the same recording file.
@@ -623,7 +640,7 @@ impl Drive {
                 let wire_id = self.wire.control(request).await?;
                 self.config = Some((wire_id, id, value));
             }
-            DriverCommand::Rollback(turns) => self.rollback(turns).await?,
+            DriverCommand::Rollback(turns, scope) => self.rollback(turns, scope).await?,
             DriverCommand::Close => unreachable!("handled in run"),
         }
         Ok(())
@@ -889,8 +906,10 @@ impl Drive {
 
     /// Exactly one `result` per turn.
     async fn on_result(&mut self, frame: &Value) -> Result<(), Gone> {
-        self.turn_uuid = None;
-        self.history.push(self.turn_assistant.take());
+        self.history.push(Turn {
+            user: self.turn_uuid.take(),
+            assistant: self.turn_assistant.take(),
+        });
         // Backgrounded tools stay tracked; `task_notification` finishes them.
         self.tools.retain(|_, tool| tool.status.is_active());
         if let Some(used) = self.last_usage.take() {
@@ -915,7 +934,11 @@ impl Drive {
     /// resume token clears until the fork names itself on the next prompt's
     /// `system/init`; the old session stays resumable on disk. A failed
     /// respawn closes the session.
-    async fn rollback(&mut self, turns: std::num::NonZeroU32) -> Result<(), Gone> {
+    async fn rollback(
+        &mut self,
+        turns: std::num::NonZeroU32,
+        scope: RollbackScope,
+    ) -> Result<(), Gone> {
         let n = turns.get() as usize;
         if n >= self.history.len() {
             return self
@@ -929,7 +952,7 @@ impl Drive {
                 )
                 .await;
         }
-        let Some(cut) = self.history[self.history.len() - n - 1].clone() else {
+        let Some(cut) = self.history[self.history.len() - n - 1].assistant.clone() else {
             return self
                 .diagnostic(
                     DiagnosticLevel::Warning,
@@ -945,6 +968,24 @@ impl Drive {
                 )
                 .await;
         };
+        // Files first, on the still-live process: a failed rewind leaves the
+        // session untouched instead of half rolled back.
+        if scope == RollbackScope::ConversationAndFiles {
+            let Some(user) = self.history[self.history.len() - n].user.clone() else {
+                return self
+                    .diagnostic(
+                        DiagnosticLevel::Warning,
+                        "rollback rejected: the first dropped turn has no user message to \
+                         rewind files at",
+                    )
+                    .await;
+            };
+            if let Err(e) = self.rewind_files(&user).await? {
+                return self
+                    .diagnostic(DiagnosticLevel::Warning, format!("rollback rejected: {e}"))
+                    .await;
+            }
+        }
         // The old process goes first so its transcript is flushed before the
         // fork reads it.
         self.child.shutdown(CLOSE_GRACE).await;
@@ -980,6 +1021,48 @@ impl Drive {
         self.child = child;
         self.wire = wire;
         Ok(())
+    }
+
+    /// Restores agent-changed files to the start of `user`'s turn via the
+    /// CLI's `rewind_files`, blocking on its receipt (other frames are
+    /// handled normally in the meantime). `Err(reason)` on refusal.
+    async fn rewind_files(&mut self, user: &str) -> Result<Result<(), String>, Gone> {
+        let id = self
+            .wire
+            .control(
+                json!({ "subtype": "rewind_files", "user_message_id": user, "dry_run": false }),
+            )
+            .await?;
+        let deadline = tokio::time::Instant::now() + REWIND_TIMEOUT;
+        loop {
+            let Ok(frame) = tokio::time::timeout_at(deadline, self.wire.frames.recv()).await else {
+                return Ok(Err("no rewind receipt from the agent".into()));
+            };
+            let Some(frame) = frame else {
+                self.report_exit().await;
+                return Err(Gone);
+            };
+            let response = &frame["response"];
+            if frame["type"].as_str() != Some("control_response")
+                || response["request_id"].as_str() != Some(&id)
+            {
+                self.handle_frame(frame).await?;
+                continue;
+            }
+            // Refusals arrive both as error envelopes and as `canRewind:
+            // false` payloads (probed 2026-08-27, claude 2.1.247).
+            let refusal = response["error"]
+                .as_str()
+                .or_else(|| {
+                    (response["response"]["canRewind"].as_bool() == Some(false)).then(|| {
+                        response["response"]["error"]
+                            .as_str()
+                            .unwrap_or("cannot rewind")
+                    })
+                })
+                .map(str::to_owned);
+            return Ok(refusal.map_or(Ok(()), Err));
+        }
     }
 
     /// `system/init` carries the provider session id (= resume token).

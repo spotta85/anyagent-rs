@@ -155,6 +155,22 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         extra_paths: &[],
     },
     AgentProfile {
+        id: "kiro",
+        name: "Kiro CLI",
+        cli: "kiro-cli",
+        executable_env: "ANYAGENT_KIRO_BIN",
+        config_dir: ".kiro",
+        config_home_env: None,
+        connection: Connection::Acp { args: &["acp"] },
+        // The credential is a row in a platform data-dir sqlite (auth_kv in
+        // data.sqlite3), which also exists logged out — no honest offline
+        // marker, so discovery reports Unknown and `probe` answers for real.
+        auth_markers: &[],
+        login_args: &["login"],
+        install_hint: "install Kiro CLI from https://kiro.dev",
+        extra_paths: &[".local/bin"],
+    },
+    AgentProfile {
         id: "qwen",
         name: "Qwen Code",
         cli: "qwen",

@@ -12,8 +12,8 @@ use futures::StreamExt;
 use anyagent::{
     AgentError, AgentInstallation, Answer, AuthKind, AuthStatus, Capability, ConfigId, ConfigKind,
     ConfigSelection, ConfigValue, DeliveryKind, Event, EventKind, Events, Input, LoginMethod,
-    McpServer, MessageId, PermissionChoice, PlanStatus, QuestionAnswer, Request, Runtime, Session,
-    SessionOptions, StopReason, ToolKind, ToolStatus, TurnOrigin,
+    McpServer, MessageId, PermissionChoice, PlanStatus, QuestionAnswer, Request, RollbackScope,
+    Runtime, Session, SessionOptions, StopReason, ToolKind, ToolStatus, TurnOrigin,
 };
 
 /// A temp dir holding one inlineable png, one pdf, and nothing else.
@@ -80,6 +80,31 @@ async fn complete_turn(session: &Session, events: &mut Events) -> String {
             _ => {}
         }
     }
+}
+
+/// Opens a session in its own cwd (for tests that assert on files there).
+async fn open_in(name: &str, flags: &str, dir: &Path) -> (Session, Events) {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).unwrap();
+    let runtime = Runtime::new();
+    let agent = AgentInstallation::at("claude", wrapper(name, flags));
+    runtime
+        .open(&agent, SessionOptions::in_dir(dir))
+        .await
+        .unwrap()
+}
+
+/// Runs one `--echo-uuid` turn and returns the echoed user-message uuid.
+async fn echoed_turn(session: &Session, events: &mut Events, prompt: &str) -> String {
+    session.prompt(prompt).await.unwrap();
+    let text = complete_turn(session, events).await;
+    text.split("uuid=")
+        .nth(1)
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap()
+        .to_owned()
 }
 
 #[tokio::test]
@@ -161,23 +186,17 @@ async fn rollback_forks_at_the_cut_point_and_renews_the_token() {
     let (session, mut events) = open("rollback", "--echo-uuid").await;
     let mut uuids = Vec::new();
     for prompt in ["one", "two"] {
-        session.prompt(prompt).await.unwrap();
-        let text = complete_turn(&session, &mut events).await;
-        let uuid = text
-            .split("uuid=")
-            .nth(1)
-            .unwrap()
-            .split(' ')
-            .next()
-            .unwrap();
-        uuids.push(uuid.to_owned());
+        uuids.push(echoed_turn(&session, &mut events, prompt).await);
     }
     assert_eq!(session.info().resume_token.unwrap().as_str(), "sess-c1");
 
     // Dropping the last turn respawns forked at turn one's final assistant
     // message; the token clears until the fork names itself.
     session
-        .rollback(std::num::NonZeroU32::new(1).unwrap())
+        .rollback(
+            std::num::NonZeroU32::new(1).unwrap(),
+            RollbackScope::Conversation,
+        )
         .await
         .unwrap();
     loop {
@@ -194,6 +213,75 @@ async fn rollback_forks_at_the_cut_point_and_renews_the_token() {
         "expected the fork at turn one's last assistant frame, got: {text}"
     );
     assert_eq!(session.info().resume_token.unwrap().as_str(), "sess-fork-1");
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn files_rollback_rewinds_at_the_first_dropped_turn() {
+    let dir = std::env::temp_dir().join(format!("anyagent-rwfiles-{}", std::process::id()));
+    let (session, mut events) = open_in("rwfiles", "--echo-uuid", &dir).await;
+    let mut uuids = Vec::new();
+    for prompt in ["one", "two"] {
+        uuids.push(echoed_turn(&session, &mut events, prompt).await);
+    }
+
+    session
+        .rollback(
+            std::num::NonZeroU32::new(1).unwrap(),
+            RollbackScope::ConversationAndFiles,
+        )
+        .await
+        .unwrap();
+    loop {
+        if let EventKind::SessionUpdated(_) = next(&mut events).await.kind {
+            break;
+        }
+    }
+    // The fixture wrote the rewind target: the first dropped turn's user uuid.
+    let rewound = std::fs::read_to_string(dir.join("rewound-at.txt")).unwrap();
+    assert_eq!(rewound, uuids[1]);
+
+    // The conversation fork still cuts at the last kept assistant frame.
+    session.prompt("three").await.unwrap();
+    let text = complete_turn(&session, &mut events).await;
+    assert!(
+        text.contains(&format!("fork=a-{}", uuids[0])),
+        "got: {text}"
+    );
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn files_rollback_refusal_leaves_the_session_untouched() {
+    let dir = std::env::temp_dir().join(format!("anyagent-rwfail-{}", std::process::id()));
+    let (session, mut events) = open_in("rwfail", "--echo-uuid --rewind-fails", &dir).await;
+    for prompt in ["one", "two"] {
+        echoed_turn(&session, &mut events, prompt).await;
+    }
+
+    // The rejection is a diagnostic; nothing is rewound and nothing respawns.
+    session
+        .rollback(
+            std::num::NonZeroU32::new(1).unwrap(),
+            RollbackScope::ConversationAndFiles,
+        )
+        .await
+        .unwrap();
+    loop {
+        if let EventKind::Diagnostic(d) = next(&mut events).await.kind {
+            assert!(
+                d.message.contains("rollback rejected"),
+                "got: {}",
+                d.message
+            );
+            break;
+        }
+    }
+    assert!(!dir.join("rewound-at.txt").exists());
+    assert_eq!(session.info().resume_token.unwrap().as_str(), "sess-c1");
+    session.prompt("three").await.unwrap();
+    let text = complete_turn(&session, &mut events).await;
+    assert!(!text.contains("fork="), "unexpected fork: {text}");
     session.close().await.unwrap();
 }
 

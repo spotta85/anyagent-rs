@@ -569,7 +569,7 @@ impl Drive {
                 let wire_id = self.wire.request(method, params).await?;
                 self.config = Some((wire_id, id, value));
             }
-            DriverCommand::Rollback(turns) => {
+            DriverCommand::Rollback(turns, _) => {
                 self.diagnostic(
                     DiagnosticLevel::Warning,
                     format!("rollback({turns}) is not supported by the ACP adapter"),

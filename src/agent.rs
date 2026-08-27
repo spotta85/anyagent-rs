@@ -147,12 +147,22 @@ pub enum Capability {
     Permissions,
     Questions,
     Rollback,
+    /// `rollback` may also restore the files the dropped turns changed.
+    RollbackFiles,
     Fork,
     SlashCommands,
     Plan,
     Subagents,
     ContextUsage,
     PlanUsage,
+}
+
+/// What `rollback` rewinds: conversation context only, or also the files
+/// the agent changed in the dropped turns (requires `RollbackFiles`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RollbackScope {
+    Conversation,
+    ConversationAndFiles,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -17,7 +17,7 @@ use tokio::time::Instant;
 use crate::adapter::{DriverCommand, DriverConnection, DriverEvent, DriverInfo};
 use crate::agent::{
     AgentDetails, AgentInstallation, Capability, ConfigKind, ConfigSelection, ConfigValue, Input,
-    LoginMethod, PermissionMode, ResumeToken, SessionConfiguration, SessionOptions,
+    LoginMethod, PermissionMode, ResumeToken, RollbackScope, SessionConfiguration, SessionOptions,
 };
 use crate::error::AgentError;
 use crate::event::{
@@ -75,7 +75,7 @@ enum Command {
     Dequeue(PromptId, Reply<()>),
     Answer(RequestId, Answer, Reply<()>),
     Configure(ConfigSelection, Reply<()>),
-    Rollback(NonZeroU32, Reply<()>),
+    Rollback(NonZeroU32, RollbackScope, Reply<()>),
     Cancel { clear_queue: bool, reply: Reply<()> },
     Close(Reply<()>),
 }
@@ -113,11 +113,17 @@ impl Session {
             .await
     }
 
-    /// Rewinds provider-owned conversation context by completed turns.
-    /// Files stay unchanged. Requires an idle session and rollback support.
-    /// `SessionUpdated` confirms success; a diagnostic reports rejection.
-    pub async fn rollback(&self, turns: NonZeroU32) -> Result<(), AgentError> {
-        self.send(|reply| Command::Rollback(turns, reply)).await
+    /// Rewinds provider-owned conversation context by completed turns; the
+    /// files scope also restores agent-changed files to the cut point.
+    /// Requires an idle session and rollback support. `SessionUpdated`
+    /// confirms success; a diagnostic reports rejection.
+    pub async fn rollback(
+        &self,
+        turns: NonZeroU32,
+        scope: RollbackScope,
+    ) -> Result<(), AgentError> {
+        self.send(|reply| Command::Rollback(turns, scope, reply))
+            .await
     }
 
     /// Stops the active turn. The session and the queue survive; the next
@@ -373,8 +379,8 @@ impl Engine {
             Command::Configure(selection, reply) => {
                 let _ = reply.send(self.handle_configure(selection).await);
             }
-            Command::Rollback(turns, reply) => {
-                let _ = reply.send(self.handle_rollback(turns).await);
+            Command::Rollback(turns, scope, reply) => {
+                let _ = reply.send(self.handle_rollback(turns, scope).await);
             }
             Command::Cancel { clear_queue, reply } => {
                 let _ = reply.send(self.handle_cancel(clear_queue).await);
@@ -493,19 +499,24 @@ impl Engine {
         self.forward(DriverCommand::Configure(selection)).await
     }
 
-    async fn handle_rollback(&mut self, turns: NonZeroU32) -> Result<(), AgentError> {
-        if !self
-            .info()
-            .details
-            .capabilities
-            .supports(Capability::Rollback)
-        {
+    async fn handle_rollback(
+        &mut self,
+        turns: NonZeroU32,
+        scope: RollbackScope,
+    ) -> Result<(), AgentError> {
+        let capabilities = self.info().details.capabilities;
+        if !capabilities.supports(Capability::Rollback) {
             return Err(AgentError::UnsupportedFeature("rollback".into()));
+        }
+        if scope == RollbackScope::ConversationAndFiles
+            && !capabilities.supports(Capability::RollbackFiles)
+        {
+            return Err(AgentError::UnsupportedFeature("file rollback".into()));
         }
         if matches!(self.state, TurnState::Running { .. }) {
             return Err(AgentError::SessionBusy);
         }
-        self.forward(DriverCommand::Rollback(turns)).await
+        self.forward(DriverCommand::Rollback(turns, scope)).await
     }
 
     /// Cancels the active turn; open requests close first. Idempotent.

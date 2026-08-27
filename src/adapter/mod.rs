@@ -12,8 +12,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 use crate::agent::{
-    AgentDetails, AgentInstallation, ConfigSelection, Input, ResumeToken, SessionConfiguration,
-    SessionOptions,
+    AgentDetails, AgentInstallation, ConfigSelection, Input, ResumeToken, RollbackScope,
+    SessionConfiguration, SessionOptions,
 };
 use crate::error::AgentError;
 use crate::event::{
@@ -45,7 +45,7 @@ pub(crate) enum DriverCommand {
         answer: Answer,
     },
     Configure(ConfigSelection),
-    Rollback(NonZeroU32),
+    Rollback(NonZeroU32, RollbackScope),
     /// Interrupt the running turn. The adapter also drops any pending wire
     /// requests; the engine has already emitted their `RequestClosed`.
     Cancel,

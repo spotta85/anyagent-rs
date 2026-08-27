@@ -181,7 +181,7 @@ async fn drive(
                     return;
                 }
             }
-            DriverCommand::Cancel | DriverCommand::Configure(_) | DriverCommand::Rollback(_) => {}
+            DriverCommand::Cancel | DriverCommand::Configure(_) | DriverCommand::Rollback(..) => {}
             DriverCommand::Close => return,
         }
     }

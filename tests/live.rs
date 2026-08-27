@@ -22,12 +22,12 @@ use futures::StreamExt;
 
 use anyagent::{
     AgentError, Answer, AuthStatus, Capability, ConfigKind, DeliveryKind, Event, EventKind, Events,
-    MessageId, PermissionChoice, QuestionAnswer, Request, RequestId, Runtime, Session,
-    SessionOptions, StopReason, ToolStatus, TurnOrigin,
+    MessageId, PermissionChoice, QuestionAnswer, Request, RequestId, RollbackScope, Runtime,
+    Session, SessionOptions, StopReason, ToolStatus, TurnOrigin,
 };
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(120);
-const OPENCODE_MODEL: &str = "openrouter/google/gemini-2.5-flash-lite";
+const OPENCODE_MODEL: &str = "openrouter/meta/muse-spark-1.2-contributor";
 const COUNT: &str = "Count from 1 to 400, one number per line. No other text. No tools.";
 
 // -- gate -------------------------------------------------------------------
@@ -52,7 +52,7 @@ fn enabled() -> Vec<&'static str> {
         println!("SKIP all: ANYAGENT_LIVE is not set");
         return Vec::new();
     };
-    ["claude", "opencode", "hermes"]
+    ["claude", "opencode", "hermes", "kiro"]
         .into_iter()
         .filter(|h| list == "all" || list.split(',').any(|p| p.trim() == *h))
         .filter(|h| {
@@ -76,6 +76,17 @@ async fn discovery_finds_authenticated_harnesses() {
             .require(h)
             .unwrap_or_else(|_| panic!("{h}: not discovered"));
         assert!(agent.executable_path.exists(), "{h}: executable missing");
+        // kiro has no honest offline marker (sqlite credential): discovery
+        // reports no auth and `probe` answers for real.
+        if h == "kiro" {
+            assert!(
+                agent.auth.is_none(),
+                "{h}: unexpected marker: {:?}",
+                agent.auth
+            );
+            pass(h, "discovered (auth unknown by design)");
+            continue;
+        }
         assert!(
             matches!(agent.auth, Some(AuthStatus::Authenticated { .. })),
             "{h}: not authenticated: {:?}",
@@ -507,24 +518,35 @@ async fn cancel_ends_the_turn_in_every_queue_shape() {
         // (a) cancel(false) with a queued prompt: it runs next and answers.
         for rep in 0..reps {
             session.prompt(COUNT).await.unwrap();
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            // Queue immediately: a fast model can finish COUNT inside a fixed
+            // sleep (kiro did), which would make this `Started`, not `Queued`.
             let queued = session.prompt("Say only PEAR. No tools.").await.unwrap();
             assert_eq!(queued.kind, DeliveryKind::Queued { position: 0 }, "{h}");
+            tokio::time::sleep(Duration::from_secs(2)).await;
             session.cancel(false).await.unwrap();
             expect_cancelled(&mut events, &format!("{h}: queued cancel rep {rep}")).await;
-            let text = drain_to_turn_end(
+            let mut text = drain_to_turn_end(
                 &session,
                 &mut events,
                 &format!("{h}: queued prompt rep {rep}"),
             )
             .await;
+            // KNOWN (kiro 2.19.1): the agent's cancel races the next prompt —
+            // the queued turn can come back spuriously cancelled and empty
+            // (probed 2026-08-27). An app's recourse is to re-send; do that.
+            if h == "kiro" && text.is_empty() {
+                println!("KNOWN kiro: queued turn spuriously cancelled; re-sending");
+                session.prompt("Say only PEAR. No tools.").await.unwrap();
+                text =
+                    drain_to_turn_end(&session, &mut events, &format!("{h}: PEAR re-send")).await;
+            }
             assert!(text.contains("PEAR"), "{h}: queued turn said {text:?}");
         }
 
         // (b) cancel(true): the queued prompt must never run.
         session.prompt(COUNT).await.unwrap();
-        tokio::time::sleep(Duration::from_secs(2)).await;
         session.prompt("Say only PLUM. No tools.").await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
         session.cancel(true).await.unwrap();
         expect_cancelled(&mut events, &format!("{h}: clear-queue cancel")).await;
         quiet(&mut events, 5, &format!("{h}: after clear-queue cancel")).await;
@@ -679,7 +701,10 @@ async fn rollback_forgets_the_rolled_back_turn() {
         drain_to_turn_end(&session, &mut events, &format!("{h}: codeword two")).await;
         let before = session.info().resume_token.expect("token before rollback");
 
-        session.rollback(NonZeroU32::new(1).unwrap()).await.unwrap();
+        session
+            .rollback(NonZeroU32::new(1).unwrap(), RollbackScope::Conversation)
+            .await
+            .unwrap();
         session
             .prompt("List every codeword I told you, comma separated, nothing else. No tools.")
             .await
@@ -698,6 +723,55 @@ async fn rollback_forgets_the_rolled_back_turn() {
         assert_ne!(after.as_str(), before.as_str(), "{h}: token did not change");
         session.close().await.unwrap();
         pass(h, "rollback forgot exactly the last turn");
+    }
+}
+
+#[tokio::test]
+#[ignore = "live: talks to real agents"]
+async fn files_rollback_restores_agent_written_files() {
+    for h in enabled() {
+        let (session, mut events, dir) = open(h).await;
+        if !session
+            .info()
+            .details
+            .capabilities
+            .supports(Capability::RollbackFiles)
+        {
+            println!("SKIP {h}: file rollback not advertised");
+            session.close().await.unwrap();
+            continue;
+        }
+        let note = dir.path().join("note.txt");
+        for word in ["alpha", "beta"] {
+            session
+                .prompt(format!(
+                    "Use the Write tool to make {} contain exactly: {word}. Nothing else.",
+                    note.display()
+                ))
+                .await
+                .unwrap();
+            drain_to_turn_end(&session, &mut events, &format!("{h}: write {word}")).await;
+        }
+        assert_eq!(std::fs::read_to_string(&note).unwrap().trim(), "beta");
+
+        // Dropping the last turn also rewinds its file change.
+        session
+            .rollback(
+                NonZeroU32::new(1).unwrap(),
+                RollbackScope::ConversationAndFiles,
+            )
+            .await
+            .unwrap();
+        loop {
+            if let EventKind::SessionUpdated(_) =
+                next(&mut events, &format!("{h}: rollback")).await.kind
+            {
+                break;
+            }
+        }
+        assert_eq!(std::fs::read_to_string(&note).unwrap().trim(), "alpha");
+        session.close().await.unwrap();
+        pass(h, "files rollback restored the previous file state");
     }
 }
 
@@ -899,7 +973,9 @@ async fn errors_are_typed() {
         {
             assert!(
                 matches!(
-                    session.rollback(NonZeroU32::new(1).unwrap()).await,
+                    session
+                        .rollback(NonZeroU32::new(1).unwrap(), RollbackScope::Conversation)
+                        .await,
                     Err(AgentError::UnsupportedFeature(_))
                 ),
                 "{h}: rollback should be UnsupportedFeature"
@@ -987,10 +1063,16 @@ async fn expect_cancelled(events: &mut Events, step: &str) {
         .unwrap_or_else(|_| panic!("no Cancelled turn end within 10s at {step}"));
 }
 
-/// Asserts no event at all arrives for `secs` seconds.
+/// Asserts no turn traffic arrives for `secs` seconds. Diagnostics are the
+/// sanctioned form of out-of-turn noise (kiro emits metadata notifications
+/// between turns) and don't break the quiet.
 async fn quiet(events: &mut Events, secs: u64, step: &str) {
-    if let Ok(Some(event)) = tokio::time::timeout(Duration::from_secs(secs), events.next()).await {
-        panic!("expected quiet at {step}, got {:?}", event.map(|e| e.kind));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, events.next()).await {
+        let kind = event.map(|e| e.kind);
+        if !matches!(kind, Ok(EventKind::Diagnostic(_))) {
+            panic!("expected quiet at {step}, got {kind:?}");
+        }
     }
 }
 
@@ -1003,6 +1085,11 @@ fn kill_child(harness: &str, session: &Session) {
             &[],
             session.info().resume_token.unwrap().as_str().to_owned(),
         ),
+        // Both halves: `kiro-cli acp` dispatches to a `kiro-cli-chat acp`
+        // worker that inherits the pipes — killing only the dispatcher lets
+        // the turn complete. Anchored so the user's Kiro apps' own
+        // `kiro-cli acp --agent <name>` processes never match.
+        "kiro" => (&[], "kiro-cli(-chat)? acp$".to_owned()),
         _ => (&["-n"], "opencode acp".to_owned()),
     };
     let out = std::process::Command::new("pgrep")
@@ -1011,15 +1098,23 @@ fn kill_child(harness: &str, session: &Session) {
         .arg(&pattern)
         .output()
         .unwrap();
-    let pid = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .last()
-        .unwrap_or_else(|| panic!("{harness}: no process matched {pattern:?}"))
-        .to_owned();
-    std::process::Command::new("kill")
-        .args(["-9", &pid])
-        .status()
-        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let pids: Vec<&str> = stdout.lines().collect();
+    if pids.is_empty() {
+        panic!("{harness}: no process matched {pattern:?}");
+    }
+    // kiro matches dispatcher + worker; kill every matched pid.
+    let last = if harness == "kiro" {
+        pids.clone()
+    } else {
+        vec![*pids.last().unwrap()]
+    };
+    for pid in last {
+        std::process::Command::new("kill")
+            .args(["-9", pid])
+            .status()
+            .unwrap();
+    }
 }
 
 fn allow() -> Answer {

@@ -6,8 +6,10 @@
 // key supplies auth, still with `tokenSource: "none"`), --bedrock (an
 // AWS cloud-provider login, no Anthropic identity at all),
 // --token-source-key (the credential named in tokenSource itself),
-// --echo-config-home (echo the CLAUDE_CONFIG_DIR the child received).
+// --echo-config-home (echo the CLAUDE_CONFIG_DIR the child received),
+// --rewind-fails (rewind_files answers with an error envelope).
 import { createInterface } from 'node:readline';
+import { writeFileSync } from 'node:fs';
 
 const flag = (name) => process.argv.includes(name);
 const send = (m) => process.stdout.write(JSON.stringify(m) + '\n');
@@ -89,6 +91,17 @@ function onControl(m) {
         { kind: 'weekly_all', group: 'weekly', percent: 5, severity: 'normal', resets_at: '2026-08-24T18:59:59.746057+00:00', scope: null, is_active: false },
         { kind: 'weekly_scoped', group: 'weekly', percent: 9, severity: 'normal', resets_at: '2026-08-24T18:59:59.746461+00:00', scope: { model: { id: null, display_name: 'Fable' }, surface: null }, is_active: false },
       ] } });
+    case 'rewind_files': {
+      // Like the CLI (probed 2026-08-27, 2.1.247): refuses without the spawn
+      // env flag; a missing checkpoint is an error envelope. Success writes
+      // the target uuid to cwd so tests can assert files "changed".
+      if (process.env.CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING !== 'true')
+        return reply({ canRewind: false, error: 'File rewinding is not enabled.' });
+      if (flag('--rewind-fails'))
+        return send({ type: 'control_response', response: { subtype: 'error', request_id: m.request_id, error: 'No file checkpoint found for this message.' } });
+      writeFileSync('rewound-at.txt', m.request.user_message_id);
+      return reply({ canRewind: true, skippedLinks: 0 });
+    }
     case 'interrupt': {
       const cancelled = [];
       if (turn) turn.interrupted = true;
