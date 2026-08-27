@@ -21,9 +21,9 @@ use std::time::Duration;
 use futures::StreamExt;
 
 use anyagent::{
-    AgentError, Answer, AuthStatus, Capability, DeliveryKind, Event, EventKind, Events, MessageId,
-    PermissionChoice, QuestionAnswer, Request, RequestId, Runtime, Session, SessionOptions,
-    StopReason, ToolStatus, TurnOrigin,
+    AgentError, Answer, AuthStatus, Capability, ConfigKind, DeliveryKind, Event, EventKind, Events,
+    MessageId, PermissionChoice, QuestionAnswer, Request, RequestId, Runtime, Session,
+    SessionOptions, StopReason, ToolStatus, TurnOrigin,
 };
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -124,6 +124,55 @@ async fn open_reports_token_capabilities_and_options() {
         }
         session.close().await.unwrap();
         pass(h, "open info complete");
+    }
+}
+
+#[tokio::test]
+#[ignore = "live: talks to real agents"]
+async fn probe_reports_details_without_a_session() {
+    for h in enabled() {
+        let runtime = Runtime::new();
+        let report = runtime.discover().await;
+        let agent = report
+            .require(h)
+            .unwrap_or_else(|_| panic!("{h}: not discovered"));
+        // Probe promises to leave nothing behind. Claude writes one
+        // transcript file per session, so a new one means its throwaway
+        // session outlived the probe.
+        let transcripts = claude_transcripts();
+        let details = runtime
+            .probe(agent)
+            .await
+            .unwrap_or_else(|e| panic!("{h}: probe failed: {e}"));
+        assert!(details.version.is_some(), "{h}: probe has no version");
+        let model = details
+            .config_options
+            .iter()
+            .find(|o| o.id.as_str() == "model");
+        let has_mode = details
+            .config_options
+            .iter()
+            .any(|o| o.id.as_str() == "mode");
+        assert!(
+            model.is_some() || has_mode,
+            "{h}: probe has no model/mode option"
+        );
+        if h == "claude" {
+            let ConfigKind::Select { choices } = &model.expect("claude: model option").kind else {
+                panic!("claude: model option is not a select");
+            };
+            assert!(!choices.is_empty(), "claude: model has no choices");
+            assert!(
+                !details.commands.is_empty(),
+                "claude: probe has no commands"
+            );
+            let left: Vec<_> = claude_transcripts()
+                .difference(&transcripts)
+                .cloned()
+                .collect();
+            assert!(left.is_empty(), "claude: probe left a transcript: {left:?}");
+        }
+        pass(h, "probe reports details without a session");
     }
 }
 
@@ -979,4 +1028,32 @@ fn allow() -> Answer {
 
 fn pass(harness: &str, what: &str) {
     println!("PASS {harness}: {what}");
+}
+
+/// Transcript files claude has on disk, one per session it has recorded.
+/// Empty when the directory does not exist or cannot be read.
+fn claude_transcripts() -> std::collections::BTreeSet<std::path::PathBuf> {
+    let mut found = std::collections::BTreeSet::new();
+    let home = match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => match std::env::var_os("HOME") {
+            Some(home) => std::path::PathBuf::from(home).join(".claude"),
+            None => return found,
+        },
+    };
+    let Ok(projects) = std::fs::read_dir(home.join("projects")) else {
+        return found;
+    };
+    for project in projects.flatten() {
+        for file in std::fs::read_dir(project.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if file.path().extension().is_some_and(|e| e == "jsonl") {
+                found.insert(file.path());
+            }
+        }
+    }
+    found
 }

@@ -7,10 +7,10 @@ use std::time::Duration;
 use futures::StreamExt;
 
 use anyagent::{
-    AgentError, AgentInstallation, Answer, Capability, ChoiceId, ConfigId, ConfigSelection,
-    ConfigValue, DeliveryKind, Event, EventKind, Events, Input, LoginMethod, McpServer,
-    McpTransport, PermissionChoice, QuestionAnswer, Request, ResumeToken, Runtime, Session,
-    SessionOptions, StopReason,
+    AgentError, AgentInstallation, Answer, AuthStatus, Capability, ChoiceId, ConfigId,
+    ConfigSelection, ConfigValue, DeliveryKind, Event, EventKind, Events, Input, LoginMethod,
+    McpServer, McpTransport, PermissionChoice, QuestionAnswer, Request, ResumeToken, Runtime,
+    Session, SessionOptions, StopReason,
 };
 
 fn fixture(extra: &[&str]) -> AgentInstallation {
@@ -165,6 +165,28 @@ async fn the_handshake_fills_session_info() {
     assert_eq!(ids, vec!["mode", "model"]);
     assert_eq!(info.resume_token.unwrap().as_str(), "sess-1");
     session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn probe_reports_details_and_waits_for_late_commands() {
+    let details = Runtime::new()
+        .probe(&fixture(&["--commands-on-open"]))
+        .await
+        .unwrap();
+    // The same details an open reports: version and config options.
+    assert_eq!(details.version.as_deref(), Some("0.0.1"));
+    let ids: Vec<_> = details
+        .config_options
+        .iter()
+        .map(|o| o.id.as_str().to_owned())
+        .collect();
+    assert_eq!(ids, vec!["mode", "model"]);
+    // The command list only arrives as a `SessionUpdated` after session/new;
+    // seeing it proves probe waited for it instead of returning empty.
+    assert!(
+        details.commands.iter().any(|c| c.name == "compact"),
+        "probe must wait for the ACP available-commands update"
+    );
 }
 
 #[tokio::test]
@@ -407,6 +429,25 @@ async fn auth_required_carries_runnable_login_methods() {
     };
     assert_eq!(command[0], "node");
     assert_eq!(command[1..], ["auth".to_string(), "login".to_string()]);
+}
+
+#[tokio::test]
+async fn probe_reports_a_logged_out_agent_instead_of_failing() {
+    // `open` refuses a logged-out agent; `probe` inspects it and answers.
+    let details = Runtime::new()
+        .probe(&fixture(&["--auth-required"]))
+        .await
+        .expect("probe must report a missing login, not fail on it");
+    let AuthStatus::Unauthenticated { login } = &details.auth else {
+        panic!("expected Unauthenticated, got {:?}", details.auth);
+    };
+    let LoginMethod::Terminal { command, .. } = &login[0] else {
+        panic!("expected a terminal method");
+    };
+    assert_eq!(command[1..], ["auth".to_string(), "login".to_string()]);
+    // Nothing is advertised until the agent has a login.
+    assert!(details.config_options.is_empty());
+    assert!(details.commands.is_empty());
 }
 
 #[tokio::test]

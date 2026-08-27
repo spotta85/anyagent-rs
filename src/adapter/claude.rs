@@ -224,7 +224,8 @@ fn option_args(options: &crate::agent::SessionOptions) -> Result<Vec<String>, Ag
     Ok(args)
 }
 
-/// Runnable login methods from the catalog, for mid-session auth loss.
+/// Runnable login methods from the catalog, for a logged-out handshake
+/// and for mid-session auth loss.
 fn login_methods(installation: &crate::agent::AgentInstallation) -> Vec<LoginMethod> {
     crate::catalog::PROFILES
         .iter()
@@ -296,26 +297,55 @@ fn model_choices(models: &Value) -> Vec<ConfigChoice> {
         .collect()
 }
 
-/// What the `initialize` response tells us, folded into the engine vocabulary.
-fn driver_info(init: &Value, version: Option<String>, request: &ConnectRequest) -> DriverInfo {
-    let auth = match init.get("account").filter(|a| a.is_object()) {
-        Some(account) => AuthStatus::Authenticated {
-            kind: if account["subscriptionType"].is_string() {
+/// Login state from `initialize`'s `account`. The CLI always sends the object,
+/// so only its contents separate a login from none (all probed live
+/// 2026-08-27, claude 2.1.241):
+///
+/// - `email` / `subscriptionType` — a real login, subscription or console.
+/// - `apiKeySource` — a key supplied by that env var. Note `tokenSource` is
+///   still `"none"` here, so it alone cannot mean "logged out".
+/// - `tokenSource: "none"` and nothing else — no credential. This is what an
+///   expired OAuth session looks like, and it read as an API-key login before
+///   this gate existed.
+/// - anything else — defer to the offline marker instead of inventing an
+///   answer.
+fn account_status(account: &Value, request: &ConnectRequest) -> AuthStatus {
+    let email = account["email"].as_str();
+    let plan = account["subscriptionType"].as_str();
+    if email.is_some() || plan.is_some() {
+        return AuthStatus::Authenticated {
+            kind: if plan.is_some() {
                 AuthKind::Subscription
             } else {
                 AuthKind::ApiKey
             },
             account: Some(AccountInfo {
-                email: account["email"].as_str().map(str::to_owned),
-                plan: account["subscriptionType"].as_str().map(str::to_owned),
+                email: email.map(str::to_owned),
+                plan: plan.map(str::to_owned),
             }),
-        },
-        None => request
-            .installation
-            .auth
-            .clone()
-            .unwrap_or(AuthStatus::Unknown),
-    };
+        };
+    }
+    if account["apiKeySource"].is_string() {
+        return AuthStatus::Authenticated {
+            kind: AuthKind::ApiKey,
+            account: None,
+        };
+    }
+    if account["tokenSource"].as_str() == Some("none") {
+        return AuthStatus::Unauthenticated {
+            login: login_methods(&request.installation),
+        };
+    }
+    request
+        .installation
+        .auth
+        .clone()
+        .unwrap_or(AuthStatus::Unknown)
+}
+
+/// What the `initialize` response tells us, folded into the engine vocabulary.
+fn driver_info(init: &Value, version: Option<String>, request: &ConnectRequest) -> DriverInfo {
+    let auth = account_status(&init["account"], request);
     let commands = init["commands"]
         .as_array()
         .map(|commands| {

@@ -1,6 +1,7 @@
 // ACP v1 fixture agent: speaks JSON-RPC over stdio and emits the annoying cases.
 // Flags: --eof (die mid-turn), --flood=N (N chunks before the response),
-//        --late-ms=N (late noise delay), --auth-required (session/new fails).
+//        --late-ms=N (late noise delay), --auth-required (session/new fails),
+//        --commands-on-open (push availableCommands right after session/new).
 import { createInterface } from 'node:readline';
 
 const flag = (name) => process.argv.includes(name);
@@ -27,7 +28,11 @@ async function onRequest(m) {
       // --grok-models: the first-class models state (no model configOption);
       // switching must ride session/set_model.
       if (flag('--grok-models')) return reply({ sessionId: 'sess-1', models: { currentModelId: 'grok-4.5', availableModels: [{ modelId: 'grok-4.5', name: 'Grok 4.5', description: 'fast' }, { modelId: 'grok-4.6', name: 'Grok 4.6' }] } });
-      return reply({ sessionId: 'sess-1', modes: { currentModeId: 'default', availableModes: [{ id: 'default', name: 'Default' }, { id: 'plan', name: 'Plan' }] }, configOptions: [{ id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'sonnet', options: [{ value: 'sonnet', name: 'Sonnet' }] }], _meta: { claude: { sessionId: 'uuid-1' } } });
+      reply({ sessionId: 'sess-1', modes: { currentModeId: 'default', availableModes: [{ id: 'default', name: 'Default' }, { id: 'plan', name: 'Plan' }] }, configOptions: [{ id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'sonnet', options: [{ value: 'sonnet', name: 'Sonnet' }] }], _meta: { claude: { sessionId: 'uuid-1' } } });
+      // Real ACP agents push the command list as an update just after
+      // session/new; --commands-on-open reproduces it so probe can wait for it.
+      if (flag('--commands-on-open')) notify('sess-1', { sessionUpdate: 'available_commands_update', availableCommands: [{ name: 'compact', description: 'Compact context' }] });
+      return;
     case 'session/load': return reply({ _meta: { loaded: m.params.sessionId } });
     case 'session/set_mode': {
       reply({});

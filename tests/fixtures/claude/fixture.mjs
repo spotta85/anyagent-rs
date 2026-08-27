@@ -1,7 +1,9 @@
 // Claude stream-json fixture agent, shaped like the recordings in this
 // directory (claude 2.1.241). Flags: --question (AskUserQuestion turn),
 // --eof (die mid-turn), --wake (background task wakes an agent-originated
-// turn), --subagent (nested transcript with parent_tool_use_id).
+// turn), --subagent (nested transcript with parent_tool_use_id),
+// --logged-out (initialize reports no token source), --api-key (an env
+// key supplies auth, still with `tokenSource: "none"`).
 import { createInterface } from 'node:readline';
 
 const flag = (name) => process.argv.includes(name);
@@ -55,7 +57,15 @@ function onControl(m) {
           { value: 'default', displayName: 'Default (recommended)', description: 'Opus 5 with 1M context', supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'] },
           { value: 'sonnet', displayName: 'Sonnet', description: 'Fast for everyday tasks', supportedEffortLevels: ['low', 'high'] },
         ],
-        account: { email: 'user@example.com', organization: 'Example Org', subscriptionType: 'Claude Max', apiProvider: 'firstParty' },
+        // Logged out, the real CLI still sends an account object — it just
+        // names no token source (probed live 2026-08-27, claude 2.1.241).
+        // An env API key keeps `tokenSource: "none"` and adds `apiKeySource`,
+        // so only the absence of both means logged out.
+        account: flag('--logged-out')
+          ? { tokenSource: 'none', apiProvider: 'firstParty' }
+          : flag('--api-key')
+          ? { tokenSource: 'none', apiKeySource: 'ANTHROPIC_API_KEY', apiProvider: 'firstParty' }
+          : { email: 'user@example.com', organization: 'Example Org', subscriptionType: 'Claude Max', apiProvider: 'firstParty' },
         current_permission_mode: pm > -1 ? process.argv[pm + 1] : 'default',
       });
     }

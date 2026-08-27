@@ -10,9 +10,9 @@ use std::time::Duration;
 use futures::StreamExt;
 
 use anyagent::{
-    AgentError, AgentInstallation, Answer, AuthStatus, Capability, ConfigId, ConfigKind,
-    ConfigSelection, ConfigValue, DeliveryKind, Event, EventKind, Events, Input, McpServer,
-    MessageId, PermissionChoice, PlanStatus, QuestionAnswer, Request, Runtime, Session,
+    AgentError, AgentInstallation, Answer, AuthKind, AuthStatus, Capability, ConfigId, ConfigKind,
+    ConfigSelection, ConfigValue, DeliveryKind, Event, EventKind, Events, Input, LoginMethod,
+    McpServer, MessageId, PermissionChoice, PlanStatus, QuestionAnswer, Request, Runtime, Session,
     SessionOptions, StopReason, ToolKind, ToolStatus, TurnOrigin,
 };
 
@@ -371,6 +371,76 @@ async fn the_handshake_fills_details() {
     // The adapter mints the session id, so the token exists before any turn.
     assert!(session.info().resume_token.is_some());
     session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn probe_reports_the_same_details_as_open() {
+    let runtime = Runtime::new();
+    let agent = AgentInstallation::at("claude", wrapper("probe", ""));
+    // What an open would report, from a session we then throw away.
+    let (session, _events) = runtime
+        .open(&agent, SessionOptions::in_dir(std::env::temp_dir()))
+        .await
+        .unwrap();
+    let opened = session.info().details;
+    session.close().await.unwrap();
+    // Probe reports the identical details without keeping a session.
+    let probed = runtime.probe(&agent).await.unwrap();
+    assert_eq!(probed, opened);
+    // The comet use case: the `model` option and the command list.
+    assert!(
+        probed
+            .config_options
+            .iter()
+            .any(|o| o.id.as_str() == "model")
+    );
+    assert!(probed.commands.iter().any(|c| c.name == "compact"));
+}
+
+#[tokio::test]
+async fn a_logged_out_handshake_reports_unauthenticated_with_login_methods() {
+    // The CLI sends an account object either way; only its contents separate
+    // a login from none, and a stale offline marker must not override it.
+    let agent = AgentInstallation::at("claude", wrapper("logged-out", "--logged-out"));
+    let details = Runtime::new().probe(&agent).await.unwrap();
+    let AuthStatus::Unauthenticated { login } = &details.auth else {
+        panic!("expected Unauthenticated, got {:?}", details.auth);
+    };
+    assert!(
+        login
+            .iter()
+            .any(|m| matches!(m, LoginMethod::Terminal { .. })),
+        "a logged-out claude must carry a runnable login command"
+    );
+    // A real login still reads as one, with its plan.
+    let signed_in = Runtime::new()
+        .probe(&AgentInstallation::at("claude", wrapper("signed-in", "")))
+        .await
+        .unwrap();
+    let AuthStatus::Authenticated { kind, account } = &signed_in.auth else {
+        panic!("expected Authenticated, got {:?}", signed_in.auth);
+    };
+    assert_eq!(*kind, AuthKind::Subscription);
+    assert_eq!(
+        account.as_ref().unwrap().plan.as_deref(),
+        Some("Claude Max")
+    );
+    // An env API key also reads as a login, though it keeps `tokenSource:
+    // "none"` — that field alone must never decide.
+    let api_key = Runtime::new()
+        .probe(&AgentInstallation::at(
+            "claude",
+            wrapper("api-key", "--api-key"),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        api_key.auth,
+        AuthStatus::Authenticated {
+            kind: AuthKind::ApiKey,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]
