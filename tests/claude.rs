@@ -441,6 +441,36 @@ async fn a_logged_out_handshake_reports_unauthenticated_with_login_methods() {
             ..
         }
     ));
+    // Some CLI versions name the credential in `tokenSource` itself.
+    let token_source = Runtime::new()
+        .probe(&AgentInstallation::at(
+            "claude",
+            wrapper("token-source", "--token-source-key"),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        token_source.auth,
+        AuthStatus::Authenticated {
+            kind: AuthKind::ApiKey,
+            ..
+        }
+    ));
+    // Bedrock carries no Anthropic identity — `apiProvider` is the only tell.
+    let bedrock = Runtime::new()
+        .probe(&AgentInstallation::at(
+            "claude",
+            wrapper("bedrock", "--bedrock"),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        bedrock.auth,
+        AuthStatus::Authenticated {
+            kind: AuthKind::CloudProvider,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]
@@ -910,4 +940,83 @@ async fn creation_time_config_rides_the_launch_args_and_unknown_ids_are_refused(
         panic!("expected InvalidConfiguration");
     };
     assert!(message.contains("sandbox"), "got: {message}");
+}
+
+// -- config home isolation + wire recording (P2 smalls) ---------------------
+
+/// `config_home` reaches the child as `CLAUDE_CONFIG_DIR`; the fixture echoes
+/// the value it received back in its turn text.
+#[tokio::test]
+async fn config_home_reaches_the_child_as_an_env_var() {
+    let runtime = Runtime::new();
+    let agent = AgentInstallation::at("claude", wrapper("cfg-home", "--echo-config-home"));
+    let home = std::env::temp_dir().join(format!("anyagent-cfg-home-{}", std::process::id()));
+    let (session, mut events) = runtime
+        .open(
+            &agent,
+            SessionOptions::in_dir(std::env::temp_dir()).config_home(&home),
+        )
+        .await
+        .unwrap();
+    session.prompt("hi").await.unwrap();
+    let text = complete_turn(&session, &mut events).await;
+    assert!(
+        text.contains(&format!("cfg={}", home.display())),
+        "child did not see the config home: {text:?}"
+    );
+    session.close().await.unwrap();
+}
+
+/// Reads the recording file until it has grown past `min` lines or the poll
+/// budget runs out; the writer task flushes asynchronously.
+async fn recorded_lines(path: &Path, min: usize) -> Vec<serde_json::Value> {
+    for _ in 0..40 {
+        let body = std::fs::read_to_string(path).unwrap_or_default();
+        if body.lines().count() >= min {
+            return body
+                .lines()
+                .map(|l| serde_json::from_str(l).expect("each recorded line is valid JSON"))
+                .collect();
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("recording never reached {min} lines: {path:?}");
+}
+
+/// `record_wire` tees both directions, including the pre-turn handshake, as
+/// one valid JSON object per line.
+#[tokio::test]
+async fn record_wire_tees_both_directions_including_handshake() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("wire.jsonl");
+    let runtime = Runtime::new();
+    let agent = AgentInstallation::at("claude", wrapper("record", ""));
+    let (session, mut events) = runtime
+        .open(
+            &agent,
+            SessionOptions::in_dir(std::env::temp_dir()).record_wire(&log),
+        )
+        .await
+        .unwrap();
+    session.prompt("hi").await.unwrap();
+    complete_turn(&session, &mut events).await;
+    session.close().await.unwrap();
+
+    let lines = recorded_lines(&log, 5).await;
+    assert!(
+        lines.iter().any(|f| f["dir"] == "out"),
+        "no outbound frames recorded"
+    );
+    assert!(
+        lines.iter().any(|f| f["dir"] == "in"),
+        "no inbound frames recorded"
+    );
+    // The handshake runs before the first turn: its `initialize` control
+    // request must be in the log, proving recording started at open.
+    assert!(
+        lines
+            .iter()
+            .any(|f| f["dir"] == "out" && f["frame"]["request"]["subtype"] == "initialize"),
+        "handshake initialize was not recorded"
+    );
 }

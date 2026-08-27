@@ -10,7 +10,8 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::adapter::{
-    Adapter, ConnectRequest, DriverCommand, DriverConnection, DriverEvent, DriverInfo, attach,
+    Adapter, ConnectRequest, DriverCommand, DriverConnection, DriverEvent, DriverInfo,
+    WireRecorder, attach,
 };
 use crate::agent::{
     AccountInfo, AgentDetails, AuthKind, AuthStatus, Capabilities, Capability, ConfigChoice,
@@ -31,6 +32,9 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const CLOSE_GRACE: Duration = Duration::from_secs(2);
 const FRAME_BUFFER: usize = 64;
 const OUTPUT_CAP: usize = 16 * 1024;
+
+/// Gateway credential: the CLI accepts it but never names it in `account`.
+const GATEWAY_TOKEN_ENV: &str = "ANTHROPIC_AUTH_TOKEN";
 
 /// Puts the CLI in stream-json mode with a stdio control channel.
 const BASE_ARGS: [&str; 10] = [
@@ -60,9 +64,11 @@ impl Adapter for ClaudeAdapter {
     /// Spawns the CLI, runs the `initialize` control handshake, and hands the
     /// live wire to the drive task.
     async fn connect(&self, request: ConnectRequest) -> Result<DriverConnection, AgentError> {
-        let (child, wire, info) = launch(&request, &request.options.start).await?;
-        let (cmd_tx, cmd_rx) = mpsc::channel(16);
         let (ev_tx, ev_rx) = mpsc::channel(FRAME_BUFFER);
+        let recorder = WireRecorder::for_session(&request.options, &ev_tx).await;
+        let (child, wire, info) =
+            launch(&request, &request.options.start, recorder.clone()).await?;
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
         tokio::spawn(
             Drive {
                 wire,
@@ -80,6 +86,7 @@ impl Adapter for ClaudeAdapter {
                 last_usage: None,
                 next_uuid: 1,
                 request,
+                recorder,
             }
             .run(cmd_rx),
         );
@@ -102,7 +109,7 @@ impl Adapter for ClaudeAdapter {
             env: Vec::new(),
         })
         .await?;
-        let mut wire = Wire::over(&mut child);
+        let mut wire = Wire::over(&mut child, None);
         let fetch = async {
             wire.roundtrip(json!({ "subtype": "initialize", "hooks": {} }))
                 .await?;
@@ -125,6 +132,7 @@ impl Adapter for ClaudeAdapter {
 async fn launch(
     request: &ConnectRequest,
     start: &SessionStart,
+    recorder: Option<WireRecorder>,
 ) -> Result<(process::Child, Wire, DriverInfo), AgentError> {
     let mut args: Vec<String> = BASE_ARGS.iter().map(|s| (*s).to_owned()).collect();
     // Mint the session id so the resume token exists at open; the CLI only
@@ -156,10 +164,10 @@ async fn launch(
         exec_path: request.installation.executable_path.clone(),
         args,
         cwd: request.options.cwd().clone(),
-        env: Vec::new(),
+        env: crate::adapter::config_home_env(&request.installation, &request.options)?,
     })
     .await?;
-    let mut wire = Wire::over(&mut child);
+    let mut wire = Wire::over(&mut child, recorder);
     match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut wire, request)).await {
         Ok(Ok(mut info)) => {
             if let Some(uuid) = minted {
@@ -302,6 +310,9 @@ fn model_choices(models: &Value) -> Vec<ConfigChoice> {
 /// 2026-08-27, claude 2.1.241):
 ///
 /// - `email` / `subscriptionType` — a real login, subscription or console.
+/// - `apiProvider: "bedrock"` — external AWS credentials, no Anthropic login.
+/// - `tokenSource: "none"` plus `ANTHROPIC_AUTH_TOKEN` in the environment — a
+///   gateway login, which the wire never reports.
 /// - `apiKeySource` — a key supplied by that env var. Note `tokenSource` is
 ///   still `"none"` here, so it alone cannot mean "logged out".
 /// - `tokenSource: "none"` and nothing else — no credential. This is what an
@@ -325,13 +336,49 @@ fn account_status(account: &Value, request: &ConnectRequest) -> AuthStatus {
             }),
         };
     }
+    // A cloud-provider login carries no Anthropic identity at all: auth is the
+    // provider's own credentials, so `apiProvider` is the only tell. T3 keys on
+    // the same field (`ClaudeProvider.ts:567`); Vertex's value is unconfirmed,
+    // so it is not guessed here — it falls to the marker like any unknown shape.
+    if account["apiProvider"].as_str() == Some("bedrock") {
+        return AuthStatus::Authenticated {
+            kind: AuthKind::CloudProvider,
+            account: None,
+        };
+    }
     if account["apiKeySource"].is_string() {
         return AuthStatus::Authenticated {
             kind: AuthKind::ApiKey,
             account: None,
         };
     }
+    // Some CLI versions name the credential in `tokenSource` itself instead of
+    // `apiKeySource` ("apiKey", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN" —
+    // T3's observed set, `ClaudeProvider.ts:516`). Only those known spellings
+    // count; other non-"none" values still fall to the marker.
+    let token_source = account["tokenSource"].as_str().unwrap_or_default();
+    let normalized = token_source.to_lowercase().replace(['_', '-', ' '], "");
+    if matches!(
+        normalized.as_str(),
+        "apikey" | "anthropicapikey" | "anthropicauthtoken"
+    ) {
+        return AuthStatus::Authenticated {
+            kind: AuthKind::ApiKey,
+            account: None,
+        };
+    }
     if account["tokenSource"].as_str() == Some("none") {
+        // A gateway credential is invisible on this wire: with only
+        // `ANTHROPIC_AUTH_TOKEN` set, the account object is byte-identical to a
+        // logged-out one (probed live 2026-08-27). Read the variable the same
+        // way discovery reads `ANTHROPIC_API_KEY`, or we call working setups
+        // logged out. Like any key, it is reported, never validated.
+        if std::env::var(GATEWAY_TOKEN_ENV).is_ok_and(|v| !v.trim().is_empty()) {
+            return AuthStatus::Authenticated {
+                kind: AuthKind::ApiKey,
+                account: None,
+            };
+        }
         return AuthStatus::Unauthenticated {
             login: login_methods(&request.installation),
         };
@@ -501,6 +548,8 @@ struct Drive {
     history: Vec<Option<String>>,
     /// The original connect request: the relaunch recipe for rollback.
     request: ConnectRequest,
+    /// Kept so a rollback respawn keeps teeing to the same recording file.
+    recorder: Option<WireRecorder>,
     next_uuid: u64,
 }
 
@@ -927,7 +976,7 @@ impl Drive {
             from: token.clone(),
             at: Some(MessageId::new(cut)),
         };
-        let (child, wire, _) = launch(&self.request, &start).await?;
+        let (child, wire, _) = launch(&self.request, &start, self.recorder.clone()).await?;
         self.child = child;
         self.wire = wire;
         Ok(())
@@ -1512,21 +1561,26 @@ struct Wire {
     /// All frames the reader task saw, bounded; pipe backpressure beyond.
     frames: mpsc::Receiver<Value>,
     next_id: u64,
+    recorder: Option<WireRecorder>,
 }
 
 impl Wire {
     /// Takes the child's stdio and starts the line-reader task.
-    fn over(child: &mut process::Child) -> Self {
+    fn over(child: &mut process::Child, recorder: Option<WireRecorder>) -> Self {
         use tokio::io::{AsyncBufReadExt, BufReader};
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let (tx, frames) = mpsc::channel(FRAME_BUFFER);
+        let reader_recorder = recorder.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let Ok(frame) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
+                if let Some(recorder) = &reader_recorder {
+                    recorder.record("in", &frame);
+                }
                 if tx.send(frame).await.is_err() {
                     break;
                 }
@@ -1536,6 +1590,7 @@ impl Wire {
             stdin,
             frames,
             next_id: 1,
+            recorder,
         }
     }
 
@@ -1589,6 +1644,9 @@ impl Wire {
 
     async fn write(&mut self, frame: Value) -> std::io::Result<()> {
         use tokio::io::AsyncWriteExt;
+        if let Some(recorder) = &self.recorder {
+            recorder.record("out", &frame);
+        }
         let mut line = frame.to_string();
         line.push('\n');
         self.stdin.write_all(line.as_bytes()).await

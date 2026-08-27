@@ -7,6 +7,8 @@
 use std::num::NonZeroU32;
 
 use async_trait::async_trait;
+use serde_json::{Value, json};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 use crate::agent::{
@@ -14,7 +16,9 @@ use crate::agent::{
     SessionOptions,
 };
 use crate::error::AgentError;
-use crate::event::{Answer, EventKind, Extensions, RequestId, StopReason, ToolId};
+use crate::event::{
+    Answer, Diagnostic, DiagnosticLevel, EventKind, Extensions, RequestId, StopReason, ToolId,
+};
 
 pub(crate) mod acp;
 pub(crate) mod attach;
@@ -118,6 +122,94 @@ pub(crate) fn apply_selection(
         option.current = Some(value.clone());
     }
     true
+}
+
+/// The per-agent config-home environment override for this session, as
+/// `envs` for the child, or an empty set when `config_home` is unset. Fails
+/// typed for an agent with no known config-home variable (an ad-hoc ACP
+/// install), so an isolation request is never silently dropped.
+pub(crate) fn config_home_env(
+    installation: &AgentInstallation,
+    options: &SessionOptions,
+) -> Result<Vec<(String, String)>, AgentError> {
+    let Some(dir) = &options.config_home else {
+        return Ok(Vec::new());
+    };
+    match crate::catalog::config_home_env(installation.id.as_str()) {
+        Some(var) => Ok(vec![(var.to_owned(), dir.to_string_lossy().into_owned())]),
+        None => Err(AgentError::InvalidConfiguration(format!(
+            "{} has no config-home environment variable to isolate its login",
+            installation.id
+        ))),
+    }
+}
+
+/// Tees raw protocol frames to a JSONL file when `record_wire` is set: one
+/// `{"dir":"in"|"out","frame":<frame>}` per line, append-only and flushed per
+/// line so a crash keeps the tail. It is a plain local debug artifact — no
+/// buffering, rotation, or redaction. A write failure is reported once as a
+/// `Diagnostic` and then dropped; recording never fails a turn.
+#[derive(Clone)]
+pub(crate) struct WireRecorder {
+    lines: mpsc::UnboundedSender<Vec<u8>>,
+}
+
+impl WireRecorder {
+    /// The session's recorder when `record_wire` is set; `None` otherwise.
+    /// An open failure is surfaced as one diagnostic on `events` and recording
+    /// stays off, rather than failing the session.
+    pub(crate) async fn for_session(
+        options: &SessionOptions,
+        events: &mpsc::Sender<DriverEvent>,
+    ) -> Option<Self> {
+        let path = options.record_wire.as_deref()?;
+        let events = events.clone();
+        let file = match tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await
+        {
+            Ok(file) => file,
+            Err(e) => {
+                warn(&events, format!("wire recording is off: {e}")).await;
+                return None;
+            }
+        };
+        let (lines, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        tokio::spawn(async move {
+            let mut file = file;
+            while let Some(bytes) = rx.recv().await {
+                if let Err(e) = append(&mut file, &bytes).await {
+                    warn(&events, format!("wire recording stopped: {e}")).await;
+                    break; // report once, then drop the rest silently
+                }
+            }
+        });
+        Some(Self { lines })
+    }
+
+    /// Records one frame in the given direction. Never blocks and never errors
+    /// the caller: a full or gone writer just loses the frame.
+    pub(crate) fn record(&self, dir: &'static str, frame: &Value) {
+        let mut line = json!({ "dir": dir, "frame": frame }).to_string();
+        line.push('\n');
+        let _ = self.lines.send(line.into_bytes());
+    }
+}
+
+async fn append(file: &mut tokio::fs::File, bytes: &[u8]) -> std::io::Result<()> {
+    file.write_all(bytes).await?;
+    file.flush().await
+}
+
+async fn warn(events: &mpsc::Sender<DriverEvent>, message: String) {
+    let _ = events
+        .send(DriverEvent::event(EventKind::Diagnostic(Diagnostic {
+            level: DiagnosticLevel::Warning,
+            message,
+        })))
+        .await;
 }
 
 #[derive(Clone)]

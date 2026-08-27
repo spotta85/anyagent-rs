@@ -681,3 +681,74 @@ async fn grok_first_class_models_surface_as_the_model_option_and_switch_via_set_
         }
     }
 }
+
+#[tokio::test]
+async fn config_home_on_an_agent_without_a_known_var_is_refused() {
+    let runtime = Runtime::new();
+    let err = runtime
+        .open(
+            &fixture(&[]),
+            SessionOptions::in_dir(std::env::temp_dir()).config_home(std::env::temp_dir()),
+        )
+        .await
+        .err();
+    assert!(
+        matches!(err, Some(AgentError::InvalidConfiguration(_))),
+        "expected InvalidConfiguration, got {err:?}"
+    );
+}
+
+/// `record_wire` tees the ACP JSON-RPC wire too, both directions and including
+/// the handshake, as one valid JSON object per line.
+#[tokio::test]
+async fn record_wire_tees_the_acp_wire_including_handshake() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("wire.jsonl");
+    let runtime = Runtime::new();
+    let (session, mut events) = runtime
+        .open(
+            &fixture(&[]),
+            SessionOptions::in_dir(std::env::temp_dir()).record_wire(&log),
+        )
+        .await
+        .unwrap();
+    session.prompt("hi").await.unwrap();
+    loop {
+        match next(&mut events).await.kind {
+            EventKind::RequestOpened(Request::Permission(request)) => {
+                session.answer(request.id, allow()).await.unwrap();
+            }
+            EventKind::TurnEnded { .. } => break,
+            _ => {}
+        }
+    }
+    session.close().await.unwrap();
+
+    let mut lines = Vec::new();
+    for _ in 0..40 {
+        let body = std::fs::read_to_string(&log).unwrap_or_default();
+        if body.lines().count() >= 5 {
+            lines = body
+                .lines()
+                .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("valid JSON line"))
+                .collect();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(lines.len() >= 5, "too few frames recorded: {}", lines.len());
+    assert!(
+        lines.iter().any(|f| f["dir"] == "out"),
+        "no outbound frames recorded"
+    );
+    assert!(
+        lines.iter().any(|f| f["dir"] == "in"),
+        "no inbound frames recorded"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|f| f["dir"] == "out" && f["frame"]["method"] == "initialize"),
+        "handshake initialize was not recorded"
+    );
+}

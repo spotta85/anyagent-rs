@@ -3,7 +3,10 @@
 // --eof (die mid-turn), --wake (background task wakes an agent-originated
 // turn), --subagent (nested transcript with parent_tool_use_id),
 // --logged-out (initialize reports no token source), --api-key (an env
-// key supplies auth, still with `tokenSource: "none"`).
+// key supplies auth, still with `tokenSource: "none"`), --bedrock (an
+// AWS cloud-provider login, no Anthropic identity at all),
+// --token-source-key (the credential named in tokenSource itself),
+// --echo-config-home (echo the CLAUDE_CONFIG_DIR the child received).
 import { createInterface } from 'node:readline';
 
 const flag = (name) => process.argv.includes(name);
@@ -63,8 +66,12 @@ function onControl(m) {
         // so only the absence of both means logged out.
         account: flag('--logged-out')
           ? { tokenSource: 'none', apiProvider: 'firstParty' }
+          : flag('--bedrock')
+          ? { apiProvider: 'bedrock' }
           : flag('--api-key')
           ? { tokenSource: 'none', apiKeySource: 'ANTHROPIC_API_KEY', apiProvider: 'firstParty' }
+          : flag('--token-source-key')
+          ? { tokenSource: 'ANTHROPIC_AUTH_TOKEN', apiProvider: 'firstParty' }
           : { email: 'user@example.com', organization: 'Example Org', subscriptionType: 'Claude Max', apiProvider: 'firstParty' },
         current_permission_mode: pm > -1 ? process.argv[pm + 1] : 'default',
       });
@@ -189,6 +196,9 @@ async function runTurn(m) {
   // Echo identity so rollback tests can assert the fork cut point.
   if (flag('--echo-uuid')) delta({ type: 'text_delta', text: `uuid=${u} ` });
   if (FORK_AT) delta({ type: 'text_delta', text: `fork=${FORK_AT} ` });
+  // Echo the config-home env var so tests can assert isolation reached the
+  // child (set by SessionOptions::config_home).
+  if (flag('--echo-config-home')) delta({ type: 'text_delta', text: `cfg=${process.env.CLAUDE_CONFIG_DIR ?? 'unset'} ` });
   // Echo --mcp-config so tests can assert the launch shape.
   const mi = process.argv.indexOf('--mcp-config');
   if (mi > -1) {

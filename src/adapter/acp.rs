@@ -13,7 +13,8 @@ use tokio::process::ChildStdin;
 use tokio::sync::mpsc;
 
 use crate::adapter::{
-    Adapter, ConnectRequest, DriverCommand, DriverConnection, DriverEvent, DriverInfo, attach,
+    Adapter, ConnectRequest, DriverCommand, DriverConnection, DriverEvent, DriverInfo,
+    WireRecorder, attach,
 };
 use crate::agent::{
     AgentDetails, AuthStatus, Capabilities, Capability, ConfigChoice, ConfigId, ConfigKind,
@@ -52,14 +53,17 @@ impl Adapter for AcpAdapter {
     /// Spawns the CLI, runs `initialize` + `session/new` (or `session/load`),
     /// and hands the live wire to the drive task.
     async fn connect(&self, request: ConnectRequest) -> Result<DriverConnection, AgentError> {
+        let env = crate::adapter::config_home_env(&request.installation, &request.options)?;
+        let (ev_tx, ev_rx) = mpsc::channel(FRAME_BUFFER);
+        let recorder = WireRecorder::for_session(&request.options, &ev_tx).await;
         let mut child = process::spawn(Spawn {
             exec_path: request.installation.executable_path.clone(),
             args: self.args.clone(),
             cwd: request.options.cwd().clone(),
-            env: Vec::new(),
+            env,
         })
         .await?;
-        let mut wire = Wire::over(&mut child);
+        let mut wire = Wire::over(&mut child, recorder);
 
         let handshake = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut wire, &request));
         let (info, session_id, login, first_class_model) = match handshake.await {
@@ -75,7 +79,6 @@ impl Adapter for AcpAdapter {
         };
 
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
-        let (ev_tx, ev_rx) = mpsc::channel(FRAME_BUFFER);
         tokio::spawn(
             Drive {
                 wire,
@@ -278,6 +281,10 @@ fn driver_info(init: &acp::InitializeResponse, auth: &Option<AuthStatus>) -> Dri
     DriverInfo {
         details: AgentDetails {
             version: init.agent_info.as_ref().map(|i| i.version.clone()),
+            // ACP has no auth-status field on the wire; this is discovery's
+            // offline marker (credential file / env), so it is best-effort: a
+            // stale credential still reads Authenticated until the agent
+            // refuses, which surfaces as `AuthRequired` at the first prompt.
             auth: auth.clone().unwrap_or(AuthStatus::Unknown),
             capabilities,
             config_options: Vec::new(),
@@ -1219,20 +1226,25 @@ struct Wire {
     /// All frames the reader task saw, bounded; pipe backpressure beyond.
     frames: mpsc::Receiver<Value>,
     next_id: u64,
+    recorder: Option<WireRecorder>,
 }
 
 impl Wire {
     /// Takes the child's stdio and starts the line-reader task.
-    fn over(child: &mut process::Child) -> Self {
+    fn over(child: &mut process::Child, recorder: Option<WireRecorder>) -> Self {
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let (tx, frames) = mpsc::channel(FRAME_BUFFER);
+        let reader_recorder = recorder.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let Ok(frame) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
+                if let Some(recorder) = &reader_recorder {
+                    recorder.record("in", &frame);
+                }
                 if tx.send(frame).await.is_err() {
                     break;
                 }
@@ -1242,6 +1254,7 @@ impl Wire {
             stdin,
             frames,
             next_id: 1,
+            recorder,
         }
     }
 
@@ -1294,6 +1307,9 @@ impl Wire {
     }
 
     async fn write(&mut self, frame: Value) -> std::io::Result<()> {
+        if let Some(recorder) = &self.recorder {
+            recorder.record("out", &frame);
+        }
         let mut line = frame.to_string();
         line.push('\n');
         self.stdin.write_all(line.as_bytes()).await

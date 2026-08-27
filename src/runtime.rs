@@ -17,7 +17,7 @@ use crate::event::{Diagnostic, PlanUsage};
 use crate::session::{self, Events, Session};
 
 const USAGE_CACHE_TTL: Duration = Duration::from_secs(60);
-/// special case for acp probe. 
+/// special case for acp probe.
 const PROBE_COMMANDS_WAIT: Duration = Duration::from_secs(2);
 
 /// The one object an application creates. Holds the adapter registry.
@@ -122,12 +122,12 @@ impl Runtime {
             .await?;
         Ok(session::start(agent.clone(), connection, &options))
     }
-    // spawn agent in temp dir, wait for handshake, read details, close. 
+    // spawn agent in temp dir, wait for handshake, read details, close.
     pub async fn probe(&self, agent: &AgentInstallation) -> Result<AgentDetails, AgentError> {
         let opened = self
             .open(agent, SessionOptions::in_dir(std::env::temp_dir()))
             .await;
-        // Not logged is reported as a detail. 
+        // Not logged is reported as a detail.
         let (session, mut events) = match opened {
             Err(AgentError::AuthRequired { login }) => {
                 return Ok(AgentDetails {
@@ -143,7 +143,7 @@ impl Runtime {
         // ACP agents often deliver `availableCommands` as an update just
         // after `session/new`; wait briefly for it before giving up on an
         // empty list. Agents that report commands at handshake (claude) skip
-        // the wait entirely. 
+        // the wait entirely.
         let deadline = tokio::time::Instant::now() + PROBE_COMMANDS_WAIT;
         while session.info().details.commands.is_empty() {
             let Ok(Some(Ok(_))) = tokio::time::timeout_at(deadline, events.next()).await else {
@@ -155,7 +155,7 @@ impl Runtime {
         Ok(details)
     }
 
- /// Agents without quota
+    /// Agents without quota
     /// (or with an API-key login) return `UnsupportedFeature`. May spawn a
     /// short-lived agent process; results are cached for 60 s.
     pub async fn plan_usage(&self, agent: &AgentInstallation) -> Result<PlanUsage, AgentError> {

@@ -1057,3 +1057,87 @@ fn claude_transcripts() -> std::collections::BTreeSet<std::path::PathBuf> {
     }
     found
 }
+
+// -- config home isolation + wire recording (P2 smalls) ---------------------
+
+#[tokio::test]
+#[ignore = "live: talks to real agents"]
+async fn config_home_isolates_login() {
+    for h in enabled() {
+        if h != "claude" {
+            println!("SKIP {h}: config-home isolation asserted on claude");
+            continue;
+        }
+        let runtime = Runtime::new();
+        let report = runtime.discover().await;
+        let agent = report.require(h).unwrap();
+        // The real login is present (offline marker), proving the default
+        // path is authenticated.
+        assert!(
+            matches!(agent.auth, Some(AuthStatus::Authenticated { .. })),
+            "{h}: default login is not authenticated: {:?}",
+            agent.auth
+        );
+        // An empty temp config home has no credentials. NEVER touch ~/.claude
+        // itself; the temp dir is discarded at the end of the test.
+        let empty = tempfile::tempdir().unwrap();
+        let opened = runtime
+            .open(
+                agent,
+                SessionOptions::in_dir(empty.path()).config_home(empty.path()),
+            )
+            .await;
+        match opened {
+            Ok((session, _events)) => {
+                assert!(
+                    matches!(
+                        session.info().details.auth,
+                        AuthStatus::Unauthenticated { .. }
+                    ),
+                    "{h}: empty config home is not unauthenticated: {:?}",
+                    session.info().details.auth
+                );
+                session.close().await.ok();
+            }
+            // A logged-out handshake that fails closed is equally valid.
+            Err(AgentError::AuthRequired { .. }) => {}
+            Err(e) => panic!("{h}: empty config home errored unexpectedly: {e}"),
+        }
+        pass(h, "config home isolates login (empty home is logged out)");
+    }
+}
+
+#[tokio::test]
+#[ignore = "live: talks to real agents"]
+async fn record_wire_captures_a_live_turn() {
+    for h in enabled() {
+        if h != "claude" {
+            println!("SKIP {h}: recording smoke asserted on claude");
+            continue;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("wire.jsonl");
+        let runtime = Runtime::new();
+        let report = runtime.discover().await;
+        let agent = report.require(h).unwrap();
+        let (session, mut events) = runtime
+            .open(agent, SessionOptions::in_dir(dir.path()).record_wire(&log))
+            .await
+            .unwrap();
+        session.prompt("Say only OK. No tools.").await.unwrap();
+        drain_to_turn_end(&session, &mut events, &format!("{h}: record turn")).await;
+        session.close().await.unwrap();
+        // The writer task flushes asynchronously.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let body = std::fs::read_to_string(&log).unwrap();
+        let count = body.lines().count();
+        assert!(count > 5, "{h}: too few frames recorded: {count}");
+        for line in body.lines() {
+            assert!(
+                line.starts_with("{\"dir\":"),
+                "{h}: recorded line is not a dir/frame object: {line}"
+            );
+        }
+        pass(h, &format!("recorded {count} wire frames over a live turn"));
+    }
+}

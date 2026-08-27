@@ -173,3 +173,13 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         extra_paths: &[],
     },
 ];
+
+/// The environment variable that relocates an agent's config home, if it has
+/// one. `None` for an agent outside the catalog (an ad-hoc ACP install) or one
+/// with no such variable.
+pub(crate) fn config_home_env(id: &str) -> Option<&'static str> {
+    PROFILES
+        .iter()
+        .find(|p| p.id == id)
+        .and_then(|p| p.config_home_env)
+}

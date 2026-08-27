@@ -376,6 +376,8 @@ pub struct SessionOptions {
     pub(crate) quiet_window: Option<Duration>,
     pub(crate) mcp_servers: Vec<McpServer>,
     pub(crate) configure: Vec<(ConfigId, ConfigValue)>,
+    pub(crate) config_home: Option<PathBuf>,
+    pub(crate) record_wire: Option<PathBuf>,
 }
 
 /// How `open` binds to a provider session.
@@ -398,6 +400,8 @@ impl SessionOptions {
             quiet_window: None,
             mcp_servers: Vec::new(),
             configure: Vec::new(),
+            config_home: None,
+            record_wire: None,
         }
     }
 
@@ -435,6 +439,26 @@ impl SessionOptions {
 
     pub fn permission_mode(mut self, mode: PermissionMode) -> Self {
         self.permission_mode = mode;
+        self
+    }
+
+    /// Point the agent at a separate config directory so one machine can hold
+    /// several logins side by side (claude: `CLAUDE_CONFIG_DIR`, codex:
+    /// `CODEX_HOME`). This is the supported way to keep logins apart;
+    /// credential copying stays the application's job. `open` fails with
+    /// `InvalidConfiguration` on an agent that has no known config-home
+    /// variable, rather than silently ignoring the request.
+    pub fn config_home(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.config_home = Some(dir.into());
+        self
+    }
+
+    /// Tee every raw protocol frame, both directions, to `path` for bug
+    /// reports: one JSON object per line, `{"dir":"in"|"out","frame":<frame>}`,
+    /// append-only and flushed per line. A recording failure never fails a
+    /// turn. Unset (the default) records nothing.
+    pub fn record_wire(mut self, path: impl Into<PathBuf>) -> Self {
+        self.record_wire = Some(path.into());
         self
     }
 
