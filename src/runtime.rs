@@ -86,9 +86,12 @@ impl Runtime {
     }
 
     /// Best-effort, read-only inventory: which agents exist, where, and
-    /// whether a login marker is present. Never launches an agent.
+    /// whether a login marker is present. Never launches an agent. An agent
+    /// whose adapter is not implemented never appears as usable.
     pub async fn discover(&self) -> DiscoveryReport {
         let mut report = crate::discovery::discover(self.profiles).await;
+        report.agents.retain(|a| self.adapters.contains_key(&a.id));
+        report.missing.retain(|m| self.adapters.contains_key(&m.id));
         report.agents.splice(0..0, self.pinned.iter().cloned());
         report
     }
@@ -224,4 +227,82 @@ pub struct MissingAgent {
     pub name: String,
     pub searched: Vec<PathBuf>,
     pub install_hint: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn make_exe(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let exe = dir.join(name);
+        std::fs::write(&exe, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        exe
+    }
+
+    #[tokio::test]
+    async fn discover_hides_agents_without_adapter() {
+        let _guard = env_lock().lock().unwrap();
+        // `antigravity` has no adapter; even if its `agy` binary is on disk
+        // it must not appear as usable.
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join(".local/bin");
+        make_exe(&bin, "agy");
+        // Also create a supported agent so the scan has something to find.
+        make_exe(&bin, "claude");
+
+        let orig_home = std::env::var_os("HOME");
+        let orig_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("HOME", home.path());
+            std::env::set_var("PATH", bin.to_string_lossy().to_string());
+        }
+
+        // Raw discovery (no filtering) would find `agy`.
+        let raw = crate::discovery::discover(crate::catalog::PROFILES).await;
+        assert!(
+            raw.agents.iter().any(|a| a.id.as_str() == "antigravity"),
+            "raw discover should find agy when present"
+        );
+
+        // Runtime::discover hides it.
+        let runtime = Runtime::new();
+        let report = runtime.discover().await;
+        assert!(
+            !report.agents.iter().any(|a| a.id.as_str() == "antigravity"),
+            "antigravity must not appear as usable"
+        );
+        assert!(
+            !report
+                .missing
+                .iter()
+                .any(|m| m.id.as_str() == "antigravity"),
+            "antigravity must not appear as missing either"
+        );
+        assert!(
+            report.agents.iter().any(|a| a.id.as_str() == "claude"),
+            "supported agents still appear"
+        );
+
+        unsafe {
+            if let Some(v) = orig_home {
+                std::env::set_var("HOME", v);
+            } else {
+                std::env::remove_var("HOME");
+            }
+            if let Some(v) = orig_path {
+                std::env::set_var("PATH", v);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+    }
 }
