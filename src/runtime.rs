@@ -179,6 +179,18 @@ impl Runtime {
         Ok(usage)
     }
 
+    /// Drives the agent's own login flow and streams what the user must do (like open url)
+    pub async fn login(
+        &self,
+        agent: &AgentInstallation,
+        method: Option<crate::agent::LoginMethod>,
+    ) -> Result<crate::login::LoginSession, AgentError> {
+        match self.adapters.get(&agent.id) {
+            Some(adapter) => adapter.login(agent, method.as_ref()).await,
+            None => Err(crate::adapter::login_unsupported(agent)),
+        }
+    }
+
     /// One call for a usage page: every discovered agent with its quota or
     /// the typed reason it has none. Per-agent probes run concurrently.
     pub async fn plan_usage_all(&self) -> Vec<AgentPlanUsage> {

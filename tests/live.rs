@@ -21,9 +21,9 @@ use std::time::Duration;
 use futures::StreamExt;
 
 use anyagent::{
-    AgentError, Answer, AuthStatus, Capability, ConfigKind, DeliveryKind, Event, EventKind, Events,
-    MessageId, PermissionChoice, QuestionAnswer, Request, RequestId, RollbackScope, Runtime,
-    Session, SessionOptions, StopReason, ToolStatus, TurnOrigin,
+    AgentError, AgentInstallation, Answer, AuthStatus, Capability, ConfigKind, DeliveryKind, Event,
+    EventKind, Events, LoginEvent, MessageId, PermissionChoice, QuestionAnswer, Request, RequestId,
+    RollbackScope, Runtime, Session, SessionOptions, StopReason, ToolStatus, TurnOrigin,
 };
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -1291,6 +1291,77 @@ async fn config_home_isolates_login() {
             Err(e) => panic!("{h}: empty config home errored unexpectedly: {e}"),
         }
         pass(h, "config home isolates login (empty home is logged out)");
+    }
+}
+
+#[tokio::test]
+#[ignore = "live: talks to real agents"]
+async fn login_streams_a_real_url_and_cancel_cleans_up() {
+    for h in enabled() {
+        if h != "claude" && h != "codex" {
+            println!("SKIP {h}: driven login ships on claude and codex");
+            continue;
+        }
+        let runtime = Runtime::new();
+        let report = runtime.discover().await;
+        let agent = report.require(h).unwrap();
+        // NEVER the real config home: a wrapper pins a throwaway one, and the
+        // flow is cancelled before any OAuth completes. Note: claude's CLI
+        // still opens a browser tab; the flow it starts is abandoned.
+        let home = tempfile::tempdir().unwrap();
+        let var = match h {
+            "claude" => "CLAUDE_CONFIG_DIR",
+            _ => "CODEX_HOME",
+        };
+        let wrapper = home.path().join(h);
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\n{var}={} exec {} \"$@\"\n",
+                home.path().display(),
+                agent.executable_path.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pinned = AgentInstallation::at(h, &wrapper);
+        let mut login = runtime
+            .login(&pinned, None)
+            .await
+            .unwrap_or_else(|e| panic!("{h}: login did not start: {e}"));
+        let url = loop {
+            match tokio::time::timeout(Duration::from_secs(30), login.events.next())
+                .await
+                .unwrap_or_else(|_| panic!("{h}: no login URL within 30s"))
+            {
+                Some(LoginEvent::OpenUrl { url, .. }) => break url,
+                Some(_) => continue,
+                None => panic!("{h}: login stream ended before a URL"),
+            }
+        };
+        assert!(url.starts_with("https://"), "{h}: implausible URL: {url}");
+        login.cancel.cancel();
+        let status = loop {
+            match tokio::time::timeout(Duration::from_secs(15), login.events.next())
+                .await
+                .unwrap_or_else(|_| panic!("{h}: no Finished within 15s of cancel"))
+            {
+                Some(LoginEvent::Finished { status }) => break status,
+                Some(_) => continue,
+                None => panic!("{h}: login stream ended without Finished"),
+            }
+        };
+        // The throwaway home never got a credential, so the re-check reads
+        // logged out (Unknown is the honest cancel-killed-the-CLI fallback).
+        assert!(
+            matches!(
+                status,
+                AuthStatus::Unauthenticated { .. } | AuthStatus::Unknown
+            ),
+            "{h}: unexpected status after cancel: {status:?}"
+        );
+        pass(h, "login URL arrived; cancel finished the flow logged out");
     }
 }
 

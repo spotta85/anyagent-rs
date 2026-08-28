@@ -2,10 +2,13 @@
 // directory (codex 0.147.0): line-delimited JSON-RPC 2.0 both ways.
 // Flags: --logged-out (no account; a turn 401s), --api-key (auth.json key
 // login), --question (a requestUserInput mid-turn), --echo-config-home
-// (echo the CODEX_HOME the child received). Prompt words steer scenarios:
+// (echo the CODEX_HOME the child received), --auth-file (account/read keyed
+// on $CODEX_HOME/auth.json, for login flows), --login-slow (completion never
+// arrives, for the login cancel test). Prompt words steer scenarios:
 // "write-file" (a fileChange escalates past the sandbox -> approval),
 // "sleep" (a command that only an interrupt ends), "die" (exit mid-turn).
 import { createInterface } from 'node:readline';
+import { existsSync, writeFileSync } from 'node:fs';
 
 const flag = (name) => process.argv.includes(name);
 const send = (m) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...m }) + '\n');
@@ -13,7 +16,8 @@ const notify = (method, params) => send({ method, params });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const THREAD = { id: 'th-1', name: null };
-let turnN = 0, serverReqN = 0, itemN = 0;
+const AUTH_FILE = (process.env.CODEX_HOME ?? '.') + '/auth.json';
+let turnN = 0, serverReqN = 0, itemN = 0, loginTimer = null;
 let turn = null; // { id, started, interrupted, steered: [] }
 const waiters = {}; // server request id -> resolver
 
@@ -70,11 +74,28 @@ async function onRequest(m) {
     case 'initialize':
       return reply({ userAgent: 'anyagent/0.147.0 (Mac OS 26.5.1; arm64)', codexHome: process.env.CODEX_HOME ?? '', platformOs: 'macos' });
     case 'account/read':
+      // --auth-file keys the account on auth.json, like the real server;
+      // the login flow writes it on completion.
+      if (flag('--auth-file')) return reply(existsSync(AUTH_FILE)
+        ? { account: { type: 'chatgpt', email: 'user@example.com', planType: 'edu' }, requiresOpenaiAuth: true }
+        : { account: null, requiresOpenaiAuth: true });
       return reply(flag('--logged-out')
         ? { account: null, requiresOpenaiAuth: true }
         : flag('--api-key')
         ? { account: { type: 'apiKey' }, requiresOpenaiAuth: true }
         : { account: { type: 'chatgpt', email: 'user@example.com', planType: 'edu' }, requiresOpenaiAuth: true });
+    case 'account/login/start':
+      // The delayed completion models the user's browser round trip;
+      // --login-slow leaves it pending so the cancel test can abort first.
+      reply({ authUrl: 'https://auth.example.com/oauth?login', loginId: 'login-1' });
+      loginTimer = setTimeout(() => {
+        writeFileSync(AUTH_FILE, '{}');
+        notify('account/login/completed', { success: true, loginId: 'login-1', error: null });
+      }, flag('--login-slow') ? 60_000 : 50);
+      return;
+    case 'account/login/cancel':
+      clearTimeout(loginTimer);
+      return reply({});
     case 'model/list':
       return reply({ data: MODELS, nextCursor: null });
     case 'account/rateLimits/read':

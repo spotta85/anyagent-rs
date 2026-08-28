@@ -9,9 +9,29 @@
 // --echo-config-home (echo the CLAUDE_CONFIG_DIR the child received),
 // --rewind-fails (rewind_files answers with an error envelope).
 import { createInterface } from 'node:readline';
-import { writeFileSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
 
 const flag = (name) => process.argv.includes(name);
+
+// `auth login` / `auth status --json` modes for the Runtime::login tests:
+// login prints the URL then completes (marker file in $CLAUDE_CONFIG_DIR),
+// hangs (--login-hang, for the cancel test), or fails (--login-fail);
+// status reports loggedIn from the marker, exit 1 when logged out.
+if (flag('auth')) {
+  const marker = (process.env.CLAUDE_CONFIG_DIR ?? '.') + '/fixture-auth';
+  if (flag('status')) {
+    const loggedIn = existsSync(marker);
+    console.log(JSON.stringify(loggedIn
+      ? { loggedIn: true, authMethod: 'claude.ai', email: 'user@example.com', subscriptionType: 'max' }
+      : { loggedIn: false, authMethod: 'none' }));
+    process.exit(loggedIn ? 0 : 1);
+  }
+  console.log('Opening browser to sign in…');
+  console.log("If the browser didn't open, visit: https://example.com/oauth?code=true&state=abc");
+  if (flag('--login-hang')) setInterval(() => {}, 1000);
+  else if (flag('--login-fail')) { console.log('Login failed.'); process.exit(1); }
+  else { writeFileSync(marker, ''); console.log('Login successful.'); process.exit(0); }
+}
 const send = (m) => process.stdout.write(JSON.stringify(m) + '\n');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // A fork launch (`--fork-session`, optionally `--resume-session-at=<uuid>`)

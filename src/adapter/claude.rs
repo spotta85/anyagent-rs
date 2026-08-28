@@ -126,6 +126,104 @@ impl Adapter for ClaudeAdapter {
         child.shutdown(CLOSE_GRACE).await;
         result
     }
+
+    /// Drives `claude auth login`: the browser flow completes on its own
+    /// (probed 2026-08-27); `Finished` re-reads `auth status --json`.
+    async fn login(
+        &self,
+        installation: &crate::agent::AgentInstallation,
+        method: Option<&crate::agent::LoginMethod>,
+    ) -> Result<crate::login::LoginSession, AgentError> {
+        crate::adapter::check_login_method(installation, method)?;
+        let child = process::spawn(Spawn {
+            exec_path: installation.executable_path.clone(),
+            args: vec!["auth".into(), "login".into()],
+            cwd: std::env::temp_dir(),
+            env: Vec::new(),
+        })
+        .await?;
+        let (events, cancel, session) = crate::login::login_channel();
+        tokio::spawn(drive_login(child, installation.clone(), events, cancel));
+        Ok(session)
+    }
+}
+
+/// Streams the login child's stdout until it exits or the caller cancels,
+/// then reports the re-checked auth status as `Finished`.
+async fn drive_login(
+    mut child: process::Child,
+    installation: crate::agent::AgentInstallation,
+    events: mpsc::Sender<crate::login::LoginEvent>,
+    cancel: std::sync::Arc<tokio::sync::Notify>,
+) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut lines = BufReader::new(child.stdout.take().expect("piped stdout")).lines();
+    loop {
+        tokio::select! {
+            line = lines.next_line() => match line {
+                Ok(Some(line)) => { let _ = events.send(login_line(&line)).await; }
+                _ => break, // the CLI exited; the flow is over either way
+            },
+            _ = cancel.notified() => break,
+        }
+    }
+    child.shutdown(CLOSE_GRACE).await;
+    let status = auth_status(&installation).await;
+    let _ = events
+        .send(crate::login::LoginEvent::Finished { status })
+        .await;
+}
+
+/// The CLI's known URL line becomes `OpenUrl`; everything else passes through.
+fn login_line(line: &str) -> crate::login::LoginEvent {
+    match line.split("visit: ").nth(1) {
+        Some(url) => crate::login::LoginEvent::OpenUrl {
+            url: url.trim().to_owned(),
+            code: None,
+        },
+        None => crate::login::LoginEvent::Output {
+            line: line.to_owned(),
+        },
+    }
+}
+
+/// Post-flow truth check: `claude auth status --json` (~0.2 s, exit 1 when
+/// logged out). Unreadable output is reported as `Unknown`, never guessed.
+async fn auth_status(installation: &crate::agent::AgentInstallation) -> AuthStatus {
+    let output = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        tokio::process::Command::new(&installation.executable_path)
+            .args(["auth", "status", "--json"])
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
+    let Ok(Ok(output)) = output else {
+        return AuthStatus::Unknown;
+    };
+    match serde_json::from_slice::<Value>(&output.stdout) {
+        Ok(status) if status["loggedIn"].as_bool() == Some(true) => AuthStatus::Authenticated {
+            kind: if status["subscriptionType"].is_string() {
+                AuthKind::Subscription
+            } else {
+                AuthKind::Other(
+                    status["authMethod"]
+                        .as_str()
+                        .unwrap_or("unknown")
+                        .to_owned(),
+                )
+            },
+            account: Some(AccountInfo {
+                email: status["email"].as_str().map(str::to_owned),
+                plan: status["subscriptionType"].as_str().map(str::to_owned),
+            }),
+        },
+        Ok(_) => AuthStatus::Unauthenticated {
+            login: login_methods(installation),
+        },
+        Err(_) => AuthStatus::Unknown,
+    }
 }
 
 /// Spawns the CLI bound to `start` and handshakes within the timeout: the

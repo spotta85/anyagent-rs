@@ -1108,3 +1108,124 @@ async fn record_wire_tees_both_directions_including_handshake() {
         "handshake initialize was not recorded"
     );
 }
+
+/// A `claude` stand-in for login flows: the wrapper exports a private config
+/// home so the fixture's auth marker is per-test.
+fn login_wrapper(name: &str, flags: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude/fixture.mjs");
+    let dir = std::env::temp_dir().join(format!("anyagent-claude-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("claude");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nCLAUDE_CONFIG_DIR={} exec node {} {flags} \"$@\"\n",
+            dir.display(),
+            fixture.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// Drains a login stream: returns the last URL and the final status.
+async fn drain_login(login: &mut anyagent::LoginSession) -> (Option<String>, Option<AuthStatus>) {
+    let (mut url, mut status) = (None, None);
+    let drain = async {
+        while let Some(event) = login.events.next().await {
+            match event {
+                anyagent::LoginEvent::OpenUrl { url: u, .. } => url = Some(u),
+                anyagent::LoginEvent::Finished { status: s } => status = Some(s),
+                _ => {}
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), drain)
+        .await
+        .expect("login stream did not finish");
+    (url, status)
+}
+
+#[tokio::test]
+async fn login_streams_the_url_and_reports_the_new_status() {
+    let runtime = Runtime::new();
+    let agent = AgentInstallation::at("claude", login_wrapper("login-ok", ""));
+    let mut login = runtime.login(&agent, None).await.unwrap();
+    let (url, status) = drain_login(&mut login).await;
+    assert_eq!(
+        url.as_deref(),
+        Some("https://example.com/oauth?code=true&state=abc")
+    );
+    // `Finished` is the re-read `auth status --json`, not the exit code.
+    match status.expect("no Finished event") {
+        AuthStatus::Authenticated {
+            kind: AuthKind::Subscription,
+            account,
+        } => assert_eq!(account.unwrap().email.as_deref(), Some("user@example.com")),
+        other => panic!("expected a subscription login, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn login_failure_finishes_unauthenticated_with_methods() {
+    let runtime = Runtime::new();
+    let agent = AgentInstallation::at("claude", login_wrapper("login-fail", "--login-fail"));
+    let mut login = runtime.login(&agent, None).await.unwrap();
+    let (_, status) = drain_login(&mut login).await;
+    match status.expect("no Finished event") {
+        AuthStatus::Unauthenticated { login } => assert!(!login.is_empty()),
+        other => panic!("expected unauthenticated, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn login_cancel_kills_the_child_and_still_finishes() {
+    let runtime = Runtime::new();
+    let agent = AgentInstallation::at("claude", login_wrapper("login-hang", "--login-hang"));
+    let mut login = runtime.login(&agent, None).await.unwrap();
+    // Wait for the URL so the cancel lands mid-flow, not before spawn output.
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), login.events.next())
+            .await
+            .expect("timed out")
+            .expect("stream ended early");
+        if let anyagent::LoginEvent::OpenUrl { .. } = event {
+            break;
+        }
+    }
+    login.cancel.cancel();
+    let (_, status) = drain_login(&mut login).await;
+    match status.expect("no Finished event") {
+        AuthStatus::Unauthenticated { .. } => {}
+        other => panic!("expected unauthenticated after cancel, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn login_refuses_env_var_and_unknown_methods() {
+    let runtime = Runtime::new();
+    let agent = AgentInstallation::at("claude", login_wrapper("login-methods", ""));
+    let key = runtime
+        .login(
+            &agent,
+            Some(LoginMethod::EnvVar {
+                name: "ANTHROPIC_API_KEY".into(),
+            }),
+        )
+        .await;
+    assert!(matches!(key, Err(AgentError::UnsupportedFeature(_))));
+    let unknown = runtime
+        .login(
+            &agent,
+            Some(LoginMethod::Terminal {
+                command: vec!["other".into()],
+                env: Default::default(),
+                description: String::new(),
+            }),
+        )
+        .await;
+    assert!(matches!(unknown, Err(AgentError::InvalidRequest(_))));
+}

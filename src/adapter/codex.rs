@@ -131,6 +131,102 @@ impl Adapter for CodexAdapter {
         child.shutdown(CLOSE_GRACE).await;
         result
     }
+
+    /// Drives the in-protocol login 
+    async fn login(
+        &self,
+        installation: &crate::agent::AgentInstallation,
+        method: Option<&crate::agent::LoginMethod>,
+    ) -> Result<crate::login::LoginSession, AgentError> {
+        crate::adapter::check_login_method(installation, method)?;
+        let mut child = process::spawn(Spawn {
+            exec_path: installation.executable_path.clone(),
+            args: vec!["app-server".into()],
+            cwd: std::env::temp_dir(),
+            env: Vec::new(),
+        })
+        .await?;
+        let mut wire = Wire::over(&mut child, None);
+        let start = async {
+            wire.roundtrip("initialize", json!({ "clientInfo": client_info() }))
+                .await?;
+            wire.notify("initialized").await?;
+            wire.roundtrip("account/login/start", json!({ "type": "chatgpt" }))
+                .await
+        };
+        let started = match tokio::time::timeout(HANDSHAKE_TIMEOUT, start).await {
+            Ok(Ok(started)) => started,
+            Ok(Err(e)) => {
+                let e = with_stderr(e.into_error(), &child);
+                child.shutdown(CLOSE_GRACE).await;
+                return Err(e);
+            }
+            Err(_) => {
+                child.shutdown(CLOSE_GRACE).await;
+                return Err(AgentError::HandshakeTimeout);
+            }
+        };
+        let login_id = started["loginId"].as_str().unwrap_or_default().to_owned();
+        let (events, cancel, session) = crate::login::login_channel();
+        if let Some(url) = started["authUrl"].as_str() {
+            let _ = events
+                .send(crate::login::LoginEvent::OpenUrl {
+                    url: url.to_owned(),
+                    code: None,
+                })
+                .await;
+        }
+        tokio::spawn(drive_login(
+            child,
+            wire,
+            login_id,
+            installation.clone(),
+            events,
+            cancel,
+        ));
+        Ok(session)
+    }
+}
+
+/// Waits for `account/login/completed` (or a cancel, which aborts the flow
+/// in-protocol), then reports the re-read account as `Finished`.
+async fn drive_login(
+    mut child: process::Child,
+    mut wire: Wire,
+    login_id: String,
+    installation: crate::agent::AgentInstallation,
+    events: mpsc::Sender<crate::login::LoginEvent>,
+    cancel: std::sync::Arc<tokio::sync::Notify>,
+) {
+    let mut wire_alive = true;
+    loop {
+        tokio::select! {
+            frame = wire.frames.recv() => match frame {
+                Some(frame) if frame["method"] == "account/login/completed" => break,
+                Some(_) => continue,
+                None => { wire_alive = false; break; }
+            },
+            _ = cancel.notified() => {
+                let abort = wire.roundtrip("account/login/cancel", json!({ "loginId": login_id }));
+                let _ = tokio::time::timeout(CLOSE_GRACE, abort).await;
+                break;
+            }
+        }
+    }
+    // Truth check on the same wire; a dead server leaves the status Unknown.
+    let status = match wire_alive {
+        true => match tokio::time::timeout(CLOSE_GRACE, wire.roundtrip("account/read", json!({})))
+            .await
+        {
+            Ok(Ok(account)) => account_status(&account, &installation),
+            _ => AuthStatus::Unknown,
+        },
+        false => AuthStatus::Unknown,
+    };
+    child.shutdown(CLOSE_GRACE).await;
+    let _ = events
+        .send(crate::login::LoginEvent::Finished { status })
+        .await;
 }
 
 fn client_info() -> Value {
@@ -290,7 +386,7 @@ async fn open_thread(
 
 /// Login state from `account/read`, offline and instant. `OPENAI_API_KEY` is
 /// ignored by app-server 0.147.0 (probed), so the environment is not consulted.
-fn account_status(account: &Value, request: &ConnectRequest) -> AuthStatus {
+fn account_status(account: &Value, installation: &crate::agent::AgentInstallation) -> AuthStatus {
     match account["account"]["type"].as_str() {
         Some("chatgpt") => AuthStatus::Authenticated {
             kind: AuthKind::Subscription,
@@ -308,7 +404,7 @@ fn account_status(account: &Value, request: &ConnectRequest) -> AuthStatus {
             account: None,
         },
         None => AuthStatus::Unauthenticated {
-            login: login_methods(&request.installation),
+            login: login_methods(installation),
         },
     }
 }
@@ -328,7 +424,7 @@ fn driver_info(
         .and_then(|ua| ua.split('/').nth(1))
         .and_then(|rest| rest.split(' ').next())
         .map(str::to_owned);
-    let auth = account_status(account, request);
+    let auth = account_status(account, &request.installation);
     // Configured model/effort win: they ride every `turn/start`, while the
     // thread bind reports only the config-file default. The bind and the
     // catalog fill in where nothing was configured.

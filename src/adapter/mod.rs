@@ -223,6 +223,52 @@ pub(crate) fn login_methods(installation: &AgentInstallation) -> Vec<crate::agen
         .unwrap_or_default()
 }
 
+/// Validates the caller's login method choice: `None` means the agent's
+/// drivable (terminal) method; `EnvVar` and unknown methods are typed errors.
+pub(crate) fn check_login_method(
+    installation: &AgentInstallation,
+    method: Option<&crate::agent::LoginMethod>,
+) -> Result<(), AgentError> {
+    use crate::agent::LoginMethod;
+    let advertised = login_methods(installation);
+    match method {
+        None if advertised
+            .iter()
+            .any(|m| matches!(m, LoginMethod::Terminal { .. })) =>
+        {
+            Ok(())
+        }
+        None => Err(login_unsupported(installation)),
+        Some(LoginMethod::EnvVar { name }) => Err(AgentError::UnsupportedFeature(format!(
+            "an API-key login has nothing to drive: set {name} and reopen"
+        ))),
+        Some(m) if advertised.contains(m) => Ok(()),
+        Some(_) => Err(AgentError::InvalidRequest(format!(
+            "unknown login method for {}",
+            installation.id
+        ))),
+    }
+}
+
+/// The typed refusal for agents whose flow anyagent cannot drive, naming
+/// what the application should do instead.
+pub(crate) fn login_unsupported(installation: &AgentInstallation) -> AgentError {
+    use crate::agent::LoginMethod;
+    let hint = login_methods(installation)
+        .into_iter()
+        .next()
+        .map(|m| match m {
+            LoginMethod::Terminal { command, .. } => {
+                format!("run `{}` in a terminal", command.join(" "))
+            }
+            LoginMethod::EnvVar { name } => format!("set {name} and reopen"),
+        });
+    AgentError::UnsupportedFeature(match hint {
+        Some(hint) => format!("a driven login for {}; {hint}", installation.id),
+        None => format!("login for {} (no known method)", installation.id),
+    })
+}
+
 /// Adds the child's stderr to a handshake failure (a logged-out CLI prints
 /// its complaint there and closes the wire).
 pub(crate) fn with_stderr(error: AgentError, child: &crate::process::Child) -> AgentError {
@@ -272,5 +318,16 @@ pub(crate) trait Adapter: Send + Sync {
     ) -> Result<crate::event::PlanUsage, AgentError> {
         let _ = installation;
         Err(AgentError::UnsupportedFeature("plan usage".into()))
+    }
+
+    /// Drives the agent's own login flow from a short-lived process.
+    /// Default: not drivable; the error names the manual command instead.
+    async fn login(
+        &self,
+        installation: &AgentInstallation,
+        method: Option<&crate::agent::LoginMethod>,
+    ) -> Result<crate::login::LoginSession, AgentError> {
+        let _ = method;
+        Err(login_unsupported(installation))
     }
 }

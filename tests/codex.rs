@@ -632,3 +632,80 @@ async fn a_dead_agent_surfaces_the_exit_and_stderr() {
     }
     drop(session);
 }
+
+/// A `codex` stand-in for login flows: the wrapper exports a private
+/// CODEX_HOME so the fixture's auth.json is per-test.
+fn login_wrapper(name: &str, flags: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex/fixture.mjs");
+    let dir = std::env::temp_dir().join(format!("anyagent-codex-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("codex");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nCODEX_HOME={} exec node {} {flags} \"$@\"\n",
+            dir.display(),
+            fixture.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// Drains a login stream: returns the last URL and the final status.
+async fn drain_login(login: &mut anyagent::LoginSession) -> (Option<String>, Option<AuthStatus>) {
+    let (mut url, mut status) = (None, None);
+    let drain = async {
+        while let Some(event) = login.events.next().await {
+            match event {
+                anyagent::LoginEvent::OpenUrl { url: u, .. } => url = Some(u),
+                anyagent::LoginEvent::Finished { status: s } => status = Some(s),
+                _ => {}
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), drain)
+        .await
+        .expect("login stream did not finish");
+    (url, status)
+}
+
+#[tokio::test]
+async fn login_runs_in_protocol_and_reports_the_new_account() {
+    let runtime = Runtime::new();
+    let agent = AgentInstallation::at("codex", login_wrapper("login-ok", "--auth-file"));
+    let mut login = runtime.login(&agent, None).await.unwrap();
+    let (url, status) = drain_login(&mut login).await;
+    assert_eq!(url.as_deref(), Some("https://auth.example.com/oauth?login"));
+    // `Finished` is the re-read `account/read` after the completion
+    // notification, not an assumption.
+    match status.expect("no Finished event") {
+        AuthStatus::Authenticated {
+            kind: AuthKind::Subscription,
+            account,
+        } => assert_eq!(account.unwrap().plan.as_deref(), Some("edu")),
+        other => panic!("expected a chatgpt login, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn login_cancel_aborts_in_protocol_and_still_finishes() {
+    let runtime = Runtime::new();
+    let agent = AgentInstallation::at(
+        "codex",
+        login_wrapper("login-cancel", "--auth-file --login-slow"),
+    );
+    let mut login = runtime.login(&agent, None).await.unwrap();
+    // The URL arrives with the session (login/start already answered);
+    // cancel sends `account/login/cancel` before the fixture ever completes.
+    login.cancel.cancel();
+    let (url, status) = drain_login(&mut login).await;
+    assert!(url.is_some(), "no OpenUrl before cancel");
+    match status.expect("no Finished event") {
+        AuthStatus::Unauthenticated { .. } => {}
+        other => panic!("expected unauthenticated after cancel, got {other:?}"),
+    }
+}
