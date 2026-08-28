@@ -23,6 +23,7 @@ use crate::event::{
 pub(crate) mod acp;
 pub(crate) mod attach;
 pub(crate) mod claude;
+pub(crate) mod codex;
 #[cfg(test)]
 mod conformance;
 #[cfg(test)]
@@ -210,6 +211,40 @@ async fn warn(events: &mpsc::Sender<DriverEvent>, message: String) {
             message,
         })))
         .await;
+}
+
+/// Runnable login methods from the catalog, for a logged-out handshake and
+/// for mid-session auth loss.
+pub(crate) fn login_methods(installation: &AgentInstallation) -> Vec<crate::agent::LoginMethod> {
+    crate::catalog::PROFILES
+        .iter()
+        .find(|p| p.id == installation.id.as_str())
+        .map(|p| crate::discovery::login_methods(p, &installation.executable_path))
+        .unwrap_or_default()
+}
+
+/// Adds the child's stderr to a handshake failure (a logged-out CLI prints
+/// its complaint there and closes the wire).
+pub(crate) fn with_stderr(error: AgentError, child: &crate::process::Child) -> AgentError {
+    let stderr = child.stderr_tail();
+    match (error, stderr.is_empty()) {
+        (AgentError::ProtocolFailed(message), false) => {
+            AgentError::ProtocolFailed(format!("{message}: {stderr}"))
+        }
+        (error, _) => error,
+    }
+}
+
+/// Truncates to `at` bytes on a char boundary; tool output stays bounded.
+pub(crate) fn cap(mut s: String, at: usize) -> String {
+    if s.len() > at {
+        let mut end = at;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+    s
 }
 
 #[derive(Clone)]

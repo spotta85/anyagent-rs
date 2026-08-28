@@ -27,7 +27,7 @@ use anyagent::{
 };
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(120);
-const OPENCODE_MODEL: &str = "openrouter/meta/muse-spark-1.2-contributor";
+const OPENCODE_MODEL: &str = "openrouter/meta/muse-spark-1.2";
 const COUNT: &str = "Count from 1 to 400, one number per line. No other text. No tools.";
 
 // -- gate -------------------------------------------------------------------
@@ -52,7 +52,7 @@ fn enabled() -> Vec<&'static str> {
         println!("SKIP all: ANYAGENT_LIVE is not set");
         return Vec::new();
     };
-    ["claude", "opencode", "hermes", "kiro"]
+    ["claude", "codex", "opencode", "hermes", "kiro"]
         .into_iter()
         .filter(|h| list == "all" || list.split(',').any(|p| p.trim() == *h))
         .filter(|h| {
@@ -132,6 +132,11 @@ async fn open_reports_token_capabilities_and_options() {
         }
         if h == "opencode" {
             assert!(has_option("model"), "opencode: no `model` config option");
+        }
+        if h == "codex" {
+            assert!(caps.supports(Capability::Steer), "codex: missing Steer");
+            assert!(has_option("model"), "codex: no `model` config option");
+            assert!(has_option("sandbox"), "codex: no `sandbox` option");
         }
         session.close().await.unwrap();
         pass(h, "open info complete");
@@ -377,20 +382,25 @@ async fn permissions_gate_the_write_and_deny_holds() {
 #[ignore = "live: talks to real agents"]
 async fn a_question_round_trips() {
     for h in enabled() {
-        if h != "claude" {
+        // codex runs as a probe: `item/tool/requestUserInput` is
+        // schema-confirmed but has never fired live (ticket 10) — the
+        // translation is exercised if it ever does, without failing the run.
+        if h != "claude" && h != "codex" {
             println!("SKIP {h}: questions (claude only)");
             continue;
         }
         let (session, mut events, _dir) = open(h).await;
         session
-            .prompt("Ask me whether I prefer red or blue using your question tool, then answer with just my choice.")
+            .prompt("Ask me whether I prefer red or blue using your question tool (claude: AskUserQuestion; codex: request_user_input), then answer with just my choice.")
             .await
             .unwrap();
         let mut text = String::new();
+        let mut asked = false;
         loop {
-            let event = next(&mut events, "claude: question").await;
+            let event = next(&mut events, &format!("{h}: question")).await;
             match event.kind {
                 EventKind::RequestOpened(Request::Question(request)) => {
+                    asked = true;
                     let question = &request.questions[0];
                     assert!(question.choices.len() >= 2, "fewer than 2 choices");
                     let red = question
@@ -415,6 +425,12 @@ async fn a_question_round_trips() {
                 }
                 _ => {}
             }
+        }
+        if !asked {
+            assert_eq!(h, "codex", "{h}: no question request opened");
+            println!("SKIP codex: requestUserInput did not fire (unverified live, ticket 10)");
+            session.close().await.unwrap();
+            continue;
         }
         assert!(text.to_lowercase().contains("red"), "answer was {text:?}");
         session.close().await.unwrap();
@@ -467,8 +483,22 @@ async fn the_queue_is_fifo_and_ids_stay_aligned() {
     for h in enabled() {
         let (session, mut events, _dir) = open(h).await;
         session.prompt(COUNT).await.unwrap();
-        let kiwi = session.prompt("Say only KIWI. No tools.").await.unwrap();
-        let lemon = session.prompt("Say only LEMON. No tools.").await.unwrap();
+        // On a steering harness (codex) a lone mid-turn prompt folds into
+        // the running turn; occupy the steer slot first so KIWI and LEMON
+        // genuinely queue.
+        let (kiwi, lemon) = if steers(&session) {
+            let (_, kiwi, lemon) = tokio::join!(
+                session.prompt("Keep counting."),
+                session.prompt("Say only KIWI. No tools."),
+                session.prompt("Say only LEMON. No tools.")
+            );
+            (kiwi.unwrap(), lemon.unwrap())
+        } else {
+            (
+                session.prompt("Say only KIWI. No tools.").await.unwrap(),
+                session.prompt("Say only LEMON. No tools.").await.unwrap(),
+            )
+        };
         assert_eq!(kiwi.kind, DeliveryKind::Queued { position: 0 }, "{h}");
         assert_eq!(lemon.kind, DeliveryKind::Queued { position: 1 }, "{h}");
 
@@ -507,9 +537,11 @@ async fn cancel_ends_the_turn_in_every_queue_shape() {
         let reps = if h == "claude" { 3 } else { 1 };
         let (session, mut events, _dir) = open(h).await;
 
-        // Empty queue: cancel ends the turn and the session survives.
+        // Empty queue: cancel ends the turn and the session survives. Cancel
+        // once the turn visibly streams — a fixed sleep let fast models
+        // (kiro) finish COUNT before the cancel landed.
         session.prompt(COUNT).await.unwrap();
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        wait_for_content(&mut events, &format!("{h}: count streaming")).await;
         session.cancel(false).await.unwrap();
         expect_cancelled(&mut events, &format!("{h}: empty-queue cancel")).await;
         session.prompt("Say only OK. No tools.").await.unwrap();
@@ -520,9 +552,11 @@ async fn cancel_ends_the_turn_in_every_queue_shape() {
             session.prompt(COUNT).await.unwrap();
             // Queue immediately: a fast model can finish COUNT inside a fixed
             // sleep (kiro did), which would make this `Started`, not `Queued`.
-            let queued = session.prompt("Say only PEAR. No tools.").await.unwrap();
+            // On a steering harness the follow-up would fold instead, so the
+            // steer slot is occupied first.
+            let queued = queue_one(&session, "Say only PEAR. No tools.").await;
             assert_eq!(queued.kind, DeliveryKind::Queued { position: 0 }, "{h}");
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            wait_for_content(&mut events, &format!("{h}: count streaming rep {rep}")).await;
             session.cancel(false).await.unwrap();
             expect_cancelled(&mut events, &format!("{h}: queued cancel rep {rep}")).await;
             let mut text = drain_to_turn_end(
@@ -545,8 +579,8 @@ async fn cancel_ends_the_turn_in_every_queue_shape() {
 
         // (b) cancel(true): the queued prompt must never run.
         session.prompt(COUNT).await.unwrap();
-        session.prompt("Say only PLUM. No tools.").await.unwrap();
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        queue_one(&session, "Say only PLUM. No tools.").await;
+        wait_for_content(&mut events, &format!("{h}: count streaming (b)")).await;
         session.cancel(true).await.unwrap();
         expect_cancelled(&mut events, &format!("{h}: clear-queue cancel")).await;
         quiet(&mut events, 5, &format!("{h}: after clear-queue cancel")).await;
@@ -638,17 +672,33 @@ async fn plan_usage_arrives_after_a_turn() {
             continue;
         }
         session.prompt("Say OK. No tools.").await.unwrap();
-        drain_to_turn_end(&session, &mut events, &format!("{h}: usage turn")).await;
-        // The adapter refreshes quota right after the turn.
+        // codex pushes quota during the turn (after every model call);
+        // claude refreshes right after it. Collect through turn end, then
+        // give a post-turn push 10 more seconds.
+        let mut pushed = None;
+        loop {
+            let event = next(&mut events, &format!("{h}: usage turn")).await;
+            match event.kind {
+                EventKind::PlanUsageUpdated(usage) => pushed = Some(usage),
+                EventKind::RequestOpened(request) => {
+                    session.answer(request.id(), allow()).await.unwrap();
+                }
+                EventKind::TurnEnded { .. } => break,
+                _ => {}
+            }
+        }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let usage = loop {
+            if let Some(usage) = pushed {
+                break usage;
+            }
             let event = tokio::time::timeout_at(deadline, events.next())
                 .await
                 .unwrap_or_else(|_| panic!("{h}: no PlanUsageUpdated within 10s of turn end"))
                 .expect("stream ended")
                 .unwrap();
             if let EventKind::PlanUsageUpdated(usage) = event.kind {
-                break usage;
+                pushed = Some(usage);
             }
         };
         assert!(!usage.windows.is_empty(), "{h}: quota with no windows");
@@ -791,7 +841,7 @@ async fn fork_from_branches_at_a_point_and_at_the_tip() {
             continue;
         }
         // Two codeword turns; keep each turn's last fork anchor
-        // (`claude/fork_point` on MessageEnded).
+        // (`<agent>/fork_point` on MessageEnded).
         let mut anchors = Vec::new();
         for codeword in ["ALPHA9", "ZULU7"] {
             session
@@ -805,7 +855,7 @@ async fn fork_from_branches_at_a_point_and_at_the_tip() {
                 let event = next(&mut events, &format!("{h}: codeword turn")).await;
                 match event.kind {
                     EventKind::MessageEnded { .. } => {
-                        if let Some(point) = event.extensions.get("claude/fork_point") {
+                        if let Some(point) = event.extensions.get(&format!("{h}/fork_point")) {
                             anchor = point.as_str().map(str::to_owned);
                         }
                     }
@@ -1015,6 +1065,13 @@ async fn open(harness: &str) -> (Session, Events, tempfile::TempDir) {
     if harness == "opencode" {
         options = options.configure("model", OPENCODE_MODEL);
     }
+    if harness == "codex" {
+        // Deterministic approvals regardless of the host config: a write
+        // escalates past the read-only sandbox and asks.
+        options = options
+            .configure("sandbox", "read-only")
+            .configure("mode", "on-request");
+    }
     let (session, events) = runtime
         .open(agent, options)
         .await
@@ -1043,6 +1100,20 @@ async fn drain_to_turn_end(session: &Session, events: &mut Events, step: &str) -
                 session.answer(request.id(), allow()).await.unwrap();
             }
             EventKind::TurnEnded { .. } => return text,
+            _ => {}
+        }
+    }
+}
+
+/// Waits until the turn is visibly streaming (first in-turn content), so a
+/// cancel lands mid-turn instead of racing turn start or turn end.
+async fn wait_for_content(events: &mut Events, step: &str) {
+    loop {
+        match next(events, step).await.kind {
+            EventKind::TextDelta { .. }
+            | EventKind::ReasoningDelta { .. }
+            | EventKind::ToolUpdated(_) => return,
+            EventKind::TurnEnded { .. } => panic!("turn ended before it streamed at {step}"),
             _ => {}
         }
     }
@@ -1090,6 +1161,7 @@ fn kill_child(harness: &str, session: &Session) {
         // the turn complete. Anchored so the user's Kiro apps' own
         // `kiro-cli acp --agent <name>` processes never match.
         "kiro" => (&[], "kiro-cli(-chat)? acp$".to_owned()),
+        "codex" => (&["-n"], "codex app-server".to_owned()),
         _ => (&["-n"], "opencode acp".to_owned()),
     };
     let out = std::process::Command::new("pgrep")
@@ -1119,6 +1191,26 @@ fn kill_child(harness: &str, session: &Session) {
 
 fn allow() -> Answer {
     Answer::Permission(PermissionChoice::AllowOnce)
+}
+
+fn steers(session: &Session) -> bool {
+    session
+        .info()
+        .details
+        .capabilities
+        .supports(Capability::Steer)
+}
+
+/// Gets `prompt` into the queue mid-turn: on a steering harness a lone
+/// prompt would fold into the running turn, so a throwaway steer occupies
+/// the slot first (both commands land before either resolves).
+async fn queue_one(session: &Session, prompt: &str) -> anyagent::Delivery {
+    if steers(session) {
+        let (_, queued) = tokio::join!(session.prompt("Keep going."), session.prompt(prompt));
+        queued.unwrap()
+    } else {
+        session.prompt(prompt).await.unwrap()
+    }
 }
 
 fn pass(harness: &str, what: &str) {
@@ -1159,8 +1251,8 @@ fn claude_transcripts() -> std::collections::BTreeSet<std::path::PathBuf> {
 #[ignore = "live: talks to real agents"]
 async fn config_home_isolates_login() {
     for h in enabled() {
-        if h != "claude" {
-            println!("SKIP {h}: config-home isolation asserted on claude");
+        if h != "claude" && h != "codex" {
+            println!("SKIP {h}: config-home isolation asserted on claude and codex");
             continue;
         }
         let runtime = Runtime::new();

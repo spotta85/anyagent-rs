@@ -49,8 +49,11 @@ impl Runtime {
                 Connection::Native(NativeKind::Claude) => {
                     Arc::new(crate::adapter::claude::ClaudeAdapter::new())
                 }
-                // Codex (P3) and Antigravity (adapter pending) have no driver yet.
-                Connection::Native(NativeKind::Codex | NativeKind::Antigravity) => continue,
+                Connection::Native(NativeKind::Codex) => {
+                    Arc::new(crate::adapter::codex::CodexAdapter::new())
+                }
+                // Antigravity's wire is unvalidated (ticket 05); no driver yet.
+                Connection::Native(NativeKind::Antigravity) => continue,
             };
             adapters.insert(AgentId::new(profile.id), adapter);
         }

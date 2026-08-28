@@ -11,13 +11,13 @@ use tokio::sync::mpsc;
 
 use crate::adapter::{
     Adapter, ConnectRequest, DriverCommand, DriverConnection, DriverEvent, DriverInfo,
-    WireRecorder, attach,
+    WireRecorder, attach, cap, login_methods, with_stderr,
 };
 use crate::agent::{
     AccountInfo, AgentDetails, AuthKind, AuthStatus, Capabilities, Capability, ConfigChoice,
-    ConfigId, ConfigKind, ConfigOption, ConfigSelection, ConfigValue, Input, LoginMethod,
-    McpConnection, McpServer, McpTransport, ResumeToken, RollbackScope, SessionConfiguration,
-    SessionStart, SlashCommand,
+    ConfigId, ConfigKind, ConfigOption, ConfigSelection, ConfigValue, Input, McpConnection,
+    McpServer, McpTransport, ResumeToken, RollbackScope, SessionConfiguration, SessionStart,
+    SlashCommand,
 };
 use crate::error::AgentError;
 use crate::event::{
@@ -238,28 +238,6 @@ fn option_args(options: &crate::agent::SessionOptions) -> Result<Vec<String>, Ag
         }
     }
     Ok(args)
-}
-
-/// Runnable login methods from the catalog, for a logged-out handshake
-/// and for mid-session auth loss.
-fn login_methods(installation: &crate::agent::AgentInstallation) -> Vec<LoginMethod> {
-    crate::catalog::PROFILES
-        .iter()
-        .find(|p| p.id == installation.id.as_str())
-        .map(|p| crate::discovery::login_methods(p, &installation.executable_path))
-        .unwrap_or_default()
-}
-
-/// Adds the child's stderr to a handshake failure (a logged-out CLI prints
-/// its complaint there and closes the wire).
-fn with_stderr(error: AgentError, child: &process::Child) -> AgentError {
-    let stderr = child.stderr_tail();
-    match (error, stderr.is_empty()) {
-        (AgentError::ProtocolFailed(message), false) => {
-            AgentError::ProtocolFailed(format!("{message}: {stderr}"))
-        }
-        (error, _) => error,
-    }
 }
 
 /// A creation-time `configure` value by id, when it was given as text.
@@ -1395,17 +1373,6 @@ fn file_diff(path: &str, typed: &Value) -> Option<FileDiff> {
         old_text: typed["originalFile"].as_str().map(str::to_owned),
         new_text: content.to_owned(),
     })
-}
-
-fn cap(mut s: String, at: usize) -> String {
-    if s.len() > at {
-        let mut end = at;
-        while !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        s.truncate(end);
-    }
-    s
 }
 
 fn plan_entries(todos: &Value) -> Vec<PlanEntry> {

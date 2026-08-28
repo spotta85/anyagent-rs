@@ -80,10 +80,9 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         config_dir: ".codex",
         config_home_env: Some("CODEX_HOME"),
         connection: Connection::Native(NativeKind::Codex),
-        auth_markers: &[
-            AuthMarker::ConfigFile("auth.json", AuthKind::Subscription),
-            AuthMarker::ApiKeyEnv("OPENAI_API_KEY"),
-        ],
+        // No env marker: app-server 0.147.0 ignores `OPENAI_API_KEY` entirely
+        // (probed 2026-08-27, ticket 10) — auth comes only from auth.json.
+        auth_markers: &[AuthMarker::ConfigFile("auth.json", AuthKind::Subscription)],
         login_args: &["login"],
         install_hint: "npm install -g @openai/codex",
         extra_paths: &[],

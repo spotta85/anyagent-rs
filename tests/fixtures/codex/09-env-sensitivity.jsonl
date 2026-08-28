@@ -1,0 +1,50 @@
+{"_meta": {"cmd": ["codex", "app-server"], "env_extra": {"CODEX_HOME": "/tmp/probe/home"}, "cwd": "/tmp/probe/cwd"}, "_t": 0.0}
+{"_note": {"case": "baseline (CODEX_HOME=home, chatgpt auth)", "env_extra": {"CODEX_HOME": "/tmp/probe/home"}}, "_t": 0.0}
+{"_sent": {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"clientInfo": {"name": "anyagent-probe", "version": "0.0.1"}}}, "_t": 0.0}
+{"id": 1, "result": {"userAgent": "anyagent-probe/0.147.0 (Mac OS 26.5.1; arm64) unknown (anyagent-probe; 0.0.1)", "codexHome": "/tmp/probe/home", "platformFamily": "unix", "platformOs": "macos"}, "_t": 0.023}
+{"method": "remoteControl/status/changed", "params": {"status": "disabled", "serverName": "Siddharths-MacBook-Pro.local", "installationId": "REDACTED", "environmentId": null}, "emittedAtMs": 1787886980090, "_t": 0.023}
+{"_sent": {"jsonrpc": "2.0", "method": "initialized", "params": {}}, "_t": 0.023}
+{"_sent": {"jsonrpc": "2.0", "id": 2, "method": "account/read", "params": {}}, "_t": 0.024}
+{"id": 2, "result": {"account": {"type": "chatgpt", "email": "user@example.com", "planType": "edu"}, "requiresOpenaiAuth": true}, "_t": 0.025}
+{"_note": {"case_result": "baseline (CODEX_HOME=home, chatgpt auth)", "codexHome": "/tmp/probe/home", "account": {"account": {"type": "chatgpt", "email": "user@example.com", "planType": "edu"}, "requiresOpenaiAuth": true}}, "_t": 0.025}
+{"_note": {"exit": 0}, "_t": 0.041}
+{"_meta": {"cmd": ["codex", "app-server"], "env_extra": {"CODEX_HOME": "/tmp/probe/home", "OPENAI_API_KEY": "sk-bogus-anyagent-probe"}, "cwd": "/tmp/probe/cwd"}, "_t": 0.0}
+{"_note": {"case": "OPENAI_API_KEY + chatgpt auth", "env_extra": {"CODEX_HOME": "/tmp/probe/home", "OPENAI_API_KEY": "sk-bogus-anyagent-probe"}}, "_t": 0.0}
+{"_sent": {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"clientInfo": {"name": "anyagent-probe", "version": "0.0.1"}}}, "_t": 0.0}
+{"id": 1, "result": {"userAgent": "anyagent-probe/0.147.0 (Mac OS 26.5.1; arm64) unknown (anyagent-probe; 0.0.1)", "codexHome": "/tmp/probe/home", "platformFamily": "unix", "platformOs": "macos"}, "_t": 0.017}
+{"method": "remoteControl/status/changed", "params": {"status": "disabled", "serverName": "Siddharths-MacBook-Pro.local", "installationId": "REDACTED", "environmentId": null}, "emittedAtMs": 1787886980127, "_t": 0.017}
+{"_sent": {"jsonrpc": "2.0", "method": "initialized", "params": {}}, "_t": 0.017}
+{"_sent": {"jsonrpc": "2.0", "id": 2, "method": "account/read", "params": {}}, "_t": 0.017}
+{"id": 2, "result": {"account": {"type": "chatgpt", "email": "user@example.com", "planType": "edu"}, "requiresOpenaiAuth": true}, "_t": 0.018}
+{"_note": {"case_result": "OPENAI_API_KEY + chatgpt auth", "codexHome": "/tmp/probe/home", "account": {"account": {"type": "chatgpt", "email": "user@example.com", "planType": "edu"}, "requiresOpenaiAuth": true}}, "_t": 0.019}
+{"_note": {"exit": 0}, "_t": 0.034}
+{"_meta": {"cmd": ["codex", "app-server"], "env_extra": {"CODEX_HOME": "/tmp/probe/home-envkey", "OPENAI_API_KEY": "sk-bogus-anyagent-probe"}, "cwd": "/tmp/probe/cwd"}, "_t": 0.0}
+{"_note": {"case": "OPENAI_API_KEY, no auth.json", "env_extra": {"CODEX_HOME": "/tmp/probe/home-envkey", "OPENAI_API_KEY": "sk-bogus-anyagent-probe"}}, "_t": 0.0}
+{"_sent": {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"clientInfo": {"name": "anyagent-probe", "version": "0.0.1"}}}, "_t": 0.0}
+{"id": 1, "result": {"userAgent": "anyagent-probe/0.147.0 (Mac OS 26.5.1; arm64) unknown (anyagent-probe; 0.0.1)", "codexHome": "/tmp/probe/home-envkey", "platformFamily": "unix", "platformOs": "macos"}, "_t": 0.04}
+{"method": "remoteControl/status/changed", "params": {"status": "disabled", "serverName": "Siddharths-MacBook-Pro.local", "installationId": "REDACTED", "environmentId": null}, "emittedAtMs": 1787886980187, "_t": 0.04}
+{"_sent": {"jsonrpc": "2.0", "method": "initialized", "params": {}}, "_t": 0.04}
+{"_sent": {"jsonrpc": "2.0", "id": 2, "method": "account/read", "params": {}}, "_t": 0.04}
+{"id": 2, "result": {"account": null, "requiresOpenaiAuth": true}, "_t": 0.042}
+{"_note": {"case_result": "OPENAI_API_KEY, no auth.json", "codexHome": "/tmp/probe/home-envkey", "account": {"account": null, "requiresOpenaiAuth": true}}, "_t": 0.042}
+{"_note": {"exit": 0}, "_t": 0.044}
+{"_meta": {"cmd": ["codex", "app-server"], "env_extra": {"CODEX_HOME": "/tmp/probe/home", "OPENAI_BASE_URL": "http://127.0.0.1:9/v1"}, "cwd": "/tmp/probe/cwd"}, "_t": 0.0}
+{"_note": {"case": "OPENAI_BASE_URL override", "env_extra": {"CODEX_HOME": "/tmp/probe/home", "OPENAI_BASE_URL": "http://127.0.0.1:9/v1"}}, "_t": 0.0}
+{"_sent": {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"clientInfo": {"name": "anyagent-probe", "version": "0.0.1"}}}, "_t": 0.0}
+{"id": 1, "result": {"userAgent": "anyagent-probe/0.147.0 (Mac OS 26.5.1; arm64) unknown (anyagent-probe; 0.0.1)", "codexHome": "/tmp/probe/home", "platformFamily": "unix", "platformOs": "macos"}, "_t": 0.017}
+{"method": "remoteControl/status/changed", "params": {"status": "disabled", "serverName": "Siddharths-MacBook-Pro.local", "installationId": "REDACTED", "environmentId": null}, "emittedAtMs": 1787886980211, "_t": 0.018}
+{"_sent": {"jsonrpc": "2.0", "method": "initialized", "params": {}}, "_t": 0.018}
+{"_sent": {"jsonrpc": "2.0", "id": 2, "method": "account/read", "params": {}}, "_t": 0.018}
+{"id": 2, "result": {"account": {"type": "chatgpt", "email": "user@example.com", "planType": "edu"}, "requiresOpenaiAuth": true}, "_t": 0.02}
+{"_note": {"case_result": "OPENAI_BASE_URL override", "codexHome": "/tmp/probe/home", "account": {"account": {"type": "chatgpt", "email": "user@example.com", "planType": "edu"}, "requiresOpenaiAuth": true}}, "_t": 0.02}
+{"_note": {"exit": 0}, "_t": 0.033}
+{"_meta": {"cmd": ["codex", "app-server"], "env_extra": {}, "cwd": "/tmp/probe/cwd"}, "_t": 0.0}
+{"_note": {"case": "no CODEX_HOME (real ~/.codex)", "env_extra": {}}, "_t": 0.0}
+{"_sent": {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"clientInfo": {"name": "anyagent-probe", "version": "0.0.1"}}}, "_t": 0.0}
+{"id": 1, "result": {"userAgent": "anyagent-probe/0.147.0 (Mac OS 26.5.1; arm64) unknown (anyagent-probe; 0.0.1)", "codexHome": "/Users/USER/.codex", "platformFamily": "unix", "platformOs": "macos"}, "_t": 0.047}
+{"method": "remoteControl/status/changed", "params": {"status": "disabled", "serverName": "Siddharths-MacBook-Pro.local", "installationId": "REDACTED", "environmentId": null}, "emittedAtMs": 1787886980275, "_t": 0.048}
+{"_sent": {"jsonrpc": "2.0", "method": "initialized", "params": {}}, "_t": 0.048}
+{"_sent": {"jsonrpc": "2.0", "id": 2, "method": "account/read", "params": {}}, "_t": 0.048}
+{"id": 2, "result": {"account": {"type": "chatgpt", "email": "user@example.com", "planType": "edu"}, "requiresOpenaiAuth": true}, "_t": 0.05}
+{"_note": {"case_result": "no CODEX_HOME (real ~/.codex)", "codexHome": "/Users/USER/.codex", "account": {"account": {"type": "chatgpt", "email": "user@example.com", "planType": "edu"}, "requiresOpenaiAuth": true}}, "_t": 0.05}
+{"_note": {"exit": 0}, "_t": 0.063}
