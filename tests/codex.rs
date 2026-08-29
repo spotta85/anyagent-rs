@@ -12,8 +12,8 @@ use futures::StreamExt;
 use anyagent::{
     AgentError, AgentInstallation, Answer, AuthKind, AuthStatus, Capability, ConfigKind,
     ConfigValue, DeliveryKind, Event, EventKind, Events, Input, McpServer, PermissionChoice,
-    PlanStatus, QuestionAnswer, Request, Runtime, Session, SessionOptions, StopReason, ToolKind,
-    ToolStatus,
+    PlanStatus, QuestionAnswer, Request, Runtime, Session, SessionOptions, StopReason, ToolInput,
+    ToolKind, ToolStatus,
 };
 
 /// A `codex` stand-in: a script that execs the fixture with scenario flags,
@@ -90,7 +90,12 @@ fn text_option(session: &anyagent::SessionInfo, id: &str) -> Option<String> {
 
 #[tokio::test]
 async fn handshake_reports_auth_version_options_and_token() {
-    let (session, _events) = open("handshake", "").await;
+    let (session, mut events) = open("handshake", "").await;
+    // Skills arrive after open as a `SessionUpdated` (the fetch is async so
+    // opens stay fast); wait for the list before reading the snapshot.
+    while session.info().details.commands.is_empty() {
+        next(&mut events).await;
+    }
     let info = session.info();
     assert_eq!(info.details.version.as_deref(), Some("0.147.0"));
     let AuthStatus::Authenticated { kind, account } = &info.details.auth else {
@@ -137,6 +142,131 @@ async fn handshake_reports_auth_version_options_and_token() {
     assert_eq!(text_option(&info, "effort").as_deref(), Some("medium"));
     assert_eq!(text_option(&info, "mode").as_deref(), Some("on-request"));
     assert_eq!(text_option(&info, "sandbox").as_deref(), Some("read-only"));
+
+    // Skills are the slash commands: deduped across roots, junk dropped, and
+    // the picker-sized `interface.shortDescription` preferred.
+    let commands: Vec<_> = info
+        .details
+        .commands
+        .iter()
+        .map(|c| (c.name.as_str(), c.description.as_str()))
+        .collect();
+    assert_eq!(
+        commands,
+        vec![("review", "Review a diff."), ("release", "Cut a release.")]
+    );
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn probe_reads_commands_without_waiting_them_out() {
+    let runtime = Runtime::new();
+    let agent = AgentInstallation::at("codex", wrapper("probe", ""));
+    let started = std::time::Instant::now();
+    let details = runtime.probe(&agent).await.unwrap();
+    assert!(!details.commands.is_empty());
+    // An empty command list would cost the probe its full 2 s wait.
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// A subagent's child thread runs a whole turn inside the parent's: its
+/// content must ride the subagent tool and its bookkeeping must not touch the
+/// parent turn.
+#[tokio::test]
+async fn a_subagent_child_thread_never_settles_the_parent_turn() {
+    let (session, mut events) = open("subagent", "").await;
+    session.prompt("subagent please").await.unwrap();
+
+    let mut turns_started = 0;
+    let mut turns_ended = 0;
+    let mut child_text = Vec::new();
+    let mut subagents = Vec::new();
+    let mut usage = Vec::new();
+    let mut plans = Vec::new();
+    let mut diagnostics = Vec::new();
+    loop {
+        let event = next(&mut events).await;
+        let parent = event
+            .turn_info
+            .as_ref()
+            .and_then(|t| t.parent_tool_id.clone());
+        match event.kind {
+            EventKind::TurnStarted { .. } => turns_started += 1,
+            EventKind::TextDelta { text, .. } if parent.is_some() => {
+                child_text.push((text, parent.unwrap()));
+            }
+            EventKind::ToolUpdated(tool) if tool.kind == ToolKind::Subagent => {
+                subagents.push(tool);
+            }
+            EventKind::ContextUsage { used_tokens, .. } => usage.push(used_tokens),
+            EventKind::PlanUpdated { entries } => plans.push(entries),
+            EventKind::Diagnostic(d) => diagnostics.push(d.message),
+            EventKind::TurnEnded { .. } => {
+                turns_ended += 1;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!((turns_started, turns_ended), (1, 1));
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+    // The `subAgentActivity` tool is the child thread: Running while the child
+    // works, Completed once its turn ends.
+    let activity = subagents
+        .iter()
+        .find(|t| t.title.contains("reviewer.md"))
+        .expect("a subagent tool for the child thread")
+        .id
+        .clone();
+    let states: Vec<_> = subagents
+        .iter()
+        .filter(|t| t.id == activity)
+        .map(|t| t.status)
+        .collect();
+    assert_eq!(states, vec![ToolStatus::Running, ToolStatus::Completed]);
+    // The child's content is attributed to it.
+    assert_eq!(child_text, vec![("child text".to_owned(), activity)]);
+    // The collab call is a subagent tool too, carrying its prompt.
+    assert!(
+        subagents
+            .iter()
+            .any(|t| t.input == ToolInput::Text("review the diff".into())),
+        "{subagents:?}"
+    );
+    // Neither the child's usage nor its plan reaches the parent's.
+    assert_eq!(usage, vec![1200]);
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0][0].text, "step 1");
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_child_turn_fails_its_subagent_tool() {
+    let (session, mut events) = open("subagent-fail", "").await;
+    session.prompt("subagent-fails now").await.unwrap();
+    let mut failed = None;
+    loop {
+        match next(&mut events).await.kind {
+            EventKind::ToolUpdated(tool)
+                if tool.kind == ToolKind::Subagent && tool.status == ToolStatus::Failed =>
+            {
+                failed = Some(tool);
+            }
+            // The parent turn still completes normally.
+            EventKind::TurnEnded { stop, .. } => {
+                assert!(matches!(stop, StopReason::Completed { .. }), "{stop:?}");
+                break;
+            }
+            _ => {}
+        }
+    }
+    let failed = failed.expect("the failed child marks its subagent tool Failed");
+    assert_eq!(failed.output.as_deref(), Some("child blew up"));
     session.close().await.unwrap();
 }
 
@@ -194,6 +324,7 @@ async fn a_full_turn_maps_every_frame_kind() {
     assert_eq!(fork_point.as_deref(), Some("turn-0"));
 
     let quota = quota.unwrap();
+    assert_eq!(quota.plan.as_deref(), Some("edu"));
     assert_eq!(quota.windows[0].label, "Session");
     assert_eq!(quota.windows[0].used_percent, 5);
     assert_eq!(quota.windows[1].label, "Week");
@@ -508,6 +639,7 @@ async fn plan_usage_probe_reads_the_windows() {
     let runtime = Runtime::new();
     let agent = AgentInstallation::at("codex", wrapper("usage", ""));
     let usage = runtime.plan_usage(&agent).await.unwrap();
+    assert_eq!(usage.plan.as_deref(), Some("edu"));
     assert_eq!(usage.windows.len(), 2);
     assert_eq!(usage.windows[0].label, "Session");
     assert_eq!(usage.windows[0].used_percent, 5);

@@ -17,7 +17,7 @@ use crate::adapter::{
 use crate::agent::{
     AccountInfo, AgentDetails, AuthKind, AuthStatus, Capabilities, Capability, ConfigChoice,
     ConfigId, ConfigKind, ConfigOption, ConfigValue, Input, ResumeToken, SessionConfiguration,
-    SessionStart,
+    SessionStart, SlashCommand,
 };
 use crate::error::AgentError;
 use crate::event::{
@@ -80,6 +80,8 @@ impl Adapter for CodexAdapter {
                 cancel_pending: false,
                 pending: HashMap::new(),
                 tools: HashMap::new(),
+                children: HashMap::new(),
+                child_tool: None,
                 requests: HashMap::new(),
                 open_reasoning: std::collections::HashSet::new(),
                 auth_lost: false,
@@ -172,8 +174,8 @@ async fn launch(
     }
 }
 
-/// `initialize` → `initialized`, then account and model catalog, then the
-/// thread bind from `options.start`.
+/// `initialize` → `initialized`, then account, model catalog, and skills, then
+/// the thread bind from `options.start`.
 async fn handshake(
     wire: &mut Wire,
     request: &ConnectRequest,
@@ -194,14 +196,51 @@ async fn handshake(
         .await
         .map_err(WireError::into_error)?["data"]
         .clone();
+    // Skills (the slash commands) are fetched by the drive task after open:
+    // the roundtrip costs ~0.5 s (probed, 78 skills) and lands as
+    // `SessionUpdated`, like ACP's late command list.
+    let commands = Vec::new();
     let config = start_config(request, &models)?;
     let thread = open_thread(wire, request, &config).await?;
     let thread_id = thread["thread"]["id"]
         .as_str()
         .ok_or_else(|| AgentError::ProtocolFailed("thread bind returned no id".into()))?
         .to_owned();
-    let info = driver_info(&init, &account, &models, &thread, &config, request);
+    let info = driver_info(
+        &init, &account, &models, &thread, &config, commands, request,
+    );
     Ok((info, models, thread_id))
+}
+
+/// Skills are codex's slash commands. `data` groups them by root and the same
+/// skill appears under every root, so dedupe by name keeping first appearance.
+/// A host with no skills, or a build without `skills/list`, reports none.
+fn parse_skill_commands(response: &Value) -> Vec<SlashCommand> {
+    let mut seen = std::collections::HashSet::new();
+    response["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|group| group["skills"].as_array().into_iter().flatten())
+        .filter_map(|skill| {
+            let name = skill["name"]
+                .as_str()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())?;
+            // The interface's short description is picker-sized; the
+            // top-level one is a model-facing paragraph, so it is a fallback.
+            seen.insert(name.to_owned()).then(|| SlashCommand {
+                name: name.to_owned(),
+                description: skill["interface"]["shortDescription"]
+                    .as_str()
+                    .filter(|text| !text.is_empty())
+                    .or_else(|| skill["description"].as_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+                input_hint: None,
+            })
+        })
+        .collect()
 }
 
 /// Creation-time `configure` values, validated. The wire accepts an unknown
@@ -320,6 +359,7 @@ fn driver_info(
     models: &Value,
     thread: &Value,
     config: &StartConfig,
+    commands: Vec<SlashCommand>,
     request: &ConnectRequest,
 ) -> DriverInfo {
     // `userAgent` is "anyagent/0.147.0 (…)"; the version rides after the slash.
@@ -421,6 +461,8 @@ fn driver_info(
                 Capability::Resume,
                 Capability::Fork,
                 Capability::Plan,
+                Capability::Subagents,
+                Capability::SlashCommands,
                 Capability::ContextUsage,
                 Capability::PlanUsage,
             ]),
@@ -433,7 +475,7 @@ fn driver_info(
             .into_iter()
             .flatten()
             .collect(),
-            commands: Vec::new(),
+            commands,
         },
         configuration,
         // `thread/start` returns the id immediately, so the resume token
@@ -455,6 +497,7 @@ enum Pending {
     StartTurn,
     Steer,
     Interrupt,
+    Skills,
 }
 
 /// A server→client request waiting for `answer`.
@@ -486,6 +529,12 @@ struct Drive {
     /// Active tool items by id. An interrupted turn leaves them with no
     /// `item/completed` (probed 2026-08-27); they are cancelled at turn end.
     tools: HashMap<String, ToolUpdate>,
+    /// Subagent child threads: child threadId → the `subAgentActivity` tool
+    /// that owns it. Cleared at turn end with the tools it points into.
+    children: HashMap<String, ToolId>,
+    /// Set while a child thread's frame is being translated, so every content
+    /// event it produces rides that subagent tool.
+    child_tool: Option<ToolId>,
     requests: HashMap<RequestId, PendingRequest>,
     /// Reasoning items that streamed deltas; only those get a `MessageEnded`.
     open_reasoning: std::collections::HashSet<String>,
@@ -498,6 +547,11 @@ struct Drive {
 impl Drive {
     /// Main loop until the engine or the agent goes away.
     async fn run(mut self, mut commands: mpsc::Receiver<DriverCommand>) {
+        // Late skills fetch (see `handshake`); a send failure means the wire
+        // is already gone and the loop below will report it.
+        if let Ok(id) = self.wire.request("skills/list", json!({})).await {
+            self.pending.insert(id, Pending::Skills);
+        }
         loop {
             tokio::select! {
                 cmd = commands.recv() => match cmd {
@@ -640,12 +694,77 @@ impl Drive {
             Pending::Steer => self.emit(DriverEvent::Steered(error.is_none())).await?,
             // "no active turn to interrupt" means already idle: success.
             Pending::Interrupt => {}
+            Pending::Skills => {
+                let commands = parse_skill_commands(&frame["result"]);
+                if !commands.is_empty() {
+                    self.info.details.commands = commands;
+                    self.emit(DriverEvent::InfoChanged(self.info.clone()))
+                        .await?;
+                }
+            }
         }
         Ok(())
     }
 
-    /// A server-pushed notification, routed by method.
+    /// A server-pushed notification. Frames on a registered subagent child
+    /// thread take the child path; everything else is the parent thread's.
     async fn on_notification(&mut self, method: &str, params: &Value) -> Result<(), Gone> {
+        let child = params["threadId"]
+            .as_str()
+            .and_then(|thread| self.children.get(thread))
+            .cloned();
+        match child {
+            Some(tool) => self.on_child_frame(method, params, tool).await,
+            None => self.on_parent_frame(method, params).await,
+        }
+    }
+
+    /// A child thread's frame: content rides the parent's subagent tool, and
+    /// the child's turn bookkeeping is consumed so it can never settle the
+    /// parent turn. Unknown methods fall through to the parent path.
+    async fn on_child_frame(
+        &mut self,
+        method: &str,
+        params: &Value,
+        tool: ToolId,
+    ) -> Result<(), Gone> {
+        match method {
+            "turn/completed" => self.settle_subagent(tool, &params["turn"]).await,
+            // Consumed: the child's plan is a whole-list replacement and its
+            // usage is its own context window, so neither may reach the
+            // parent's, and its turn frames must not move the parent's turn.
+            "thread/tokenUsage/updated" | "thread/status/changed" => Ok(()),
+            _ if method.starts_with("turn/") => Ok(()),
+            // Content: the parent's translation, attributed to the subagent.
+            _ if method.starts_with("item/") || method == "error" => {
+                self.child_tool = Some(tool);
+                let result = self.on_parent_frame(method, params).await;
+                self.child_tool = None;
+                result
+            }
+            _ => self.on_parent_frame(method, params).await,
+        }
+    }
+
+    /// A child turn ended: its subagent tool takes the outcome, so a failed
+    /// child is visible instead of vanishing into a cancel at parent turn end.
+    async fn settle_subagent(&mut self, tool: ToolId, turn: &Value) -> Result<(), Gone> {
+        let Some(mut update) = self.tools.remove(tool.as_str()) else {
+            return Ok(());
+        };
+        update.status = match turn["status"].as_str().unwrap_or_default() {
+            "completed" => ToolStatus::Completed,
+            "interrupted" => ToolStatus::Cancelled,
+            _ => ToolStatus::Failed,
+        };
+        if let Some(message) = turn["error"]["message"].as_str() {
+            update.output = Some(message.to_owned());
+        }
+        self.content(EventKind::ToolUpdated(update)).await
+    }
+
+    /// A parent-thread notification, routed by method.
+    async fn on_parent_frame(&mut self, method: &str, params: &Value) -> Result<(), Gone> {
         match method {
             "turn/started" => {
                 self.turn_started = true;
@@ -779,16 +898,17 @@ impl Drive {
                 if !completed {
                     return Ok(());
                 }
-                // The wire turn id is the fork anchor for `fork_from(_, at)`.
+                // The wire turn id is the fork anchor for `fork_from(_, at)`;
+                // a subagent's message is not an anchor on the parent thread.
                 let mut extensions = Extensions::new();
-                if let Some(turn) = &self.turn {
+                if let (None, Some(turn)) = (&self.child_tool, &self.turn) {
                     extensions.insert("codex/fork_point".into(), Value::from(turn.clone()));
                 }
                 self.emit(DriverEvent::Event {
                     kind: EventKind::MessageEnded {
                         message_id: MessageId::new(id),
                     },
-                    parent_tool_id: None,
+                    parent_tool_id: self.child_tool.clone(),
                     extensions,
                 })
                 .await
@@ -809,16 +929,27 @@ impl Drive {
                 }
                 Ok(())
             }
-            _ => {
-                let tool = tool_update(item);
-                if tool.status.is_active() {
-                    self.tools.insert(id, tool.clone());
-                } else {
-                    self.tools.remove(&id);
+            // The subagent's own thread; its frames route to this tool.
+            "subAgentActivity" => {
+                if let Some(child) = item["agentThreadId"].as_str() {
+                    self.children.insert(child.to_owned(), ToolId::new(&id));
                 }
-                self.content(EventKind::ToolUpdated(tool)).await
+                self.on_tool_item(&id, item).await
             }
+            _ => self.on_tool_item(&id, item).await,
         }
+    }
+
+    /// A tool-shaped item: emit the snapshot and keep the active ones, so an
+    /// interrupt or a child turn end can still settle them.
+    async fn on_tool_item(&mut self, id: &str, item: &Value) -> Result<(), Gone> {
+        let tool = tool_update(item);
+        if tool.status.is_active() {
+            self.tools.insert(id.to_owned(), tool.clone());
+        } else {
+            self.tools.remove(id);
+        }
+        self.content(EventKind::ToolUpdated(tool)).await
     }
 
     /// Exactly one `turn/completed` per turn, holding even for interrupts
@@ -833,6 +964,7 @@ impl Drive {
             }
         }
         self.requests.clear();
+        self.children.clear();
         self.open_reasoning.clear();
         self.turn = None;
         self.turn_started = false;
@@ -1050,8 +1182,15 @@ impl Drive {
         .await
     }
 
+    /// Emits one content event, attributed to the subagent tool when the frame
+    /// came from a child thread.
     async fn content(&mut self, kind: EventKind) -> Result<(), Gone> {
-        self.emit(DriverEvent::event(kind)).await
+        self.emit(DriverEvent::Event {
+            kind,
+            parent_tool_id: self.child_tool.clone(),
+            extensions: Extensions::new(),
+        })
+        .await
     }
 
     async fn emit(&mut self, event: DriverEvent) -> Result<(), Gone> {
@@ -1118,6 +1257,22 @@ fn tool_update(item: &Value) -> ToolUpdate {
                 .map(|q| ToolInput::Query(q.to_owned()))
                 .unwrap_or(ToolInput::None),
             item["query"].as_str(),
+        ),
+        // A subagent's thread, and one collab operation on it (spawn, input,
+        // wait). Only `collabAgentToolCall` carries a status, so the thread
+        // item stays Running until its child turn ends.
+        "subAgentActivity" => (
+            ToolKind::Subagent,
+            ToolInput::None,
+            item["agentPath"].as_str(),
+        ),
+        "collabAgentToolCall" => (
+            ToolKind::Subagent,
+            item["prompt"]
+                .as_str()
+                .map(|p| ToolInput::Text(p.to_owned()))
+                .unwrap_or(ToolInput::None),
+            item["tool"].as_str(),
         ),
         _ => (ToolKind::Other, ToolInput::None, None),
     };
@@ -1238,7 +1393,8 @@ fn notice_text(params: &Value) -> String {
 }
 
 /// `account/rateLimits` → quota windows; `primary` and `secondary` are the
-/// plan's two windows (300 min and 10080 min observed).
+/// plan's two windows (300 min and 10080 min observed), and `planType` names
+/// the plan.
 fn plan_usage(rate_limits: &Value) -> Option<PlanUsage> {
     let windows: Vec<UsageWindow> = ["primary", "secondary"]
         .iter()
@@ -1254,6 +1410,7 @@ fn plan_usage(rate_limits: &Value) -> Option<PlanUsage> {
         })
         .collect();
     (!windows.is_empty()).then(|| PlanUsage {
+        plan: rate_limits["planType"].as_str().map(str::to_owned),
         windows,
         fetched_at: SystemTime::now(),
     })

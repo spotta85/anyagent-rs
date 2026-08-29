@@ -378,6 +378,8 @@ async fn plan_usage_is_refreshed_after_each_turn() {
         windows,
         vec![("Session", 42), ("Week", 5), ("Week (Fable)", 9)]
     );
+    // The plan label is the receipt's own `subscription_type`.
+    assert_eq!(usage.plan.as_deref(), Some("max"));
     // 2026-08-23T08:59:59.746028+00:00, fraction dropped.
     assert_eq!(
         usage.windows[0].resets_at,

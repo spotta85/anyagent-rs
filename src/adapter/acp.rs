@@ -633,6 +633,9 @@ impl Drive {
                 self.on_question(frame).await
             }
             Some("_x.ai/session/prompt_complete") => self.on_prompt_complete(&frame).await,
+            // Kiro ships its slash commands here instead of in an
+            // `availableCommandsUpdate` (probed 2.20.1).
+            Some("_kiro.dev/commands/available") => self.on_kiro_commands(&frame).await,
             Some(other) => {
                 if frame.get("id").is_some() {
                     let other = other.to_owned();
@@ -861,6 +864,32 @@ impl Drive {
             &json!({ "result": { "stopReason": stop } }),
         )))
         .await
+    }
+
+    /// Kiro's command list, in the same place a standard `availableCommands`
+    /// update would land.
+    async fn on_kiro_commands(&mut self, frame: &Value) -> Result<(), Gone> {
+        let params = &frame["params"];
+        if params["sessionId"].as_str() != Some(self.session_id.as_str()) {
+            return Ok(());
+        }
+        let Some(commands) = params["commands"].as_array() else {
+            return Ok(());
+        };
+        self.info.details.commands = commands
+            .iter()
+            .filter_map(|c| {
+                Some(SlashCommand {
+                    name: c["name"].as_str()?.to_owned(),
+                    description: c["description"].as_str().unwrap_or_default().to_owned(),
+                    input_hint: c["meta"]["hint"]
+                        .as_str()
+                        .filter(|h| !h.is_empty())
+                        .map(str::to_owned),
+                })
+            })
+            .collect();
+        self.emit(DriverEvent::InfoChanged(self.info.clone())).await
     }
 
     /// The prompt response ends the turn; the steering response reports back.

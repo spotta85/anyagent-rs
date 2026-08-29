@@ -4,7 +4,9 @@
 // login), --question (a requestUserInput mid-turn), --echo-config-home
 // (echo the CODEX_HOME the child received). Prompt words steer scenarios:
 // "write-file" (a fileChange escalates past the sandbox -> approval),
-// "sleep" (a command that only an interrupt ends), "die" (exit mid-turn).
+// "sleep" (a command that only an interrupt ends), "die" (exit mid-turn),
+// "subagent" (a child thread runs a whole turn before the parent's ends,
+// "subagent-fails" for a child turn that fails).
 import { createInterface } from 'node:readline';
 
 const flag = (name) => process.argv.includes(name);
@@ -77,6 +79,17 @@ async function onRequest(m) {
         : { account: { type: 'chatgpt', email: 'user@example.com', planType: 'edu' }, requiresOpenaiAuth: true });
     case 'model/list':
       return reply({ data: MODELS, nextCursor: null });
+    case 'skills/list':
+      // Grouped by root; the same skill appears under every root (dedupe by
+      // name), a nameless entry is junk, and only `review` has an interface.
+      return reply({ data: [
+        { cwd: process.cwd(), skills: [
+          { name: 'review', description: 'A long model-facing paragraph.', interface: { shortDescription: 'Review a diff.' }, enabled: true, scope: 'repo', path: '/skills/review' },
+          { name: 'release', description: 'Cut a release.', enabled: true, scope: 'user', path: '/skills/release' },
+          { name: '', description: 'no name', enabled: true, scope: 'user', path: '/skills/junk' },
+        ] },
+        { cwd: '/other', skills: [{ name: 'review', description: 'dup', enabled: true, scope: 'user', path: '/skills/review' }] },
+      ] });
     case 'account/rateLimits/read':
       if (flag('--logged-out')) return refuse('codex account authentication required to read rate limits');
       return reply({ rateLimits: RATE_LIMITS });
@@ -179,6 +192,8 @@ async function runTurn(params) {
     delta(msg.id, `write=${resp?.decision} `);
   }
 
+  if (prompt.includes('subagent')) await runSubagent(prompt.includes('subagent-fails'));
+
   await sleep(20); // yield so a mid-turn steer on stdin gets read, like the real server
   for (const steer of turn.steered) delta(msg.id, `steered=${steer} `);
   notify('turn/plan/updated', { threadId: THREAD.id, turnId: turn.id, plan: [{ step: 'step 1', status: 'inProgress' }] });
@@ -193,4 +208,29 @@ async function runTurn(params) {
 function endTurn(status, error = null) {
   notify('turn/completed', { threadId: THREAD.id, turn: { id: turn.id, status, error, items: [] } });
   turn = null;
+}
+
+// A spawned subagent: the parent gets a collab tool call plus the child-thread
+// item, and the child then runs a whole turn — started, content, usage, and its
+// own turn/completed — on its own threadId, all BEFORE the parent's turn ends.
+async function runSubagent(fails) {
+  const CHILD = 'th-child-1', CHILD_TURN = 'turn-child-1';
+  const child = (method, params) => notify(method, { threadId: CHILD, turnId: CHILD_TURN, ...params });
+  const collab = item({ type: 'collabAgentToolCall', tool: 'spawnAgent', senderThreadId: THREAD.id, receiverThreadIds: [CHILD], agentsStates: {}, status: 'inProgress', prompt: 'review the diff' });
+  itemStarted(collab);
+  const activity = item({ type: 'subAgentActivity', agentThreadId: CHILD, agentPath: '.codex/agents/reviewer.md', kind: 'started' });
+  itemStarted(activity);
+
+  child('turn/started', { turn: { id: CHILD_TURN, status: 'inProgress' } });
+  const said = { id: 'it-child-msg', type: 'agentMessage', text: '', phase: 'final_answer' };
+  child('item/started', { item: said, startedAtMs: 0 });
+  child('item/agentMessage/delta', { itemId: said.id, delta: 'child text' });
+  child('item/completed', { item: { ...said, text: 'child text' } });
+  // Would overwrite the parent's context gauge and plan if it were not consumed.
+  child('thread/tokenUsage/updated', { tokenUsage: { total: { totalTokens: 77 }, last: { totalTokens: 77 }, modelContextWindow: 1024 } });
+  child('turn/plan/updated', { plan: [{ step: 'child step', status: 'inProgress' }] });
+  notify('turn/completed', { threadId: CHILD, turn: { id: CHILD_TURN, status: fails ? 'failed' : 'completed', error: fails ? { message: 'child blew up' } : null, items: [] } });
+
+  itemCompleted({ ...collab, status: 'completed', agentsStates: { [CHILD]: { status: fails ? 'errored' : 'completed' } } });
+  await sleep(10);
 }

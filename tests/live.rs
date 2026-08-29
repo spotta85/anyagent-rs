@@ -188,7 +188,13 @@ async fn probe_reports_details_without_a_session() {
                 .collect();
             assert!(left.is_empty(), "claude: probe left a transcript: {left:?}");
         }
-        pass(h, "probe reports details without a session");
+        pass(
+            h,
+            &format!(
+                "probe reports details without a session ({} commands)",
+                details.commands.len()
+            ),
+        );
     }
 }
 
@@ -720,7 +726,14 @@ async fn plan_usage_arrives_after_a_turn() {
             .iter()
             .map(|w| format!("{} {}%", w.label, w.used_percent))
             .collect();
-        pass(h, &format!("plan usage pushed: {}", summary.join(", ")));
+        pass(
+            h,
+            &format!(
+                "plan usage pushed: plan {:?}, {}",
+                usage.plan,
+                summary.join(", ")
+            ),
+        );
     }
 }
 

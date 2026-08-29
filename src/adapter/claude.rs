@@ -1491,7 +1491,8 @@ fn context_tokens(usage: &Value) -> Option<u64> {
     Some(sum)
 }
 
-/// `get_usage` receipt → quota windows, from `rate_limits.limits`.
+/// `get_usage` receipt → quota windows, from `rate_limits.limits`; the plan
+/// name is the receipt's own `subscription_type`.
 fn parse_plan_usage(response: &Value) -> Option<PlanUsage> {
     let limits = response["rate_limits"]["limits"].as_array()?;
     let windows: Vec<UsageWindow> = limits
@@ -1505,6 +1506,7 @@ fn parse_plan_usage(response: &Value) -> Option<PlanUsage> {
         })
         .collect();
     (!windows.is_empty()).then(|| PlanUsage {
+        plan: response["subscription_type"].as_str().map(str::to_owned),
         windows,
         fetched_at: std::time::SystemTime::now(),
     })

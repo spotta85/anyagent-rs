@@ -312,6 +312,8 @@ pub enum QuestionAnswer {
 /// Plan quota windows for the logged-in account.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanUsage {
+    /// The plan the quota belongs to ("max", "edu"), when the agent names it.
+    pub plan: Option<String>,
     pub windows: Vec<UsageWindow>,
     pub fetched_at: SystemTime,
 }

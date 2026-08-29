@@ -39,7 +39,8 @@ pub(crate) async fn spawn(spec: Spawn) -> Result<Child, AgentError> {
         std::env::var("PATH").ok().as_deref(),
         login_shell_path().await.as_deref(),
     );
-    let mut child = Command::new(&spec.exec_path)
+    let mut command = Command::new(&spec.exec_path);
+    command
         .args(&spec.args)
         .current_dir(&spec.cwd)
         .env("PATH", path)
@@ -47,7 +48,13 @@ pub(crate) async fn spawn(spec: Spawn) -> Result<Child, AgentError> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    // Own process group: agents that dispatch to a worker (kiro-cli spawns
+    // kiro-cli-chat, which inherits the pipes) are then signalled as a unit,
+    // so no worker outlives the session holding stderr open.
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
         .spawn()
         .map_err(|e| AgentError::SpawnFailed(format!("{}: {e}", spec.exec_path.display())))?;
 
@@ -98,7 +105,8 @@ impl Child {
         #[cfg(unix)]
         let terminated = match self.inner.id() {
             Some(pid) => {
-                unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+                // Negative pid signals the whole group; the child leads its own.
+                unsafe { libc::kill(-(pid as i32), libc::SIGTERM) };
                 tokio::time::timeout(grace, self.inner.wait()).await.is_ok()
             }
             None => false,
@@ -106,6 +114,10 @@ impl Child {
         #[cfg(not(unix))]
         let terminated = false;
         if !terminated {
+            #[cfg(unix)]
+            if let Some(pid) = self.inner.id() {
+                unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+            }
             let _ = self.inner.kill().await;
         }
         // The reader ends at stderr EOF; joining it here makes `stderr_tail`
