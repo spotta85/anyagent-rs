@@ -7,10 +7,10 @@ use std::time::Duration;
 use futures::StreamExt;
 
 use anyagent::{
-    AgentError, AgentInstallation, Answer, AuthStatus, Capability, ChoiceId, ConfigId, ConfigValue,
-    DeliveryKind, Event, EventKind, Events, Input, LoginMethod, McpServer, McpTransport,
-    PermissionChoice, QuestionAnswer, Request, ResumeToken, Runtime, Session, SessionOptions,
-    StopReason,
+    AgentError, AgentInstallation, Answer, AuthKind, AuthStatus, Capability, ChoiceId, ConfigId,
+    ConfigValue, DeliveryKind, Event, EventKind, Events, Input, LoginMethod, McpServer,
+    McpTransport, PermissionChoice, QuestionAnswer, Request, ResumeToken, Runtime, Session,
+    SessionOptions, StopReason,
 };
 
 fn fixture(extra: &[&str]) -> AgentInstallation {
@@ -41,6 +41,27 @@ async fn next(events: &mut Events) -> Event {
 
 fn allow() -> Answer {
     Answer::Permission(PermissionChoice::AllowOnce)
+}
+
+/// A catalog-agent stand-in: a script that execs the fixture with scenario
+/// flags, ignoring the profile's protocol args appended after them. Needed
+/// because auth truth (open-proves-auth, logged-out hints) is catalog data.
+fn catalog_wrapper(agent: &str, name: &str, flags: &str) -> AgentInstallation {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/acp/fixture.mjs");
+    let dir = std::env::temp_dir().join(format!("anyagent-acp-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(agent);
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nexec node {} {flags} \"$@\"\n",
+            fixture.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    AgentInstallation::at(agent, path)
 }
 
 #[tokio::test]
@@ -322,6 +343,128 @@ async fn configuring_the_mode_round_trips_and_updates_the_session() {
     let unknown = session.configure("nope", "x").await;
     assert!(matches!(unknown, Err(AgentError::InvalidConfiguration(_))));
     session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn probe_confirms_login_when_an_open_proves_it() {
+    // kiro refuses to open logged out (probed 2026-08-28), so a successful
+    // open is proof of login — no offline marker needed.
+    let agent = catalog_wrapper("kiro", "auth-in", "--commands-on-open");
+    let details = Runtime::new().probe(&agent).await.unwrap();
+    assert_eq!(
+        details.auth,
+        AuthStatus::Authenticated {
+            kind: AuthKind::Subscription,
+            account: None
+        }
+    );
+}
+
+#[tokio::test]
+async fn probe_overrides_a_stale_logged_out_marker_after_a_proven_open() {
+    let mut agent = catalog_wrapper("hermes", "auth-stale", "");
+    agent.auth = Some(AuthStatus::Unauthenticated { login: Vec::new() });
+    let details = Runtime::new().probe(&agent).await.unwrap();
+    assert_eq!(
+        details.auth,
+        AuthStatus::Authenticated {
+            kind: AuthKind::ApiKey,
+            account: None
+        }
+    );
+}
+
+#[tokio::test]
+async fn probe_preserves_a_marker_kind_after_a_proven_open() {
+    let mut agent = catalog_wrapper("qwen", "auth-kind", "");
+    agent.auth = Some(AuthStatus::Authenticated {
+        kind: AuthKind::ApiKey,
+        account: None,
+    });
+    let details = Runtime::new().probe(&agent).await.unwrap();
+    assert!(matches!(
+        details.auth,
+        AuthStatus::Authenticated {
+            kind: AuthKind::ApiKey,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn probe_maps_a_pre_protocol_exit_to_logged_out() {
+    // The kiro logged-out shape: complain on stderr, exit before speaking ACP.
+    let agent = catalog_wrapper("kiro", "auth-exit", "--die-not-logged-in");
+    let details = Runtime::new().probe(&agent).await.unwrap();
+    let AuthStatus::Unauthenticated { login } = details.auth else {
+        panic!("expected Unauthenticated, got {:?}", details.auth);
+    };
+    let LoginMethod::Terminal { command, .. } = &login[0] else {
+        panic!("expected a terminal login method");
+    };
+    assert_eq!(command[1..], ["login"]);
+}
+
+#[tokio::test]
+async fn probe_maps_a_hinted_wire_error_to_logged_out() {
+    // The hermes logged-out shape: session/new fails with a plain internal
+    // error whose `data` carries "No LLM provider configured".
+    let agent = catalog_wrapper("hermes", "auth-hint", "--auth-hint-error");
+    let details = Runtime::new().probe(&agent).await.unwrap();
+    let AuthStatus::Unauthenticated { login } = details.auth else {
+        panic!("expected Unauthenticated, got {:?}", details.auth);
+    };
+    let LoginMethod::Terminal { command, .. } = &login[0] else {
+        panic!("expected a terminal login method");
+    };
+    assert_eq!(command[1..], ["login"]);
+}
+
+#[tokio::test]
+async fn probe_uses_the_profile_fallback_when_auth_methods_are_empty() {
+    // Grok returns the auth code without a runnable method. Its profile maps
+    // the error and offers the bare executable, which opens Grok's login TUI.
+    let agent = catalog_wrapper(
+        "grok",
+        "auth-code",
+        "--auth-required --capitalized-auth --no-auth-methods",
+    );
+    let details = Runtime::new().probe(&agent).await.unwrap();
+    let AuthStatus::Unauthenticated { login } = details.auth else {
+        panic!("expected Unauthenticated, got {:?}", details.auth);
+    };
+    let LoginMethod::Terminal { command, .. } = &login[0] else {
+        panic!("expected a terminal login method");
+    };
+    assert_eq!(command, &[agent.executable_path.to_string_lossy()]);
+    // The profile's API-key marker rides along as the alternative.
+    assert!(
+        login
+            .iter()
+            .any(|m| matches!(m, LoginMethod::EnvVar { name } if name == "XAI_API_KEY")),
+        "expected the XAI_API_KEY EnvVar alternative, got {login:?}"
+    );
+}
+
+#[tokio::test]
+async fn probe_reads_a_meta_shaped_login_method() {
+    // The qwen shape: the auth method's type/args ride in `_meta`, so the
+    // typed Terminal variant never matches — the meta shape must still
+    // yield a runnable login command.
+    let details = Runtime::new()
+        .probe(&fixture(&["--auth-required", "--meta-auth-methods"]))
+        .await
+        .unwrap();
+    let AuthStatus::Unauthenticated { login } = details.auth else {
+        panic!("expected Unauthenticated, got {:?}", details.auth);
+    };
+    let LoginMethod::Terminal { command, .. } = &login[0] else {
+        panic!("expected a terminal login method");
+    };
+    assert_eq!(
+        command.last().map(String::as_str),
+        Some("--auth-type=openai")
+    );
 }
 
 #[tokio::test]

@@ -11,6 +11,13 @@ const notify = (sessionId, update) => send({ jsonrpc: '2.0', method: 'session/up
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 let nextId = 100, pending = {}, turn = null, mcpDecl = [];
 
+// --die-not-logged-in: the kiro shape — complain on stderr and exit before
+// ever speaking ACP.
+if (flag('--die-not-logged-in')) {
+  process.stderr.write('error:\nYou are not logged in, please log in with fixture login\n');
+  process.exit(1);
+}
+
 const rl = createInterface({ input: process.stdin });
 rl.on('line', (line) => { const m = JSON.parse(line); if (m.method) onRequest(m); else onResponse(m); });
 rl.on('close', () => process.exit(0));
@@ -21,9 +28,20 @@ function request(method, params) { const id = nextId++; return new Promise(r => 
 async function onRequest(m) {
   const reply = (result) => send({ jsonrpc: '2.0', id: m.id, result });
   switch (m.method) {
-    case 'initialize': return reply({ protocolVersion: 1, agentCapabilities: { loadSession: !flag('--no-load'), promptCapabilities: { image: true }, mcpCapabilities: { http: true, sse: false }, _meta: { steering: { supported: true } } }, authMethods: [{ id: 'fixture-login', name: 'Log in', type: 'terminal', args: ['auth', 'login'] }], agentInfo: { name: 'fixture', version: '0.0.1' }, _meta: { vendor: 'spike' } });
+    case 'initialize': {
+      // --meta-auth-methods: the qwen shape — `type`/`args` live in _meta,
+      // not the typed fields.
+      const authMethods = flag('--no-auth-methods')
+        ? []
+        : flag('--meta-auth-methods')
+        ? [{ id: 'openai', name: 'Use OpenAI API key', _meta: { type: 'terminal', args: ['--auth-type=openai'] } }]
+        : [{ id: 'fixture-login', name: 'Log in', type: 'terminal', args: ['auth', 'login'] }];
+      return reply({ protocolVersion: 1, agentCapabilities: { loadSession: !flag('--no-load'), promptCapabilities: { image: true }, mcpCapabilities: { http: true, sse: false }, _meta: { steering: { supported: true } } }, authMethods, agentInfo: { name: 'fixture', version: '0.0.1' }, _meta: { vendor: 'spike' } });
+    }
     case 'session/new':
-      if (flag('--auth-required')) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32000, message: 'authentication required' } });
+      if (flag('--auth-required')) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32000, message: flag('--capitalized-auth') ? 'Authentication required' : 'authentication required' } });
+      // The hermes shape: a plain internal error whose data carries the words.
+      if (flag('--auth-hint-error')) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32603, message: 'Internal error', data: { details: 'No LLM provider configured. Run `fixture login` first.' } } });
       mcpDecl = m.params.mcpServers ?? [];
       // --grok-models: the first-class models state (no model configOption);
       // switching must ride session/set_model.

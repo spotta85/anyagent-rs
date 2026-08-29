@@ -96,13 +96,24 @@ impl Child {
     /// SIGTERM, then SIGKILL when the grace period expires.
     pub async fn shutdown(&mut self, grace: Duration) {
         #[cfg(unix)]
-        if let Some(pid) = self.inner.id() {
-            unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-            if tokio::time::timeout(grace, self.inner.wait()).await.is_ok() {
-                return;
+        let terminated = match self.inner.id() {
+            Some(pid) => {
+                unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+                tokio::time::timeout(grace, self.inner.wait()).await.is_ok()
             }
+            None => false,
+        };
+        #[cfg(not(unix))]
+        let terminated = false;
+        if !terminated {
+            let _ = self.inner.kill().await;
         }
-        let _ = self.inner.kill().await;
+        // The reader ends at stderr EOF; joining it here makes `stderr_tail`
+        // complete for error reports (a child that dies at spawn can lose the
+        // race between its last lines and the caller reading the tail).
+        if let Some(task) = self.stderr_task.take() {
+            let _ = tokio::time::timeout(grace, task).await;
+        }
     }
 }
 

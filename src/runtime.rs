@@ -43,8 +43,8 @@ impl Runtime {
         let mut adapters: HashMap<AgentId, Arc<dyn Adapter>> = HashMap::new();
         for profile in crate::catalog::PROFILES {
             let adapter: Arc<dyn Adapter> = match &profile.connection {
-                Connection::Acp { args } => {
-                    Arc::new(crate::adapter::acp::AcpAdapter::new(args.iter().copied()))
+                Connection::Acp { .. } => {
+                    Arc::new(crate::adapter::acp::AcpAdapter::for_profile(profile))
                 }
                 Connection::Native(NativeKind::Claude) => {
                     Arc::new(crate::adapter::claude::ClaudeAdapter::new())
@@ -250,6 +250,9 @@ mod tests {
     }
 
     #[tokio::test]
+    // The lock deliberately spans the awaits: it serializes tests that
+    // mutate process-wide HOME/PATH.
+    #[allow(clippy::await_holding_lock)]
     async fn discover_hides_agents_without_adapter() {
         let _guard = env_lock().lock().unwrap();
         // `antigravity` has no adapter; even if its `agy` binary is on disk

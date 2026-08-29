@@ -19,6 +19,15 @@ pub(crate) struct AgentProfile {
     /// Presence of any marker means "logged in", read offline. Empty when
     /// the agent has no known marker (auth reported as `None`).
     pub auth_markers: &'static [AuthMarker],
+    /// `Some(kind)` when a successful session open proves the agent is logged
+    /// in with this kind (probed: the agent refuses to open logged out).
+    /// `None` when an open proves nothing (opencode serves free models
+    /// logged out) or the adapter reads auth from its own wire.
+    pub open_auth_kind: Option<AuthKind>,
+    /// Fingerprints of the agent's own logged-out error, matched against a
+    /// failed open's message and stderr (probed per agent; empty = the agent
+    /// uses the ACP auth-required code, which needs no hint).
+    pub auth_error_hints: &'static [&'static str],
     /// Args after the executable that start the agent's own login flow;
     /// empty when the agent only logs in interactively.
     pub login_args: &'static [&'static str],
@@ -68,6 +77,8 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
             AuthMarker::Keychain("Claude Code-credentials", AuthKind::Subscription),
             AuthMarker::ApiKeyEnv("ANTHROPIC_API_KEY"),
         ],
+        open_auth_kind: None,
+        auth_error_hints: &[],
         login_args: &["auth", "login"],
         install_hint: "npm install -g @anthropic-ai/claude-code",
         extra_paths: &[".claude/local", ".local/bin"],
@@ -83,6 +94,8 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         // No env marker: app-server 0.147.0 ignores `OPENAI_API_KEY` entirely
         // (probed 2026-08-27, ticket 10) — auth comes only from auth.json.
         auth_markers: &[AuthMarker::ConfigFile("auth.json", AuthKind::Subscription)],
+        open_auth_kind: None,
+        auth_error_hints: &[],
         login_args: &["login"],
         install_hint: "npm install -g @openai/codex",
         extra_paths: &[],
@@ -101,6 +114,8 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
             AuthMarker::ConfigFile("jetski-standalone-oauth-token", AuthKind::Subscription),
             AuthMarker::ConfigFile("oauth_creds.json", AuthKind::Subscription),
         ],
+        open_auth_kind: None,
+        auth_error_hints: &[],
         login_args: &[],
         install_hint: "install Antigravity from https://antigravity.google, then run `agy install`",
         extra_paths: &[".local/bin"],
@@ -120,7 +135,17 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         connection: Connection::Acp {
             args: &["--no-auto-update", "agent", "--no-leader", "stdio"],
         },
-        auth_markers: &[AuthMarker::ApiKeyEnv("XAI_API_KEY")],
+        // OAuth login writes ~/.grok/auth.json (probed 2026-08-28); the env
+        // key is the API-key alternative.
+        auth_markers: &[
+            AuthMarker::ConfigFile("auth.json", AuthKind::Subscription),
+            AuthMarker::ApiKeyEnv("XAI_API_KEY"),
+        ],
+        open_auth_kind: Some(AuthKind::Subscription),
+        // Grok's -32000 carries no runnable method (probed 1.0.x: "no auth
+        // method id provided"); login is its own TUI, so the fallback
+        // command is the bare executable.
+        auth_error_hints: &["Authentication required"],
         login_args: &[],
         install_hint: "npm install -g @xai-official/grok \
              (or `curl -fsSL https://x.ai/cli/install.sh | bash`)",
@@ -135,6 +160,8 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         config_home_env: None,
         connection: Connection::Acp { args: &["acp"] },
         auth_markers: &[AuthMarker::ConfigFile("auth.json", AuthKind::ApiKey)],
+        open_auth_kind: Some(AuthKind::ApiKey),
+        auth_error_hints: &["No LLM provider configured"],
         login_args: &["login"],
         install_hint: "see https://github.com/NousResearch/hermes-agent",
         extra_paths: &[".local/bin"],
@@ -149,6 +176,8 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         config_home_env: None,
         connection: Connection::Acp { args: &["acp"] },
         auth_markers: &[AuthMarker::ConfigFile("auth.json", AuthKind::Subscription)],
+        open_auth_kind: None,
+        auth_error_hints: &[],
         login_args: &["auth", "login"],
         install_hint: "brew install sst/tap/opencode",
         extra_paths: &[],
@@ -165,6 +194,8 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         // data.sqlite3), which also exists logged out — no honest offline
         // marker, so discovery reports Unknown and `probe` answers for real.
         auth_markers: &[],
+        open_auth_kind: Some(AuthKind::Subscription),
+        auth_error_hints: &["not logged in"],
         login_args: &["login"],
         install_hint: "install Kiro CLI from https://kiro.dev",
         extra_paths: &[".local/bin"],
@@ -179,10 +210,13 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         connection: Connection::Acp {
             args: &["--experimental-acp"],
         },
-        auth_markers: &[AuthMarker::ConfigFile(
-            "oauth_creds.json",
-            AuthKind::Subscription,
-        )],
+        auth_markers: &[
+            AuthMarker::ConfigFile("oauth_creds.json", AuthKind::Subscription),
+            // Advertised by qwen's own auth method (probed 0.22.0).
+            AuthMarker::ApiKeyEnv("OPENAI_API_KEY"),
+        ],
+        open_auth_kind: Some(AuthKind::Subscription),
+        auth_error_hints: &[],
         login_args: &[],
         install_hint: "npm install -g @qwen-code/qwen-code",
         extra_paths: &[],

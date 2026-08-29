@@ -706,14 +706,13 @@ impl Engine {
             message: "agent needs login".into(),
         })
         .await;
-        if self.events_alive {
-            if self
+        if self.events_alive
+            && self
                 .events
                 .send(Err(AgentError::AuthRequired { login }))
                 .is_err()
-            {
-                self.events_alive = false;
-            }
+        {
+            self.events_alive = false;
         }
         self.shutdown(None).await;
     }

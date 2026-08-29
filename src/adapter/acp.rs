@@ -17,9 +17,9 @@ use crate::adapter::{
     WireRecorder, attach,
 };
 use crate::agent::{
-    AgentDetails, AuthStatus, Capabilities, Capability, ConfigChoice, ConfigId, ConfigKind,
-    ConfigOption, ConfigValue, Input, LoginMethod, McpConnection, McpServer, McpTransport,
-    ResumeToken, SessionConfiguration, SessionStart, SlashCommand,
+    AgentDetails, AuthKind, AuthStatus, Capabilities, Capability, ConfigChoice, ConfigId,
+    ConfigKind, ConfigOption, ConfigValue, Input, LoginMethod, McpConnection, McpServer,
+    McpTransport, ResumeToken, SessionConfiguration, SessionStart, SlashCommand,
 };
 use crate::error::AgentError;
 use crate::event::{
@@ -38,12 +38,27 @@ const AUTH_REQUIRED_CODE: i64 = -32000;
 /// One instance per ACP agent; `args` put the CLI in protocol mode.
 pub(crate) struct AcpAdapter {
     args: Vec<String>,
+    /// Catalog facts for auth truth (open-proves-auth, logged-out
+    /// fingerprints); `None` for an ad-hoc ACP install.
+    profile: Option<&'static crate::catalog::AgentProfile>,
 }
 
 impl AcpAdapter {
     pub(crate) fn new(args: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self {
             args: args.into_iter().map(Into::into).collect(),
+            profile: None,
+        }
+    }
+
+    /// A catalog agent: protocol args and auth facts from its profile.
+    pub(crate) fn for_profile(profile: &'static crate::catalog::AgentProfile) -> Self {
+        let crate::catalog::Connection::Acp { args } = &profile.connection else {
+            unreachable!("for_profile is only called for ACP profiles");
+        };
+        Self {
+            args: args.iter().map(|s| (*s).to_owned()).collect(),
+            profile: Some(profile),
         }
     }
 }
@@ -65,12 +80,23 @@ impl Adapter for AcpAdapter {
         .await?;
         let mut wire = Wire::over(&mut child, recorder);
 
-        let handshake = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut wire, &request));
+        let open_auth_kind = self.profile.and_then(|p| p.open_auth_kind.clone());
+        let handshake = tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            handshake(&mut wire, &request, open_auth_kind),
+        );
         let (info, session_id, login, first_class_model) = match handshake.await {
             Ok(Ok(ok)) => ok,
             Ok(Err(e)) => {
+                // Shutdown first: it joins the stderr reader, so the tail is
+                // complete before the error is rendered and hint-matched.
                 child.shutdown(CLOSE_GRACE).await;
-                return Err(e);
+                let e = crate::adapter::with_stderr(e, &child);
+                return Err(auth_hinted(
+                    e,
+                    self.profile,
+                    &request.installation.executable_path,
+                ));
             }
             Err(_) => {
                 child.shutdown(CLOSE_GRACE).await;
@@ -113,6 +139,7 @@ impl Adapter for AcpAdapter {
 async fn handshake(
     wire: &mut Wire,
     request: &ConnectRequest,
+    open_auth_kind: Option<AuthKind>,
 ) -> Result<(DriverInfo, String, Vec<LoginMethod>, bool), AgentError> {
     let init = wire
         .roundtrip(
@@ -155,7 +182,7 @@ async fn handshake(
         .await
         .map_err(|e| e.into_error(&init.auth_methods, &request.installation.executable_path))?;
 
-    let mut info = driver_info(&init, &request.installation.auth);
+    let mut info = driver_info(&init, &request.installation.auth, open_auth_kind);
     let first_class_models = response.get("models").cloned();
     let session_id = if session_id.is_empty() {
         let new: acp::NewSessionResponse = parse(response, "session/new response")?;
@@ -265,7 +292,11 @@ fn apply_first_class_models(info: &mut DriverInfo, models: &Value) -> bool {
 }
 
 /// What `initialize` tells us, folded into the engine's vocabulary.
-fn driver_info(init: &acp::InitializeResponse, auth: &Option<AuthStatus>) -> DriverInfo {
+fn driver_info(
+    init: &acp::InitializeResponse,
+    auth: &Option<AuthStatus>,
+    open_auth_kind: Option<AuthKind>,
+) -> DriverInfo {
     let mut features = vec![Capability::Permissions];
     if init.agent_capabilities.prompt_capabilities.image {
         features.push(Capability::Images);
@@ -281,11 +312,18 @@ fn driver_info(init: &acp::InitializeResponse, auth: &Option<AuthStatus>) -> Dri
     DriverInfo {
         details: AgentDetails {
             version: init.agent_info.as_ref().map(|i| i.version.clone()),
-            // ACP has no auth-status field on the wire; this is discovery's
-            // offline marker (credential file / env), so it is best-effort: a
-            // stale credential still reads Authenticated until the agent
-            // refuses, which surfaces as `AuthRequired` at the first prompt.
-            auth: auth.clone().unwrap_or(AuthStatus::Unknown),
+            // ACP has no auth-status field on the wire. A marker with a kind
+            // wins (it knows subscription vs key); otherwise reaching this
+            // point proves login for agents that refuse to open logged out
+            // (`open_auth_kind`, probed per agent); the rest stay best-effort.
+            auth: match (auth, open_auth_kind) {
+                (Some(a @ AuthStatus::Authenticated { .. }), _) => a.clone(),
+                (_, Some(kind)) => AuthStatus::Authenticated {
+                    kind,
+                    account: None,
+                },
+                (a, None) => a.clone().unwrap_or(AuthStatus::Unknown),
+            },
             capabilities,
             config_options: Vec::new(),
             commands: Vec::new(),
@@ -1296,9 +1334,17 @@ impl Wire {
             if frame.get("method").is_none() && frame.get("id").and_then(Value::as_u64) == Some(id)
             {
                 if let Some(error) = frame.get("error") {
+                    // `data` rides along, bounded: agents put the useful words
+                    // there (hermes's "No LLM provider configured" is in
+                    // `data`), but it can also be an arbitrary blob.
+                    let mut message = error["message"].as_str().unwrap_or("error").to_owned();
+                    if let Some(data) = frame["error"].get("data").filter(|d| !d.is_null()) {
+                        message =
+                            format!("{message}: {}", crate::adapter::cap(data.to_string(), 500));
+                    }
                     return Err(WireError::Rpc {
                         code: error["code"].as_i64().unwrap_or_default(),
-                        message: error["message"].as_str().unwrap_or("error").to_owned(),
+                        message,
                     });
                 }
                 return Ok(frame.get("result").cloned().unwrap_or_default());
@@ -1352,21 +1398,81 @@ impl WireError {
     }
 }
 
+/// Maps an agent's own logged-out error to `AuthRequired` using the
+/// profile's probed fingerprints (kiro exits before speaking ACP, hermes
+/// fails session/new with a plain internal error); other failures pass.
+fn auth_hinted(
+    error: AgentError,
+    profile: Option<&crate::catalog::AgentProfile>,
+    exe: &std::path::Path,
+) -> AgentError {
+    let Some(profile) = profile else { return error };
+    // Only failure shapes carry the agent's own words; typed errors
+    // (AuthRequired, UnsupportedFeature, …) must pass through untouched.
+    if !matches!(
+        error,
+        AgentError::ProtocolFailed(_) | AgentError::ProcessExited { .. }
+    ) {
+        return error;
+    }
+    let text = error.to_string();
+    if !profile.auth_error_hints.iter().any(|h| text.contains(h)) {
+        return error;
+    }
+    let mut login = crate::discovery::login_methods(profile, exe);
+    // No login command in the catalog (grok): the agent's own TUI is the flow.
+    if !login
+        .iter()
+        .any(|m| matches!(m, LoginMethod::Terminal { .. }))
+    {
+        login.insert(
+            0,
+            LoginMethod::Terminal {
+                description: format!("{} logs in on launch; run it in a terminal", profile.name),
+                command: vec![exe.to_string_lossy().into_owned()],
+                env: std::collections::BTreeMap::new(),
+            },
+        );
+    }
+    AgentError::AuthRequired { login }
+}
+
 /// A terminal auth method becomes a runnable command; agent-driven auth
-/// belongs to `Runtime::login` (P2).
+/// belongs to `Runtime::login` (P2). Qwen predates the typed variant and
+/// advertises `{type: "terminal", args}` inside `_meta` (probed 0.22.0) —
+/// read that shape too.
 fn login_method(method: &acp::AuthMethod, exe: &std::path::Path) -> Option<LoginMethod> {
-    let acp::AuthMethod::Terminal(terminal) = method else {
-        return None;
+    let (name, args, env) = match method {
+        acp::AuthMethod::Terminal(terminal) => (
+            &terminal.name,
+            terminal.args.to_vec(),
+            terminal
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        ),
+        acp::AuthMethod::Agent(agent) => {
+            let meta = agent.meta.as_ref()?;
+            if meta.get("type").and_then(Value::as_str) != Some("terminal") {
+                return None;
+            }
+            let args = meta.get("args").and_then(Value::as_array)?;
+            (
+                &agent.name,
+                args.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect(),
+                std::collections::BTreeMap::new(),
+            )
+        }
+        _ => return None,
     };
     let mut command = vec![exe.to_string_lossy().into_owned()];
-    command.extend(terminal.args.iter().cloned());
+    command.extend(args);
     Some(LoginMethod::Terminal {
-        description: terminal.name.clone(),
+        description: name.clone(),
         command,
-        env: terminal
-            .env
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
+        env,
     })
 }

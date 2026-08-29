@@ -302,6 +302,8 @@ mod tests {
                 AuthMarker::ConfigFile("auth.json", AuthKind::Subscription),
                 AuthMarker::ApiKeyEnv("ANYAGENT_TEST_UNSET_KEY"),
             ],
+            open_auth_kind: None,
+            auth_error_hints: &[],
             login_args: &["login"],
             install_hint: "install fake",
             extra_paths: &["custom/bin"],
