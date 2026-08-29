@@ -7,10 +7,10 @@ use std::time::Duration;
 use futures::StreamExt;
 
 use anyagent::{
-    AgentError, AgentInstallation, Answer, AuthStatus, Capability, ChoiceId, ConfigId,
-    ConfigSelection, ConfigValue, DeliveryKind, Event, EventKind, Events, Input, LoginMethod,
-    McpServer, McpTransport, PermissionChoice, QuestionAnswer, Request, ResumeToken, Runtime,
-    Session, SessionOptions, StopReason,
+    AgentError, AgentInstallation, Answer, AuthStatus, Capability, ChoiceId, ConfigId, ConfigValue,
+    DeliveryKind, Event, EventKind, Events, Input, LoginMethod, McpServer, McpTransport,
+    PermissionChoice, QuestionAnswer, Request, ResumeToken, Runtime, Session, SessionOptions,
+    StopReason,
 };
 
 fn fixture(extra: &[&str]) -> AgentInstallation {
@@ -301,10 +301,7 @@ async fn agent_death_mid_turn_fails_the_turn() {
 #[tokio::test]
 async fn configuring_the_mode_round_trips_and_updates_the_session() {
     let (session, mut events) = open(&[]).await;
-    session
-        .configure(ConfigSelection::option("mode", "plan"))
-        .await
-        .unwrap();
+    session.configure("mode", "plan").await.unwrap();
     loop {
         let event = next(&mut events).await;
         if let EventKind::SessionUpdated(info) = event.kind {
@@ -317,17 +314,32 @@ async fn configuring_the_mode_round_trips_and_updates_the_session() {
     }
     // A value the agent never offered, and an option it never advertised,
     // are typed rejections that never reach the wire.
-    let bad_value = session
-        .configure(ConfigSelection::option("mode", "yolo"))
-        .await;
+    let bad_value = session.configure("mode", "yolo").await;
     assert!(matches!(
         bad_value,
         Err(AgentError::InvalidConfiguration(_))
     ));
-    let unknown = session
-        .configure(ConfigSelection::option("nope", "x"))
-        .await;
+    let unknown = session.configure("nope", "x").await;
     assert!(matches!(unknown, Err(AgentError::InvalidConfiguration(_))));
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn overlapping_configures_both_apply() {
+    // The model reply is delayed past the mode round-trip, so both changes
+    // are in flight at once; each confirmation must land, not just the last.
+    let (session, mut events) = open(&["--config-slow=150"]).await;
+    session.configure("model", "opus").await.unwrap();
+    session.configure("mode", "plan").await.unwrap();
+    let (mut mode, mut model) = (false, false);
+    while !(mode && model) {
+        let event = next(&mut events).await;
+        if let EventKind::SessionUpdated(info) = event.kind {
+            let get = |id: &str| info.configuration.options.get(&ConfigId::new(id)).cloned();
+            mode |= get("mode") == Some(ConfigValue::Text("plan".into()));
+            model |= get("model") == Some(ConfigValue::Text("opus".into()));
+        }
+    }
     session.close().await.unwrap();
 }
 
@@ -666,10 +678,7 @@ async fn grok_first_class_models_surface_as_the_model_option_and_switch_via_set_
 
     // The fixture rejects session/set_config_option for models under
     // --grok-models, so this passing proves the session/set_model route.
-    session
-        .configure(ConfigSelection::option("model", "grok-4.6"))
-        .await
-        .unwrap();
+    session.configure("model", "grok-4.6").await.unwrap();
     loop {
         let event = next(&mut events).await;
         if let EventKind::SessionUpdated(info) = event.kind {

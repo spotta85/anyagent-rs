@@ -350,23 +350,6 @@ pub struct SessionConfiguration {
     pub options: BTreeMap<ConfigId, ConfigValue>,
 }
 
-/// One live change to an advertised option. The model is the option `model`
-/// on every agent that can switch it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum ConfigSelection {
-    Option { id: ConfigId, value: ConfigValue },
-}
-
-impl ConfigSelection {
-    pub fn option(id: impl Into<ConfigId>, value: impl Into<ConfigValue>) -> Self {
-        Self::Option {
-            id: id.into(),
-            value: value.into(),
-        }
-    }
-}
-
 /// How anyagent handles tool permission requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]

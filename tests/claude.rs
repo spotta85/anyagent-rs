@@ -11,9 +11,9 @@ use futures::StreamExt;
 
 use anyagent::{
     AgentError, AgentInstallation, Answer, AuthKind, AuthStatus, Capability, ConfigId, ConfigKind,
-    ConfigSelection, ConfigValue, DeliveryKind, Event, EventKind, Events, Input, LoginMethod,
-    McpServer, MessageId, PermissionChoice, PlanStatus, QuestionAnswer, Request, RollbackScope,
-    Runtime, Session, SessionOptions, StopReason, ToolKind, ToolStatus, TurnOrigin,
+    ConfigValue, DeliveryKind, Event, EventKind, Events, Input, LoginMethod, McpServer, MessageId,
+    PermissionChoice, PlanStatus, QuestionAnswer, Request, RollbackScope, Runtime, Session,
+    SessionOptions, StopReason, ToolKind, ToolStatus, TurnOrigin,
 };
 
 /// A temp dir holding one inlineable png, one pdf, and nothing else.
@@ -774,10 +774,7 @@ async fn configuring_the_mode_round_trips_and_updates_the_session() {
     let advertised = session.info().details.config_options;
     let mode = advertised.iter().find(|o| o.id.as_str() == "mode").unwrap();
     assert_eq!(mode.current, Some(ConfigValue::Text("default".into())));
-    session
-        .configure(ConfigSelection::option("mode", "plan"))
-        .await
-        .unwrap();
+    session.configure("mode", "plan").await.unwrap();
     loop {
         let event = next(&mut events).await;
         if let EventKind::SessionUpdated(info) = event.kind {
@@ -796,10 +793,7 @@ async fn configuring_the_mode_round_trips_and_updates_the_session() {
 #[tokio::test]
 async fn switching_the_model_round_trips_and_updates_the_session() {
     let (session, mut events) = open("model", "").await;
-    session
-        .configure(ConfigSelection::option("model", "sonnet"))
-        .await
-        .unwrap();
+    session.configure("model", "sonnet").await.unwrap();
     loop {
         let event = next(&mut events).await;
         if let EventKind::SessionUpdated(info) = event.kind {

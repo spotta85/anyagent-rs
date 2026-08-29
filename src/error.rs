@@ -8,14 +8,10 @@ use crate::agent::{AgentId, LoginMethod};
 pub enum AgentError {
     #[error("agent not installed: {0}")]
     NotInstalled(AgentId),
-    #[error("several installations of {0} found; pin one with AgentInstallation::at")]
-    AmbiguousInstallation(AgentId),
     #[error("could not start agent: {0}")]
     SpawnFailed(String),
     #[error("agent needs login")]
     AuthRequired { login: Vec<LoginMethod> },
-    #[error("unsupported agent version: {0}")]
-    UnsupportedVersion(String),
     #[error("agent did not finish its handshake in time")]
     HandshakeTimeout,
     #[error("this agent does not support {0}")]

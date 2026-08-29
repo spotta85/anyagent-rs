@@ -11,9 +11,9 @@ use futures::StreamExt;
 
 use anyagent::{
     AgentError, AgentInstallation, Answer, AuthKind, AuthStatus, Capability, ConfigKind,
-    ConfigSelection, ConfigValue, DeliveryKind, Event, EventKind, Events, Input, McpServer,
-    PermissionChoice, PlanStatus, QuestionAnswer, Request, Runtime, Session, SessionOptions,
-    StopReason, ToolKind, ToolStatus,
+    ConfigValue, DeliveryKind, Event, EventKind, Events, Input, McpServer, PermissionChoice,
+    PlanStatus, QuestionAnswer, Request, Runtime, Session, SessionOptions, StopReason, ToolKind,
+    ToolStatus,
 };
 
 /// A `codex` stand-in: a script that execs the fixture with scenario flags,
@@ -227,10 +227,7 @@ async fn model_and_effort_ride_every_turn_and_switch_live() {
     assert!(text.contains("model=gpt-6-mini effort=medium"), "{text}");
 
     // A live switch needs no wire call: the next turn carries it.
-    session
-        .configure(ConfigSelection::option("model", "gpt-6"))
-        .await
-        .unwrap();
+    session.configure("model", "gpt-6").await.unwrap();
     loop {
         if let EventKind::SessionUpdated(info) = next(&mut events).await.kind {
             assert_eq!(text_option(&info, "model").as_deref(), Some("gpt-6"));
@@ -257,10 +254,7 @@ async fn effort_falls_back_when_the_new_model_lacks_it() {
         Some("high")
     );
     // gpt-6-mini has no "high": the effort falls back to its default.
-    session
-        .configure(ConfigSelection::option("model", "gpt-6-mini"))
-        .await
-        .unwrap();
+    session.configure("model", "gpt-6-mini").await.unwrap();
     loop {
         if let EventKind::SessionUpdated(info) = next(&mut events).await.kind {
             assert_eq!(text_option(&info, "effort").as_deref(), Some("low"));
@@ -325,11 +319,7 @@ async fn mode_and_sandbox_are_creation_only_thread_settings() {
         Some("workspace-write")
     );
     // Not live: a mid-session change is refused by the engine.
-    let err = session
-        .configure(ConfigSelection::option("mode", "never"))
-        .await
-        .err()
-        .unwrap();
+    let err = session.configure("mode", "never").await.err().unwrap();
     assert!(matches!(err, AgentError::InvalidConfiguration(_)), "{err}");
     session.close().await.unwrap();
 }

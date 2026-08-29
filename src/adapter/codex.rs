@@ -16,8 +16,8 @@ use crate::adapter::{
 };
 use crate::agent::{
     AccountInfo, AgentDetails, AuthKind, AuthStatus, Capabilities, Capability, ConfigChoice,
-    ConfigId, ConfigKind, ConfigOption, ConfigSelection, ConfigValue, Input, ResumeToken,
-    SessionConfiguration, SessionStart,
+    ConfigId, ConfigKind, ConfigOption, ConfigValue, Input, ResumeToken, SessionConfiguration,
+    SessionStart,
 };
 use crate::error::AgentError;
 use crate::event::{
@@ -572,7 +572,7 @@ impl Drive {
                     self.cancel_pending = true;
                 }
             }
-            DriverCommand::Configure(ConfigSelection::Option { id, value }) => {
+            DriverCommand::Configure(id, value) => {
                 // model and effort are per-turn parameters: apply locally,
                 // the next `turn/start` carries them. mode and sandbox are
                 // creation-only, so the engine never forwards them.

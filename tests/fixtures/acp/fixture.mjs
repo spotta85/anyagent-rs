@@ -28,7 +28,7 @@ async function onRequest(m) {
       // --grok-models: the first-class models state (no model configOption);
       // switching must ride session/set_model.
       if (flag('--grok-models')) return reply({ sessionId: 'sess-1', models: { currentModelId: 'grok-4.5', availableModels: [{ modelId: 'grok-4.5', name: 'Grok 4.5', description: 'fast' }, { modelId: 'grok-4.6', name: 'Grok 4.6' }] } });
-      reply({ sessionId: 'sess-1', modes: { currentModeId: 'default', availableModes: [{ id: 'default', name: 'Default' }, { id: 'plan', name: 'Plan' }] }, configOptions: [{ id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'sonnet', options: [{ value: 'sonnet', name: 'Sonnet' }] }], _meta: { claude: { sessionId: 'uuid-1' } } });
+      reply({ sessionId: 'sess-1', modes: { currentModeId: 'default', availableModes: [{ id: 'default', name: 'Default' }, { id: 'plan', name: 'Plan' }] }, configOptions: [{ id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'sonnet', options: [{ value: 'sonnet', name: 'Sonnet' }, { value: 'opus', name: 'Opus' }] }], _meta: { claude: { sessionId: 'uuid-1' } } });
       // Real ACP agents push the command list as an update just after
       // session/new; --commands-on-open reproduces it so probe can wait for it.
       if (flag('--commands-on-open')) notify('sess-1', { sessionUpdate: 'available_commands_update', availableCommands: [{ name: 'compact', description: 'Compact context' }] });
@@ -41,6 +41,8 @@ async function onRequest(m) {
     case 'session/set_config_option':
       // Under --grok-models there is no model configOption: only set_model works.
       if (m.params.configId !== 'model' || flag('--grok-models')) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32602, message: `unknown config ${m.params.configId}` } });
+      // --config-slow=N: delay the reply so a second configure overlaps it.
+      if (num('--config-slow', 0)) return setTimeout(() => reply({}), num('--config-slow', 0));
       return reply({});
     case 'session/set_model':
       if (!flag('--grok-models')) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32601, message: 'method not found' } });

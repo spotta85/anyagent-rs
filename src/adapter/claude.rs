@@ -15,9 +15,8 @@ use crate::adapter::{
 };
 use crate::agent::{
     AccountInfo, AgentDetails, AuthKind, AuthStatus, Capabilities, Capability, ConfigChoice,
-    ConfigId, ConfigKind, ConfigOption, ConfigSelection, ConfigValue, Input, McpConnection,
-    McpServer, McpTransport, ResumeToken, RollbackScope, SessionConfiguration, SessionStart,
-    SlashCommand,
+    ConfigId, ConfigKind, ConfigOption, ConfigValue, Input, McpConnection, McpServer, McpTransport,
+    ResumeToken, RollbackScope, SessionConfiguration, SessionStart, SlashCommand,
 };
 use crate::error::AgentError;
 use crate::event::{
@@ -79,7 +78,7 @@ impl Adapter for ClaudeAdapter {
                 tools: HashMap::new(),
                 requests: HashMap::new(),
                 messages: HashMap::new(),
-                config: None,
+                configs: Vec::new(),
                 usage_request: None,
                 turn_uuid: None,
                 turn_assistant: None,
@@ -523,8 +522,8 @@ struct Drive {
     requests: HashMap<RequestId, PendingRequest>,
     /// Streaming message id per transcript (main turn and each subagent).
     messages: HashMap<Option<String>, MessageId>,
-    /// An in-flight configure: wire id plus the selection to apply on success.
-    config: Option<(String, ConfigId, ConfigValue)>,
+    /// In-flight configures: wire id plus the selection to apply on success.
+    configs: Vec<(String, ConfigId, ConfigValue)>,
     /// An in-flight `get_usage`, sent after each `result` frame.
     usage_request: Option<String>,
     /// Context occupancy of the latest assistant message.
@@ -605,7 +604,7 @@ impl Drive {
                         .await?;
                 }
             }
-            DriverCommand::Configure(ConfigSelection::Option { id, value }) => {
+            DriverCommand::Configure(id, value) => {
                 let request = match (id.as_str(), &value) {
                     ("mode", ConfigValue::Text(mode)) => {
                         json!({ "subtype": "set_permission_mode", "mode": mode })
@@ -616,7 +615,7 @@ impl Drive {
                     _ => return Ok(()),
                 };
                 let wire_id = self.wire.control(request).await?;
-                self.config = Some((wire_id, id, value));
+                self.configs.push((wire_id, id, value));
             }
             DriverCommand::Rollback(turns, scope) => self.rollback(turns, scope).await?,
             DriverCommand::Close => unreachable!("handled in run"),
@@ -861,11 +860,11 @@ impl Drive {
             return Ok(());
         }
         let for_config = self
-            .config
-            .as_ref()
-            .is_some_and(|(id, _, _)| response["request_id"].as_str() == Some(id));
-        if for_config {
-            let (_, config_id, value) = self.config.take().expect("checked");
+            .configs
+            .iter()
+            .position(|(id, _, _)| response["request_id"].as_str() == Some(id));
+        if let Some(at) = for_config {
+            let (_, config_id, value) = self.configs.remove(at);
             if response["subtype"].as_str() == Some("error") {
                 let message = response["error"].as_str().unwrap_or("rejected");
                 return self
@@ -975,7 +974,7 @@ impl Drive {
                 self.messages.clear();
                 self.tools.clear();
                 self.usage_request = None;
-                self.config = None;
+                self.configs.clear();
                 self.info.resume_token = None;
                 self.emit(DriverEvent::InfoChanged(self.info.clone())).await
             }

@@ -18,8 +18,8 @@ use crate::adapter::{
 };
 use crate::agent::{
     AgentDetails, AuthStatus, Capabilities, Capability, ConfigChoice, ConfigId, ConfigKind,
-    ConfigOption, ConfigSelection, ConfigValue, Input, LoginMethod, McpConnection, McpServer,
-    McpTransport, ResumeToken, SessionConfiguration, SessionStart, SlashCommand,
+    ConfigOption, ConfigValue, Input, LoginMethod, McpConnection, McpServer, McpTransport,
+    ResumeToken, SessionConfiguration, SessionStart, SlashCommand,
 };
 use crate::error::AgentError;
 use crate::event::{
@@ -93,7 +93,7 @@ impl Adapter for AcpAdapter {
                 prompt_meta: None,
                 prompt_seq: 0,
                 steer_id: None,
-                config: None,
+                configs: Vec::new(),
                 first_class_model,
                 login,
             }
@@ -481,8 +481,8 @@ struct Drive {
     prompt_meta: Option<String>,
     prompt_seq: u64,
     steer_id: Option<u64>,
-    /// An in-flight configure: wire id plus the selection to apply on success.
-    config: Option<(u64, ConfigId, ConfigValue)>,
+    /// In-flight configures: wire id plus the selection to apply on success.
+    configs: Vec<(u64, ConfigId, ConfigValue)>,
     /// The agent advertises the first-class `models` state (grok): `model`
     /// selections ride `session/set_model`.
     first_class_model: bool,
@@ -563,11 +563,11 @@ impl Drive {
                         .await?;
                 }
             }
-            DriverCommand::Configure(ConfigSelection::Option { id, value }) => {
+            DriverCommand::Configure(id, value) => {
                 let (method, params) =
                     config_call(&self.session_id, &id, &value, self.first_class_model);
                 let wire_id = self.wire.request(method, params).await?;
-                self.config = Some((wire_id, id, value));
+                self.configs.push((wire_id, id, value));
             }
             DriverCommand::Rollback(turns, _) => {
                 self.diagnostic(
@@ -859,8 +859,8 @@ impl Drive {
             let accepted = frame["result"]["accepted"].as_bool().unwrap_or(false);
             return self.emit(DriverEvent::Steered(accepted)).await;
         }
-        if self.config.as_ref().is_some_and(|(c, _, _)| *c == id) {
-            let (_, config_id, value) = self.config.take().expect("checked");
+        if let Some(at) = self.configs.iter().position(|(c, _, _)| *c == id) {
+            let (_, config_id, value) = self.configs.remove(at);
             if let Some(error) = frame.get("error") {
                 let message = error["message"].as_str().unwrap_or("rejected");
                 return self

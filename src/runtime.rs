@@ -26,8 +26,8 @@ pub struct Runtime {
     /// Installations known without discovery (tests and pinned agents).
     pinned: Vec<AgentInstallation>,
     profiles: &'static [crate::catalog::AgentProfile],
-    /// `plan_usage` results, kept for `USAGE_CACHE_TTL`.
-    usage_cache: Mutex<HashMap<AgentId, (Instant, PlanUsage)>>,
+    /// `plan_usage` results per installation, kept for `USAGE_CACHE_TTL`.
+    usage_cache: Mutex<HashMap<(AgentId, PathBuf), (Instant, PlanUsage)>>,
 }
 
 impl Default for Runtime {
@@ -165,7 +165,8 @@ impl Runtime {
     /// (or with an API-key login) return `UnsupportedFeature`. May spawn a
     /// short-lived agent process; results are cached for 60 s.
     pub async fn plan_usage(&self, agent: &AgentInstallation) -> Result<PlanUsage, AgentError> {
-        if let Some((at, usage)) = self.usage_cache.lock().unwrap().get(&agent.id)
+        let key = (agent.id.clone(), agent.executable_path.clone());
+        if let Some((at, usage)) = self.usage_cache.lock().unwrap().get(&key)
             && at.elapsed() < USAGE_CACHE_TTL
         {
             return Ok(usage.clone());
@@ -178,7 +179,7 @@ impl Runtime {
         self.usage_cache
             .lock()
             .unwrap()
-            .insert(agent.id.clone(), (Instant::now(), usage.clone()));
+            .insert(key, (Instant::now(), usage.clone()));
         Ok(usage)
     }
 

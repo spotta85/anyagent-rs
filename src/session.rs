@@ -16,7 +16,7 @@ use tokio::time::Instant;
 
 use crate::adapter::{DriverCommand, DriverConnection, DriverEvent, DriverInfo};
 use crate::agent::{
-    AgentDetails, AgentInstallation, Capability, ConfigKind, ConfigSelection, ConfigValue, Input,
+    AgentDetails, AgentInstallation, Capability, ConfigId, ConfigKind, ConfigValue, Input,
     LoginMethod, PermissionMode, ResumeToken, RollbackScope, SessionConfiguration, SessionOptions,
 };
 use crate::error::AgentError;
@@ -75,7 +75,7 @@ enum Command {
     Prompt(Input, Reply<Delivery>),
     Dequeue(PromptId, Reply<()>),
     Answer(RequestId, Answer, Reply<()>),
-    Configure(ConfigSelection, Reply<()>),
+    Configure(ConfigId, ConfigValue, Reply<()>),
     Rollback(NonZeroU32, RollbackScope, Reply<()>),
     Cancel { clear_queue: bool, reply: Reply<()> },
     Close(Reply<()>),
@@ -108,9 +108,15 @@ impl Session {
             .await
     }
 
-    /// Applies one model or option selection; confirmed by `SessionUpdated`.
-    pub async fn configure(&self, selection: ConfigSelection) -> Result<(), AgentError> {
-        self.send(|reply| Command::Configure(selection, reply))
+    /// Applies one advertised option (`model`, `mode`, …); confirmed by
+    /// `SessionUpdated`.
+    pub async fn configure(
+        &self,
+        id: impl Into<ConfigId>,
+        value: impl Into<ConfigValue>,
+    ) -> Result<(), AgentError> {
+        let (id, value) = (id.into(), value.into());
+        self.send(|reply| Command::Configure(id, value, reply))
             .await
     }
 
@@ -394,8 +400,8 @@ impl Engine {
             Command::Answer(request, answer, reply) => {
                 let _ = reply.send(self.handle_answer(request, answer).await);
             }
-            Command::Configure(selection, reply) => {
-                let _ = reply.send(self.handle_configure(selection).await);
+            Command::Configure(id, value, reply) => {
+                let _ = reply.send(self.handle_configure(id, value).await);
             }
             Command::Rollback(turns, scope, reply) => {
                 let _ = reply.send(self.handle_rollback(turns, scope).await);
@@ -478,43 +484,43 @@ impl Engine {
 
     /// Validates a selection against the advertised options, then forwards.
     /// The applied change comes back as `SessionUpdated`.
-    async fn handle_configure(&mut self, selection: ConfigSelection) -> Result<(), AgentError> {
+    async fn handle_configure(
+        &mut self,
+        id: ConfigId,
+        value: ConfigValue,
+    ) -> Result<(), AgentError> {
         let details = self
             .info
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .details
             .clone();
-        match &selection {
-            ConfigSelection::Option { id, value } => {
-                let Some(option) = details.config_options.iter().find(|o| &o.id == id) else {
+        let Some(option) = details.config_options.iter().find(|o| o.id == id) else {
+            return Err(AgentError::InvalidConfiguration(format!(
+                "`{id}` is not an advertised option"
+            )));
+        };
+        if !option.live {
+            return Err(AgentError::InvalidConfiguration(format!(
+                "`{id}` is creation-only; set it through SessionOptions"
+            )));
+        }
+        match (&option.kind, &value) {
+            (ConfigKind::Select { choices }, ConfigValue::Text(chosen)) => {
+                if !choices.iter().any(|c| &c.value == chosen) {
                     return Err(AgentError::InvalidConfiguration(format!(
-                        "`{id}` is not an advertised option"
+                        "`{chosen}` is not a choice for `{id}`"
                     )));
-                };
-                if !option.live {
-                    return Err(AgentError::InvalidConfiguration(format!(
-                        "`{id}` is creation-only; set it through SessionOptions"
-                    )));
-                }
-                match (&option.kind, value) {
-                    (ConfigKind::Select { choices }, ConfigValue::Text(chosen)) => {
-                        if !choices.iter().any(|c| &c.value == chosen) {
-                            return Err(AgentError::InvalidConfiguration(format!(
-                                "`{chosen}` is not a choice for `{id}`"
-                            )));
-                        }
-                    }
-                    (ConfigKind::Boolean, ConfigValue::Bool(_)) => {}
-                    _ => {
-                        return Err(AgentError::InvalidConfiguration(format!(
-                            "wrong value type for `{id}`"
-                        )));
-                    }
                 }
             }
+            (ConfigKind::Boolean, ConfigValue::Bool(_)) => {}
+            _ => {
+                return Err(AgentError::InvalidConfiguration(format!(
+                    "wrong value type for `{id}`"
+                )));
+            }
         }
-        self.forward(DriverCommand::Configure(selection)).await
+        self.forward(DriverCommand::Configure(id, value)).await
     }
 
     async fn handle_rollback(
