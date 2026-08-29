@@ -53,10 +53,11 @@ pub struct Session {
     info: Arc<Mutex<SessionInfo>>,
 }
 
-/// Ordered event stream. Buffers 256 events, then applies backpressure.
+/// Ordered event stream. Buffers 256 events from the delivery task.
 ///
-/// Drain it continuously. A full buffer parks the engine, so session commands
-/// wait until the application reads events again.
+/// Drain it continuously. A full buffer parks the delivery task, not the
+/// engine, so `cancel` and `answer` remain responsive even when the consumer
+/// stalls.
 pub struct Events(mpsc::Receiver<Result<Event, AgentError>>);
 
 impl Stream for Events {
@@ -151,7 +152,8 @@ impl Session {
 }
 
 /// Spawns the engine task for a fresh driver connection and hands back the
-/// two handles.
+/// two handles. A delivery task sits between the engine and `Events` so a
+/// full consumer buffer never parks the engine — `cancel` stays responsive.
 pub(crate) fn start(
     agent: AgentInstallation,
     connection: DriverConnection,
@@ -164,7 +166,10 @@ pub(crate) fn start(
         &connection.info,
     )));
     let (commands_tx, commands_rx) = mpsc::channel(64);
-    let (events_tx, events_rx) = mpsc::channel(EVENT_BUFFER);
+    let (bounded_tx, bounded_rx) = mpsc::channel(EVENT_BUFFER);
+    let (events_tx, events_rx) = mpsc::unbounded_channel();
+
+    tokio::spawn(delivery_task(events_rx, bounded_tx));
 
     let engine = Engine {
         id: id.clone(),
@@ -208,8 +213,21 @@ pub(crate) fn start(
             commands: commands_tx,
             info,
         },
-        Events(events_rx),
+        Events(bounded_rx),
     )
+}
+
+/// Forwards from the engine's unbounded channel to the bounded `Events`
+/// channel. Parks only this task when the consumer stalls, not the engine.
+async fn delivery_task(
+    mut rx: mpsc::UnboundedReceiver<Result<Event, AgentError>>,
+    tx: mpsc::Sender<Result<Event, AgentError>>,
+) {
+    while let Some(event) = rx.recv().await {
+        if tx.send(event).await.is_err() {
+            break;
+        }
+    }
 }
 
 /// The quiet window for inferred completion, or `None` when the wire ends
@@ -295,7 +313,7 @@ struct Engine {
     id: SessionId,
     info: Arc<Mutex<SessionInfo>>,
     driver: mpsc::Sender<DriverCommand>,
-    events: mpsc::Sender<Result<Event, AgentError>>,
+    events: mpsc::UnboundedSender<Result<Event, AgentError>>,
     events_alive: bool,
     seq: u64,
     next_turn: u64,
@@ -683,10 +701,13 @@ impl Engine {
         })
         .await;
         if self.events_alive {
-            let _ = self
+            if self
                 .events
                 .send(Err(AgentError::AuthRequired { login }))
-                .await;
+                .is_err()
+            {
+                self.events_alive = false;
+            }
         }
         self.shutdown(None).await;
     }
@@ -710,10 +731,13 @@ impl Engine {
                 .exit
                 .take()
                 .unwrap_or_else(|| ("unknown".into(), String::new()));
-            let _ = self
+            if self
                 .events
                 .send(Err(AgentError::ProcessExited { status, stderr }))
-                .await;
+                .is_err()
+            {
+                self.events_alive = false;
+            }
         }
     }
 
@@ -881,7 +905,9 @@ impl Engine {
     }
 
     /// Assigns the sequence number and delivers. A dropped `Events` stops
-    /// delivery and starts shutdown.
+    /// delivery and starts shutdown. The unbounded channel never parks the
+    /// engine, so `cancel` stays responsive even when the bounded consumer
+    /// buffer is full.
     async fn push(&mut self, turn: Option<TurnContext>, kind: EventKind, extensions: Extensions) {
         if !self.events_alive {
             return;
@@ -894,7 +920,7 @@ impl Engine {
             kind,
             extensions,
         };
-        if self.events.send(Ok(event)).await.is_err() {
+        if self.events.send(Ok(event)).is_err() {
             self.events_alive = false;
             self.begin_close(None).await;
         }

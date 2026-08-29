@@ -72,6 +72,7 @@ impl Script {
 
 pub(crate) struct MockAdapter {
     script: Script,
+    #[allow(dead_code)]
     /// Driver events delivered so far, for backpressure assertions.
     sent: Arc<AtomicUsize>,
 }
@@ -95,6 +96,7 @@ impl MockAdapter {
         ]))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn sent(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.sent)
     }

@@ -1,7 +1,6 @@
 //! Session-engine contract tests, driven through the public interface with
 //! the scripted mock adapter. Every adapter must satisfy these.
 
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -287,7 +286,7 @@ async fn bookkeeping_after_turn_end_is_not_a_turn_and_late_stops_are_diagnostics
 }
 
 #[tokio::test]
-async fn slow_consumer_applies_backpressure_without_losing_events() {
+async fn slow_consumer_does_not_lose_events() {
     let mut steps: Vec<Step> = (0..1000)
         .map(|i| Step::Emit(text("m1", &format!("{i} "))))
         .collect();
@@ -299,16 +298,15 @@ async fn slow_consumer_applies_backpressure_without_losing_events() {
         }
         .turn(steps),
     );
-    let sent = adapter.sent();
     let (session, mut events) = open(adapter, None).await;
     session.prompt("go").await.unwrap();
 
+    // Slow consumer: do not drain for a bit, then verify nothing was lost
+    // and ordering is preserved. The delivery task buffers between the engine
+    // and the bounded `Events` channel, so the driver may have already sent
+    // all 1000 deltas — that is fine; the invariant is no loss, not that the
+    // driver was held back.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let buffered = sent.load(Ordering::SeqCst);
-    assert!(
-        buffered < 1001,
-        "driver was not held back: {buffered} events sent"
-    );
 
     let mut texts = 0;
     let mut last_seq = 0;
@@ -323,6 +321,46 @@ async fn slow_consumer_applies_backpressure_without_losing_events() {
         }
     }
     assert_eq!(texts, 1000);
+}
+
+#[tokio::test]
+async fn cancel_is_not_blocked_by_full_event_buffer() {
+    // Flood the bounded buffer (256) without draining, then cancel.
+    // Before the fix the engine parked mid-send and `cancel` would time out.
+    let steps: Vec<Step> = (0..500)
+        .map(|i| Step::Emit(text("m1", &format!("{i} "))))
+        .collect();
+    // No End — turn stays open until cancelled.
+    let adapter = MockAdapter::new(Script::default().turn(steps));
+    let (session, mut events) = open(adapter, None).await;
+    session.prompt("go").await.unwrap();
+
+    // Let the engine fill the consumer buffer and park the delivery task.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    tokio::time::timeout(Duration::from_secs(1), session.cancel(false))
+        .await
+        .expect("cancel was blocked by backpressure")
+        .expect("cancel failed");
+
+    // Drain until the cancelled turn ends; sequence must stay monotonic.
+    let mut last_seq = 0;
+    let mut ended = false;
+    while let Ok(event) = tokio::time::timeout(Duration::from_secs(2), next(&mut events)).await {
+        assert!(event.sequence > last_seq);
+        last_seq = event.sequence;
+        if matches!(
+            event.kind,
+            EventKind::TurnEnded {
+                stop: StopReason::Cancelled,
+                ..
+            }
+        ) {
+            ended = true;
+            break;
+        }
+    }
+    assert!(ended, "expected a Cancelled TurnEnded after cancel");
 }
 
 #[tokio::test]
