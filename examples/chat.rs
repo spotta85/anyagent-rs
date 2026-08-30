@@ -1,8 +1,13 @@
-//! Terminal chat with an installed agent.
+//! Terminal chat with an installed agent — the core loop most apps build on.
 //!
 //! ```sh
-//! cargo run --example chat -- claude
+//! cargo run --example chat -- claude     # or codex, grok, kiro, …
 //! ```
+//!
+//! The shape: `discover` finds the agent, `open` gives you a `Session`
+//! handle plus one `Events` stream, and everything the agent does — text,
+//! tools, permission requests, turn boundaries — arrives on that stream as
+//! the same typed events regardless of which agent is on the other end.
 
 use anyagent::{Answer, EventKind, PermissionChoice, Request, Runtime, SessionOptions, StopReason};
 use futures::StreamExt;
@@ -20,6 +25,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (session, mut events) = runtime.open(agent, SessionOptions::in_dir(".")).await?;
     println!("· connected — type a message\n");
 
+    // `Session` is cheap to clone; prompt from one task, drain events in
+    // another. A prompt sent mid-turn steers the running turn (or queues,
+    // if the agent can't steer) — no special API needed.
     let prompter = session.clone();
     tokio::spawn(async move {
         let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();

@@ -1,5 +1,5 @@
 # anyagent
-### Build using the subscriptions your users already pay for. 
+### For apps that want to use the AI subscriptions a user already pays for. 
 
 [![CI](https://github.com/spotta85/anyagent-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/spotta85/anyagent-rs/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/anyagent.svg)](https://crates.io/crates/anyagent)
@@ -66,6 +66,18 @@ token usage, permission requests, subagents, and turn boundaries — the same
 `EventKind`s for every agent. Anything provider-specific rides in
 `extensions` instead of leaking into the types.
 
+## Examples
+
+[`examples/`](examples/) is the tour — small, commented programs that run
+against the agents on your machine:
+
+- [`chat.rs`](examples/chat.rs) — the core loop: prompt, stream events,
+  answer permissions. Typing mid-turn steers the running turn.
+- [`sessions.rs`](examples/sessions.rs) — several sessions at once, then
+  resuming one by token.
+- [`probe.rs`](examples/probe.rs) — discover installed agents and probe
+  their login state, models, commands, and capabilities.
+
 ## Supported agents
 
 | Agent | Wire |
@@ -85,6 +97,9 @@ Guides, concepts, and the full event reference live at
 
 The generated API reference — every type and signature — is on
 [docs.rs/anyagent](https://docs.rs/anyagent).
+
+## Contributions
+Contributions are welcome! Please be sure to open an issue first. Upon approval you may create a pr. Please avoid contributing AI-Slop :) ... unless fable wrote it. 
 
 ## License
 

@@ -21,17 +21,31 @@
     }
   },
   "contextual": {
-    "options": ["copy", "view", "claude", "chatgpt", "cursor", "vscode"]
+    "options": [
+      "copy",
+      "view",
+      "claude",
+      "chatgpt",
+      "cursor",
+      "vscode"
+    ]
   },
   "navigation": {
     "groups": [
       {
         "group": "Getting started",
-        "pages": ["index", "quickstart", "supported-agents"]
+        "pages": [
+          "index",
+          "quickstart",
+          "features",
+          "supported-agents"
+        ]
       },
       {
         "group": "Concepts",
-        "pages": ["concepts"]
+        "pages": [
+          "concepts"
+        ]
       },
       {
         "group": "Guides",
@@ -46,8 +60,14 @@
   },
   "navbar": {
     "links": [
-      { "label": "crates.io", "href": "https://crates.io/crates/anyagent" },
-      { "label": "API reference", "href": "https://docs.rs/anyagent" }
+      {
+        "label": "crates.io",
+        "href": "https://crates.io/crates/anyagent"
+      },
+      {
+        "label": "API reference",
+        "href": "https://docs.rs/anyagent"
+      }
     ],
     "primary": {
       "type": "github",

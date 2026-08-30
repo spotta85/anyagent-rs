@@ -77,18 +77,15 @@ anyagent approves each request without forwarding it.
 
 ## Run the examples
 
-The repo ships two runnable examples:
+The repo's [`examples/`](https://github.com/spotta85/anyagent/tree/main/examples)
+folder is the tour — small, commented programs against the real agents on
+your machine:
 
 ```bash
-cargo run --example chat -- claude
+cargo run --example chat -- claude      # the core loop: prompt, stream, answer
+cargo run --example sessions -- claude  # several sessions at once, then resume
+cargo run --example probe               # what's installed, logged in, and capable
 ```
-
-```bash
-cargo run --example probe
-```
-
-`chat` is a terminal chat loop against one agent. `probe` reports what is
-installed and whether it is logged in.
 
 ## Next
 
