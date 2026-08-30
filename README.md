@@ -1,24 +1,23 @@
 # anyagent
+### Build using the subscriptions your users already pay for. 
 
 [![CI](https://github.com/spotta85/anyagent/actions/workflows/ci.yml/badge.svg)](https://github.com/spotta85/anyagent/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/anyagent.svg)](https://crates.io/crates/anyagent)
 [![docs.rs](https://img.shields.io/docsrs/anyagent)](https://docs.rs/anyagent)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-One Rust interface to the coding agents installed on a machine.
+### One Up-to-date, feature-rich Rust interface to the agents already on a users machine.
 
 Users have Claude Code, Codex, Grok, OpenCode, Kiro, and friends on their
 machines — each with its own CLI, protocol, and quirks. If you're building an
 app on top of them, you end up writing and maintaining a driver per agent.
-anyagent is that layer, once: it finds the agents, speaks each one's protocol
+anyagent is that layer, **once: it finds the agents, speaks each one's protocol
 (native or [ACP](https://agentclientprotocol.com)), and gives you one typed
-API — `Runtime`, `Session`, and a stream of `Events`.
+API — `Runtime`, `Session`, and a stream of `Events`**.
 
+#### Your app keeps its own transcript, UI, and policy. anyagent owns the processes, the wires, and the turn rules — every agent behaves the same way through it.
 ![alt text](image.png)
 
-Your app keeps its own transcript, UI, and policy. anyagent owns the
-processes, the wires, and the turn rules — every agent behaves the same way
-through it.
 
 ## Use
 
