@@ -99,7 +99,7 @@ The generated API reference — every type and signature — is on
 [docs.rs/anyagent](https://docs.rs/anyagent).
 
 ## Contributions
-Contributions are welcome! Please be sure to open an issue first. Upon approval you may create a pr. Please avoid contributing AI-Slop :) ... unless fable wrote it. 
+Contributions are welcome! Please be sure to open an issue first. Upon approval you may create a pr. Please avoid contributing AI-Slop :) ... unless fable wrote it. Read Contributions.md for more specifics!
 
 ## License
 
