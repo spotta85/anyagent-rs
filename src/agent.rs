@@ -384,10 +384,12 @@ pub(crate) enum SessionStart {
     },
 }
 impl SessionOptions {
-    /// Working directory the agent runs in. Required.
+    /// Working directory the agent runs in. Required. A relative path is made
+    /// absolute (lexically, no disk access): some agents reject a relative cwd.
     pub fn in_dir(cwd: impl Into<PathBuf>) -> Self {
+        let cwd = cwd.into();
         Self {
-            cwd: cwd.into(),
+            cwd: std::path::absolute(&cwd).unwrap_or(cwd),
             start: SessionStart::New,
             permission_mode: PermissionMode::Ask,
             quiet_window: None,
@@ -504,5 +506,21 @@ impl From<&str> for Input {
 impl From<String> for Input {
     fn from(text: String) -> Self {
         Self::text(text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn in_dir_makes_cwd_absolute() {
+        // Agents such as grok reject a relative cwd at `session/new`.
+        assert_eq!(
+            SessionOptions::in_dir(".").cwd(),
+            &std::env::current_dir().unwrap()
+        );
+        let abs = std::env::temp_dir();
+        assert_eq!(SessionOptions::in_dir(&abs).cwd(), &abs);
     }
 }

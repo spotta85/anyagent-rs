@@ -161,6 +161,24 @@ impl Runtime {
         Ok(details)
     }
 
+    /// Fast auth-only probe: does not wait for `availableCommands` (saves
+    /// `PROBE_COMMANDS_WAIT`). Use when only `auth` is needed (e.g. kiro).
+    pub async fn probe_auth(&self, agent: &AgentInstallation) -> Result<AuthStatus, AgentError> {
+        let opened = self
+            .open(agent, SessionOptions::in_dir(std::env::temp_dir()))
+            .await;
+        match opened {
+            Err(AgentError::AuthRequired { login }) => Ok(AuthStatus::Unauthenticated { login }),
+            Err(e) => Err(e),
+            Ok((session, _events)) => {
+                let auth = session.info().details.auth.clone();
+                // _events dropped here; close shuts down the child.
+                session.close().await.ok();
+                Ok(auth)
+            }
+        }
+    }
+
     /// Agents without quota
     /// (or with an API-key login) return `UnsupportedFeature`. May spawn a
     /// short-lived agent process; results are cached for 60 s.

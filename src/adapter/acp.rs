@@ -189,6 +189,14 @@ async fn handshake(
         apply_session_config(&mut info, new.modes.as_ref(), new.config_options.as_deref());
         new.session_id.0.to_string()
     } else {
+        // A resumed session reports its modes and options the same way a new
+        // one does (probed against opencode 1.18: `session/load` answers with
+        // the full `configOptions`). Skipping this left a reattached thread
+        // with no model or mode to switch. Parsing is best-effort: an agent
+        // that answers `null` still resumes, just without the surface.
+        if let Ok(loaded) = parse::<acp::LoadSessionResponse>(response, "session/load response") {
+            apply_session_config(&mut info, loaded.modes.as_ref(), loaded.config_options.as_deref());
+        }
         session_id
     };
     let first_class_model =
