@@ -1,0 +1,47 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "anyagent",
+  "description": "One Rust interface to the coding agents installed on a machine.",
+  "colors": {
+    "primary": "#1f1f1f",
+    "light": "#f5f5f5",
+    "dark": "#0d0d0d"
+  },
+  "navigation": {
+    "groups": [
+      {
+        "group": "Getting started",
+        "pages": ["index", "quickstart", "supported-agents"]
+      },
+      {
+        "group": "Concepts",
+        "pages": ["concepts"]
+      },
+      {
+        "group": "Guides",
+        "pages": [
+          "guides/discovery",
+          "guides/sessions",
+          "guides/events",
+          "guides/conversations"
+        ]
+      }
+    ]
+  },
+  "navbar": {
+    "links": [
+      { "label": "crates.io", "href": "https://crates.io/crates/anyagent" },
+      { "label": "docs.rs", "href": "https://docs.rs/anyagent" }
+    ],
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/spotta85/anyagent"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/spotta85/anyagent"
+    }
+  }
+}

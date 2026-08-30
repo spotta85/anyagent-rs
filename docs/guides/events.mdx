@@ -1,0 +1,172 @@
+---
+title: "Events"
+description: "Every EventKind, and what it means for your UI."
+---
+
+`Events` is a stream of `Result<Event, AgentError>`. One `Event` carries a
+`kind` plus routing fields:
+
+```rust
+pub struct Event {
+    pub sequence: u64,                   // starts at 1, increases per session
+    pub session_id: SessionId,
+    pub turn_info: Option<TurnContext>,  // present when it belongs to a turn
+    pub kind: EventKind,
+    pub extensions: Extensions,          // provider data, not normalized
+}
+
+pub struct TurnContext {
+    pub id: TurnId,
+    pub parent_tool_id: Option<ToolId>,  // set when a subagent produced it
+}
+```
+
+The same variants arrive for every agent. Anything provider-specific rides in
+`extensions` instead of becoming a new type.
+
+## Turn boundaries
+
+<ResponseField name="TurnStarted" type="{ origin }">
+  `TurnOrigin::Prompt(id)` when your prompt started it, `TurnOrigin::Agent` when
+  the agent woke itself — usually background work finishing.
+</ResponseField>
+
+<ResponseField name="TurnEnded" type="{ stop, background }">
+  Arrives exactly once per turn. `background` lists tools still running.
+</ResponseField>
+
+`StopReason` is one of:
+
+| Variant | Meaning |
+|---|---|
+| `Completed { source: Protocol }` | The wire said the turn was done |
+| `Completed { source: Inferred }` | The wire went quiet; anyagent called it |
+| `Cancelled` | You called `session.cancel(..)` |
+| `Refused` | The agent declined the work |
+| `Failed { message }` | The turn broke |
+
+<Tip>
+Render `Inferred` as "idle", not as a completed checkmark. It means anyagent
+stopped waiting, not that the agent said it was finished.
+</Tip>
+
+## Text
+
+<ResponseField name="TextDelta" type="{ message_id, text }">
+  A chunk of assistant output. Append it.
+</ResponseField>
+
+<ResponseField name="ReasoningDelta" type="{ message_id, text }">
+  A chunk of the agent's thinking. Usually rendered separately, or collapsed.
+</ResponseField>
+
+<ResponseField name="UserMessage" type="{ message_id, text }">
+  User-role content the *provider* originated — for example a parent agent
+  steering a subagent. Never a replay of your own prompt.
+</ResponseField>
+
+<ResponseField name="MessageEnded" type="{ message_id }">
+  No more deltas will arrive for this message.
+</ResponseField>
+
+## Tools
+
+<ResponseField name="ToolUpdated" type="ToolUpdate">
+  A **cumulative snapshot** of one tool call — start, each change, completion.
+  Replace your stored copy by `id`; don't try to merge deltas.
+</ResponseField>
+
+<ResponseField name="ToolOutputDelta" type="{ tool_id, text }">
+  Streamed output from a running command tool.
+</ResponseField>
+
+A `ToolUpdate` holds:
+
+```rust
+pub struct ToolUpdate {
+    pub id: ToolId,
+    pub kind: ToolKind,          // Read, Edit, Execute, Mcp { .. }, Subagent, …
+    pub title: String,           // human-readable, ready to display
+    pub status: ToolStatus,
+    pub input: ToolInput,
+    pub output: Option<String>,
+    pub diffs: Vec<FileDiff>,    // typed, for edits
+    pub locations: Vec<PathBuf>, // files it touched
+    pub raw: Option<RawTool>,    // the agent's own name + raw input
+}
+```
+
+`kind` is normalised across agents, so one renderer covers all of them. When
+`kind` is `Subagent`, the events it produces carry that tool's id in
+`turn_info.parent_tool_id` — that's how you nest a subagent's work under its
+parent in a UI.
+
+## Plans
+
+<ResponseField name="PlanUpdated" type="{ entries }">
+  The agent's full current task list. It **replaces** the previous one — don't
+  append.
+</ResponseField>
+
+## Requests
+
+<ResponseField name="RequestOpened" type="Request">
+  A permission or question needing an answer. See
+  [Sessions](/guides/sessions#answering-requests).
+</ResponseField>
+
+<ResponseField name="RequestClosed" type="{ request_id }">
+  Resolved — by your answer, or by the agent withdrawing it. Clear your UI here.
+</ResponseField>
+
+## Session and usage
+
+<ResponseField name="SessionUpdated" type="SessionInfo">
+  A new snapshot: configuration, resume token, title. Emitted after
+  `configure`, `rollback`, and whenever the agent renames the session.
+</ResponseField>
+
+<ResponseField name="ContextUsage" type="{ used_tokens, window_tokens, cost_usd }">
+  How full this session's context window is.
+</ResponseField>
+
+<ResponseField name="ContextCompacted" type="—">
+  The agent compacted its context. The next `ContextUsage` will drop.
+</ResponseField>
+
+<ResponseField name="PlanUsageUpdated" type="PlanUsage">
+  Account quota, pushed by the adapter without you asking.
+</ResponseField>
+
+<ResponseField name="Diagnostic" type="Diagnostic">
+  Something worth surfacing that isn't fatal — a rejected rollback, a wire
+  oddity. Log these; they're where the "why didn't that work" answer lives.
+</ResponseField>
+
+## A dispatcher shape
+
+```rust
+while let Some(event) = events.next().await {
+    let event = event?;
+    let nested = event
+        .turn_info
+        .as_ref()
+        .is_some_and(|t| t.parent_tool_id.is_some());
+
+    match event.kind {
+        EventKind::TextDelta { text, .. } if !nested => ui.append(text),
+        EventKind::ToolUpdated(tool) => ui.upsert_tool(tool),
+        EventKind::PlanUpdated { entries } => ui.set_plan(entries),
+        EventKind::RequestOpened(request) => ui.ask(request),
+        EventKind::RequestClosed { request_id } => ui.clear_request(request_id),
+        EventKind::Diagnostic(d) => tracing::warn!(?d),
+        EventKind::TurnEnded { stop, background } => ui.end_turn(stop, background),
+        _ => {}
+    }
+}
+```
+
+<Note>
+`EventKind` is `#[non_exhaustive]`. Always keep a `_ => {}` arm so a new variant
+doesn't break your build.
+</Note>

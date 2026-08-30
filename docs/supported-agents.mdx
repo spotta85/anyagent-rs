@@ -1,0 +1,74 @@
+---
+title: "Supported agents"
+description: "What ships in the catalog, and how to connect one that doesn't."
+---
+
+anyagent ships a catalog of known agents. Each entry says how to find the CLI,
+how to launch it in protocol mode, and the quirks that were verified against a
+real install.
+
+## Catalog
+
+| Agent | id | CLI | Wire | Install |
+|---|---|---|---|---|
+| Claude Code | `claude` | `claude` | native (stream-json) | `npm install -g @anthropic-ai/claude-code` |
+| Codex | `codex` | `codex` | native (app-server) | `npm install -g @openai/codex` |
+| Antigravity | `antigravity` | `agy` | native | [antigravity.google](https://antigravity.google), then `agy install` |
+| Grok | `grok` | `grok` | ACP | `npm install -g @xai-official/grok` |
+| Hermes Agent | `hermes` | `hermes` | ACP | [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) |
+| opencode | `opencode` | `opencode` | ACP | `brew install sst/tap/opencode` |
+| Kiro CLI | `kiro` | `kiro-cli` | ACP | [kiro.dev](https://kiro.dev) |
+| Qwen Code | `qwen` | `qwen` | ACP | `npm install -g @qwen-code/qwen-code` |
+
+<Note>
+Gemini CLI was removed in favour of Antigravity after Google sunset personal
+OAuth for it.
+</Note>
+
+## Any other ACP agent
+
+You don't need a catalog entry to use an agent that speaks
+[ACP](https://agentclientprotocol.com). Build the installation yourself:
+
+```rust
+use anyagent::{AgentInstallation, Runtime, SessionOptions};
+
+let agent = AgentInstallation::acp(
+    "my-agent",                    // display name
+    "/usr/local/bin/my-agent",     // executable
+    vec!["acp".into()],            // args that put it in ACP mode
+);
+
+let (session, events) = Runtime::new()
+    .open(&agent, SessionOptions::in_dir("."))
+    .await?;
+```
+
+Everything downstream — events, requests, capabilities — is identical. What you
+lose is the catalog's verified quirks: launch flags, login markers, and auth
+error hints. Guessed flags don't ship, so an unverified agent gets the plain
+launch path.
+
+## Pointing at a specific binary
+
+Every catalog entry reads an environment variable first, which is the easiest
+way to test a build that isn't on `PATH`:
+
+```bash
+ANYAGENT_CLAUDE_BIN=/path/to/claude cargo run --example probe
+```
+
+The pattern is `ANYAGENT_<AGENT>_BIN`. Or skip discovery entirely with
+`AgentInstallation::at(id, executable)`.
+
+## Several logins of the same agent
+
+Give each one its own config directory:
+
+```rust
+SessionOptions::in_dir(".").config_home("/path/to/work-account")
+```
+
+anyagent sets the agent's own config-home variable (`CLAUDE_CONFIG_DIR`,
+`CODEX_HOME`, …) for that process. Agents whose profile has no such variable
+ignore the option.

@@ -1,0 +1,101 @@
+---
+title: "Quickstart"
+description: "Install anyagent and run one turn against a real agent."
+---
+
+## Requirements
+
+- Rust 1.88 or newer (edition 2024)
+- A [supported agent](/supported-agents) installed and logged in
+- An async runtime — the examples use `tokio`
+
+## Install
+
+```toml
+[dependencies]
+anyagent = "0.0.1"
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+```
+
+## One turn
+
+```rust
+use anyagent::{EventKind, Runtime, SessionOptions};
+use futures::StreamExt;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = Runtime::new();
+
+    // Find what's on this machine, then insist on one of them.
+    let report = runtime.discover().await;
+    let agent = report.require("claude")?;
+
+    // Open a session; you get a command handle and an event stream.
+    let (session, mut events) = runtime.open(agent, SessionOptions::in_dir(".")).await?;
+
+    session.prompt("explain this repo").await?;
+
+    while let Some(event) = events.next().await {
+        match event?.kind {
+            EventKind::TextDelta { text, .. } => print!("{text}"),
+            EventKind::TurnEnded { .. } => break,
+            _ => {}
+        }
+    }
+
+    session.close().await?;
+    Ok(())
+}
+```
+
+<Note>
+`Session` is cheap to clone and every clone talks to the same engine task, so
+you can prompt from one task while another drains `Events`.
+</Note>
+
+## Handling a permission
+
+Most real turns hit a permission request. Answer it and the turn continues:
+
+```rust
+use anyagent::{Answer, EventKind, PermissionChoice, Request};
+
+EventKind::RequestOpened(Request::Permission(request)) => {
+    println!("allow {}?", request.tool.title);
+    session
+        .answer(request.id, Answer::Permission(PermissionChoice::AllowOnce))
+        .await?;
+}
+```
+
+If you don't want to make that call yourself, open the session with
+`SessionOptions::in_dir(".").permission_mode(PermissionMode::AutoApprove)` and
+anyagent approves each request without forwarding it.
+
+## Run the examples
+
+The repo ships two runnable examples:
+
+```bash
+cargo run --example chat -- claude
+```
+
+```bash
+cargo run --example probe
+```
+
+`chat` is a terminal chat loop against one agent. `probe` reports what is
+installed and whether it is logged in.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Concepts" icon="book" href="/concepts">
+    The vocabulary the API is built on.
+  </Card>
+  <Card title="Sessions" icon="terminal" href="/guides/sessions">
+    Steering, queuing, cancelling, configuring.
+  </Card>
+</CardGroup>

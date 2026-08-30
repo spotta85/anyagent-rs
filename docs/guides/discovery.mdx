@@ -1,0 +1,106 @@
+---
+title: "Discovery and auth"
+description: "Find the agents on a machine and check whether they are usable."
+---
+
+## Discover
+
+`discover()` scans `PATH` plus each profile's extra install locations and
+reports what it found — and what it looked for and missed.
+
+```rust
+use anyagent::Runtime;
+
+let runtime = Runtime::new();
+let report = runtime.discover().await;
+
+for agent in &report.installed {
+    println!("{} at {}", agent.name, agent.executable_path.display());
+}
+for missing in &report.missing {
+    println!("{} not found — {}", missing.name, missing.install_hint);
+}
+```
+
+`MissingAgent` carries the install hint, so "Codex isn't installed" and "here's
+how to install it" are the same lookup.
+
+### Insisting on one
+
+```rust
+let agent = report.require("claude")?;
+```
+
+`require` returns `AgentError` naming the agent and its install hint when it
+isn't there, which is usually the error you want to bubble straight to the user.
+
+<Tip>
+Discovery is filesystem work only — no processes launched, no network. Call
+`runtime.prewarm()` early if you want the scan warmed before the user needs it.
+</Tip>
+
+## Probe
+
+Discovery says an agent exists. `probe` starts it and asks what it can actually
+do:
+
+```rust
+let details = runtime.probe(&agent).await?;
+
+println!("version {:?}", details.version);
+println!("auth: {:?}", details.auth);
+
+for option in &details.config_options {
+    println!("option {} = {:?}", option.id.as_str(), option.value);
+}
+for command in &details.commands {
+    println!("/{}", command.name);
+}
+```
+
+`AgentDetails` gives you the version, auth status, capabilities, config options,
+and slash commands in one call.
+
+### Auth only
+
+If you only need the login state, `probe_auth` is the cheaper path:
+
+```rust
+let status = runtime.probe_auth(&agent).await?;
+```
+
+It answers from login markers where an agent has an honest one, and falls back
+to asking the agent when it doesn't. Kiro CLI is the second case: its credential
+lives in a sqlite row that exists logged out too, so discovery reports `Unknown`
+and the probe gives the real answer.
+
+<Warning>
+anyagent never reads or holds credentials. It checks whether a marker exists,
+or asks the agent itself.
+</Warning>
+
+## Plan usage
+
+How much subscription quota the logged-in account has burned:
+
+```rust
+let usage = runtime.plan_usage(&agent).await?;
+```
+
+For a dashboard across everything installed:
+
+```rust
+for entry in runtime.plan_usage_all().await {
+    println!("{}: {:?}", entry.agent.name, entry.usage);
+}
+```
+
+Only agents reporting `Capability::PlanUsage` return real numbers. Plan usage is
+about the *account*; for how full the current conversation is, watch
+`EventKind::ContextUsage` instead.
+
+## Logging in
+
+anyagent does not drive login flows. Each catalog entry knows the agent's own
+login command (`claude auth login`, `codex login`, …) — surface that to the user
+and let the agent's own flow run.

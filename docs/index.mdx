@@ -1,0 +1,55 @@
+---
+title: "anyagent"
+description: "One Rust interface to the coding agents installed on a machine."
+---
+
+Users have Claude Code, Codex, Grok, opencode, Kiro, and friends on their
+machines — each with its own CLI, protocol, and quirks. If you build an app on
+top of them, you end up writing a driver per agent.
+
+anyagent is that layer, written once. It finds the agents, speaks each one's
+protocol (native or [ACP](https://agentclientprotocol.com)), and gives you one
+typed API.
+
+## The whole flow
+
+```text
+Runtime::discover()  ->  Runtime::open()  ->  (Session, Events)
+```
+
+- **`Runtime`** finds agents and opens sessions.
+- **`Session`** is the command handle: prompt, answer, configure, cancel.
+- **`Events`** is the stream coming back: text, tool calls, requests, turn ends.
+
+Your app keeps its own transcript, UI, and policy. anyagent owns the processes,
+the wires, and the turn rules — so every agent behaves the same way through it.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="play" href="/quickstart">
+    Install the crate and run your first turn.
+  </Card>
+  <Card title="Concepts" icon="book" href="/concepts">
+    Session, turn, prompt, steer, request — the shared vocabulary.
+  </Card>
+  <Card title="Supported agents" icon="list" href="/supported-agents">
+    What ships in the catalog, and how to add your own ACP agent.
+  </Card>
+  <Card title="Events" icon="bolt" href="/guides/events">
+    Every `EventKind` and what it means.
+  </Card>
+</CardGroup>
+
+## Design rules
+
+Three rules keep the interface honest:
+
+1. **Same types for every agent.** Anything provider-specific rides in
+   `extensions` instead of leaking into the API.
+2. **Capabilities are reported, not assumed.** After `open`, the session tells
+   you what this agent can actually do on this connection.
+3. **A turn ends exactly once.** Whether the wire said so or anyagent inferred
+   it, you get one `TurnEnded`.
+
+## License
+
+MIT or Apache-2.0.

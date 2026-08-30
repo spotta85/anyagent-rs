@@ -1,0 +1,118 @@
+---
+title: "Conversations"
+description: "Resume, fork, rewind, and hand the agent your MCP servers."
+---
+
+## Resume
+
+Every `SessionInfo` carries a `resume_token` once the agent has one. Store it,
+and you can reopen the same conversation later.
+
+```rust
+// Grab it while the session is alive.
+let token = session.info().resume_token.clone();
+
+// Later — a new process, a new day.
+let (session, events) = runtime
+    .open(&agent, SessionOptions::in_dir(".").resume(token.unwrap()))
+    .await?;
+```
+
+The token is opaque and agent-owned. Store it as-is; don't parse it. The
+session id names the live handle and is not a resume token — those are two
+different things.
+
+Requires `Capability::Resume`.
+
+## Fork
+
+Forking opens a **new** session starting from an existing one's history. The
+original is untouched, which is what you want for "try this a different way".
+
+```rust
+let options = SessionOptions::in_dir(".").fork_from(token, Some(message_id));
+let (branch, branch_events) = runtime.open(&agent, options).await?;
+```
+
+Pass `Some(message_id)` to branch from a specific point in the history, or
+`None` to branch from the end. Requires `Capability::Fork`.
+
+## Rollback
+
+Rollback rewinds the current session in place, by completed turns.
+
+```rust
+use anyagent::RollbackScope;
+use std::num::NonZeroU32;
+
+session
+    .rollback(NonZeroU32::new(2).unwrap(), RollbackScope::Conversation)
+    .await?;
+```
+
+Two scopes:
+
+| Scope | What it rewinds | Needs |
+|---|---|---|
+| `Conversation` | Provider-owned conversation context only | `Capability::Rollback` |
+| `ConversationAndFiles` | Context **and** the files the dropped turns changed | `Capability::RollbackFiles` |
+
+The session must be idle. Success is confirmed by `SessionUpdated`; a rejection
+comes back as a `Diagnostic`, not an error from `rollback` itself.
+
+<Warning>
+`ConversationAndFiles` writes to the working tree. Make sure the user knows,
+and check `RollbackFiles` before offering the option — not every agent has it.
+</Warning>
+
+## Fork vs rollback
+
+<CardGroup cols={2}>
+  <Card title="Fork" icon="git-branch">
+    New session, old one survives. Use when the user might want both branches.
+  </Card>
+  <Card title="Rollback" icon="rotate-left">
+    Same session, history dropped. Use when the last few turns were a mistake.
+  </Card>
+</CardGroup>
+
+## MCP servers
+
+Hand the agent your own MCP servers at open time. Three transports:
+
+```rust
+use anyagent::{McpServer, SessionOptions};
+
+let options = SessionOptions::in_dir(".")
+    .mcp_server(McpServer::stdio("local", "/usr/bin/my-server", ["--stdio"]))
+    .mcp_server(McpServer::http("remote", "https://example.com/mcp"))
+    .mcp_server(McpServer::sse("stream", "https://example.com/sse"));
+```
+
+Add headers or environment with `.with(key, value)`:
+
+```rust
+McpServer::http("remote", "https://example.com/mcp")
+    .with("Authorization", "Bearer …")
+```
+
+Tool calls into those servers come back as ordinary `ToolUpdated` events with
+`ToolKind::Mcp { server, tool }`, so they render like any other tool.
+
+## Slash commands
+
+`probe` and `SessionInfo` both list what the agent advertises:
+
+```rust
+for command in &session.info().details.commands {
+    println!("/{} — {}", command.name, command.description);
+}
+```
+
+Send one as a normal prompt:
+
+```rust
+session.prompt("/review").await?;
+```
+
+Requires `Capability::SlashCommands`.

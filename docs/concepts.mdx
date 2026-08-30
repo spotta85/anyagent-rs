@@ -1,0 +1,141 @@
+---
+title: "Concepts"
+description: "The vocabulary shared by the docs, the API, and the code."
+---
+
+anyagent uses one word per idea, everywhere. If you learn these, the API reads
+itself.
+
+## Agents and connections
+
+<ResponseField name="Agent" type="AgentInstallation">
+  A coding-agent CLI installed on the machine (Claude Code, Codex, Grok, …).
+  Discovery returns these.
+</ResponseField>
+
+<ResponseField name="Profile" type="internal">
+  The catalog entry describing one supported agent: how to find it, how to
+  launch it in protocol mode, and its known quirks.
+</ResponseField>
+
+<ResponseField name="Adapter" type="internal">
+  The private code that speaks one protocol (ACP, native Claude, native Codex)
+  and translates it into the types below. You never touch an adapter directly.
+</ResponseField>
+
+<ResponseField name="Capability" type="Capability">
+  One feature this agent can do *on this session* — `Steer`, `Images`, `Fork`,
+  `PlanUsage`, and so on. Reported after `open`, never assumed per agent.
+</ResponseField>
+
+<ResponseField name="Login marker" type="internal">
+  A file or keychain item whose presence means an agent is probably logged in,
+  readable without a network call. anyagent never reads the credential itself.
+</ResponseField>
+
+## Sessions and turns
+
+```text
+Session
+ ├── Turn        (started by a prompt, or by the agent)
+ │    ├── TextDelta / ReasoningDelta
+ │    ├── ToolUpdated ...
+ │    ├── RequestOpened -> answer() -> RequestClosed
+ │    └── TurnEnded     (exactly once)
+ └── Turn ...
+```
+
+<ResponseField name="Session" type="Session">
+  One live conversation with one agent process. Resumable through a resume
+  token. Not "thread", "chat", or "run".
+</ResponseField>
+
+<ResponseField name="Turn" type="—">
+  One stretch of agent work, started by a prompt or by the agent itself,
+  ending exactly once with `TurnEnded`.
+</ResponseField>
+
+<ResponseField name="Prompt" type="Input">
+  One piece of user input submitted to a session. Depending on session state it
+  **starts** a turn, **steers** the running one, or **queues**. The `Delivery`
+  returned by `prompt()` tells you which happened.
+</ResponseField>
+
+<ResponseField name="Steer" type="DeliveryKind::Steered">
+  Delivering a prompt into a turn that is already running, so the agent changes
+  course mid-turn. Requires `Capability::Steer`.
+</ResponseField>
+
+<ResponseField name="Queue" type="DeliveryKind::Queued">
+  Prompts accepted while a turn was running. Each starts its own turn at the
+  next boundary, in order. Drop one with `session.dequeue(prompt_id)`.
+</ResponseField>
+
+<ResponseField name="Agent-originated turn" type="TurnOrigin::Agent">
+  A turn the agent started with no new prompt — typically a background task or
+  subagent finishing and waking it.
+</ResponseField>
+
+<ResponseField name="Background work" type="TurnEnded { background }">
+  Tools still running when a turn ended (subagents, backgrounded shells). Their
+  completion usually produces an agent-originated turn.
+</ResponseField>
+
+## How a turn ends
+
+Not every wire says "I'm done". anyagent tells you which kind of ending you got
+instead of pretending they are the same.
+
+| Term | Meaning | In the API |
+|---|---|---|
+| Protocol completion | The wire stated the end explicitly | `CompletionSource::Protocol` |
+| Inferred completion | The wire went quiet for the quiet window | `CompletionSource::Inferred` |
+| Quiet window | How long a non-deterministic wire may stay silent first. Never runs while a tool is running or a request is open | `SessionOptions::quiet_window` |
+| Trailing bookkeeping | Events arriving after the end that carry no new work (late tool status, usage, a late stop frame) | applied without a turn, or dropped |
+
+<Tip>
+Show inferred completion as "idle" in your UI, not as the same checkmark as a
+protocol completion. They mean different things.
+</Tip>
+
+## Requests and configuration
+
+<ResponseField name="Request" type="Request">
+  Something the agent needs a decision on before it continues. Answered exactly
+  once, with `session.answer(id, answer)`.
+</ResponseField>
+
+<ResponseField name="Permission" type="Request::Permission">
+  A request to allow or deny a tool action — once, or always.
+</ResponseField>
+
+<ResponseField name="Question" type="Request::Question">
+  A request for structured user input: choices, free text, or both.
+</ResponseField>
+
+<ResponseField name="Config option" type="ConfigOption">
+  A setting the agent advertises for this session (model, effort, mode,
+  sandbox, …) along with its allowed values. Apply one with
+  `session.configure(id, value)`.
+</ResponseField>
+
+## Usage and accounts
+
+<ResponseField name="Context usage" type="EventKind::ContextUsage">
+  How full this session's context window is — tokens used of tokens available.
+</ResponseField>
+
+<ResponseField name="Plan usage" type="PlanUsage">
+  How much of the account's subscription quota is used, per window (5-hour,
+  weekly). Not the same thing as context usage.
+</ResponseField>
+
+<ResponseField name="Auth status" type="AuthStatus">
+  Whether the agent is logged in, how (subscription, API key, cloud provider),
+  and what login methods exist.
+</ResponseField>
+
+<ResponseField name="Config home" type="SessionOptions::config_home">
+  A separate configuration directory for an agent, used to keep several logins
+  of the same agent apart.
+</ResponseField>

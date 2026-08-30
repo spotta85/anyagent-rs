@@ -1,0 +1,161 @@
+---
+title: "Sessions"
+description: "Open a session, drive turns, answer requests, change settings."
+---
+
+## Opening
+
+```rust
+use anyagent::{Runtime, SessionOptions};
+
+let (session, events) = runtime
+    .open(&agent, SessionOptions::in_dir("/path/to/repo"))
+    .await?;
+```
+
+`open` returns two halves that you usually hand to different tasks:
+
+- `Session` — the command handle. Cheap to clone; every clone talks to the same
+  engine task.
+- `Events` — the stream. One consumer.
+
+### Session options
+
+| Builder | What it does |
+|---|---|
+| `in_dir(path)` | Working directory for the agent. Required. |
+| `configure(id, value)` | Set a config option before the first turn |
+| `resume(token)` | Reopen an earlier session |
+| `fork_from(token, at)` | Branch a new session off an old one |
+| `mcp_server(server)` | Hand the agent one of your MCP servers |
+| `permission_mode(mode)` | `Ask` (forward requests) or `AutoApprove` |
+| `config_home(dir)` | Use a separate config directory for this agent |
+| `quiet_window(dur)` | How long silence may run before completion is inferred |
+| `record_wire(path)` | Dump the raw protocol traffic to a file |
+
+`record_wire` is the one to reach for when an agent misbehaves — it captures
+exactly what crossed the wire.
+
+## Prompting
+
+```rust
+let delivery = session.prompt("add tests for the parser").await?;
+```
+
+The `Delivery` tells you what actually happened to that prompt:
+
+<ResponseField name="DeliveryKind::Started" type="{ turn_id }">
+  The session was idle; this prompt began a turn.
+</ResponseField>
+
+<ResponseField name="DeliveryKind::Steered" type="{ turn_id }">
+  A turn was running and the agent supports steering, so it went into the
+  running turn.
+</ResponseField>
+
+<ResponseField name="DeliveryKind::Queued" type="{ position }">
+  A turn was running and the agent can't steer, so it waits. `position` is how
+  many prompts are ahead of it.
+</ResponseField>
+
+Drop a queued prompt before it starts:
+
+```rust
+session.dequeue(prompt_id).await?;
+```
+
+That returns `InvalidRequest` if the prompt already started.
+
+### Images and attachments
+
+```rust
+use anyagent::Input;
+
+session
+    .prompt(Input::text("what's wrong here?").attach("screenshot.png"))
+    .await?;
+```
+
+Check `Capability::Images` first — agents that can't take images will reject it.
+
+## Answering requests
+
+Every `RequestOpened` is answered exactly once.
+
+```rust
+use anyagent::{Answer, PermissionChoice, QuestionAnswer, Request};
+
+match request {
+    Request::Permission(r) => {
+        // r.options is what this agent actually offers — answers outside it
+        // are rejected.
+        session
+            .answer(r.id, Answer::Permission(PermissionChoice::AllowOnce))
+            .await?;
+    }
+    Request::Question(r) => {
+        // One QuestionAnswer per question, in order.
+        let answers = r
+            .questions
+            .iter()
+            .map(|_| QuestionAnswer::Text("yes".into()))
+            .collect();
+        session.answer(r.id, Answer::Question(answers)).await?;
+    }
+}
+```
+
+A `RequestClosed` arrives when the request is resolved — including when the
+agent withdraws it because the turn was cancelled. Clear it from your UI on
+that event, not on your own answer.
+
+## Changing settings mid-session
+
+```rust
+session.configure("model", "sonnet").await?;
+```
+
+Only ids from `details.config_options` are valid. The change is confirmed by a
+`SessionUpdated` event carrying the new `SessionConfiguration` — if you need to
+know it landed, wait for that rather than for `configure` to return.
+
+## Cancelling
+
+```rust
+session.cancel(false).await?;  // keep the queue
+session.cancel(true).await?;   // drop the queue too
+```
+
+Cancelling stops the active turn. The session survives, and the next queued
+prompt starts unless you cleared the queue. You still get a `TurnEnded`, with
+`StopReason::Cancelled`.
+
+## Closing
+
+```rust
+session.close().await?;
+```
+
+Ends the agent session and waits for cleanup, capped by a grace period.
+
+<Warning>
+Processes the agent spawned itself — backgrounded shells, subagents — may
+outlive the session. If your app needs them dead, track them from
+`TurnEnded { background, .. }` and clean up yourself.
+</Warning>
+
+## Capabilities
+
+Check before you call, rather than assuming per agent:
+
+```rust
+use anyagent::Capability;
+
+if session.info().details.capabilities.supports(Capability::Steer) {
+    // prompting mid-turn will steer instead of queue
+}
+```
+
+The full set: `Images`, `Resume`, `Steer`, `Permissions`, `Questions`,
+`Rollback`, `RollbackFiles`, `Fork`, `SlashCommands`, `Plan`, `Subagents`,
+`ContextUsage`, `PlanUsage`.
