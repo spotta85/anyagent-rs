@@ -9,3 +9,4 @@ research
 /V0_LIVE_TESTS.md
 /V0_LIVE_TEST_RESULTS.md
 .kiro/
+.env

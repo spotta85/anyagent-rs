@@ -195,7 +195,11 @@ async fn handshake(
         // with no model or mode to switch. Parsing is best-effort: an agent
         // that answers `null` still resumes, just without the surface.
         if let Ok(loaded) = parse::<acp::LoadSessionResponse>(response, "session/load response") {
-            apply_session_config(&mut info, loaded.modes.as_ref(), loaded.config_options.as_deref());
+            apply_session_config(
+                &mut info,
+                loaded.modes.as_ref(),
+                loaded.config_options.as_deref(),
+            );
         }
         session_id
     };

@@ -36,12 +36,12 @@
     ],
     "primary": {
       "type": "github",
-      "href": "https://github.com/spotta85/anyagent"
+      "href": "https://github.com/spotta85/anyagent-rs"
     }
   },
   "footer": {
     "socials": {
-      "github": "https://github.com/spotta85/anyagent"
+      "github": "https://github.com/spotta85/anyagent-rs"
     }
   }
 }
