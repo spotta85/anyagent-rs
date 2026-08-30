@@ -3,6 +3,7 @@
 
 [![CI](https://github.com/spotta85/anyagent-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/spotta85/anyagent-rs/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/anyagent.svg)](https://crates.io/crates/anyagent)
+[![docs](https://img.shields.io/badge/docs-anyagent.mintlify.site-8B5CF6)](https://anyagent.mintlify.site)
 [![docs.rs](https://img.shields.io/docsrs/anyagent)](https://docs.rs/anyagent)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
@@ -16,7 +17,7 @@ anyagent is that layer, **once: it finds the agents, speaks each one's protocol
 API — `Runtime`, `Session`, and a stream of `Events`**.
 
 #### Your app keeps its own transcript, UI, and policy. anyagent owns the processes, the wires, and the turn rules — every agent behaves the same way through it.
-![alt text](image.png)
+![alt text](image-1.png)
 
 
 ## Use
@@ -76,6 +77,14 @@ token usage, permission requests, subagents, and turn boundaries — the same
 
 Any other ACP agent works without a catalog entry via
 `AgentInstallation::acp(name, path, args)`.
+
+## Docs
+
+Guides, concepts, and the full event reference live at
+**[anyagent.mintlify.site](https://anyagent.mintlify.site)**.
+
+The generated API reference — every type and signature — is on
+[docs.rs/anyagent](https://docs.rs/anyagent).
 
 ## License
 

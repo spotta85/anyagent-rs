@@ -6,6 +6,7 @@ rust-version = "1.88"
 description = "One Rust interface to the coding agents installed on a machine."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/spotta85/anyagent-rs"
+homepage = "https://anyagent.mintlify.site"
 documentation = "https://docs.rs/anyagent"
 readme = "README.md"
 keywords = ["agent", "acp", "claude", "codex", "cli"]

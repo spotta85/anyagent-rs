@@ -3,10 +3,25 @@
   "theme": "mint",
   "name": "anyagent",
   "description": "One Rust interface to the coding agents installed on a machine.",
+  "favicon": "/favicon.svg",
   "colors": {
-    "primary": "#1f1f1f",
-    "light": "#f5f5f5",
-    "dark": "#0d0d0d"
+    "primary": "#8B5CF6",
+    "light": "#A78BFA",
+    "dark": "#6D28D9"
+  },
+  "appearance": {
+    "default": "system"
+  },
+  "background": {
+    "decoration": "gradient"
+  },
+  "styling": {
+    "codeblocks": {
+      "theme": "catppuccin-mocha"
+    }
+  },
+  "contextual": {
+    "options": ["copy", "view", "claude", "chatgpt", "cursor", "vscode"]
   },
   "navigation": {
     "groups": [
@@ -32,7 +47,7 @@
   "navbar": {
     "links": [
       { "label": "crates.io", "href": "https://crates.io/crates/anyagent" },
-      { "label": "docs.rs", "href": "https://docs.rs/anyagent" }
+      { "label": "API reference", "href": "https://docs.rs/anyagent" }
     ],
     "primary": {
       "type": "github",

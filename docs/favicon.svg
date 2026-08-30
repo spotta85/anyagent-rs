@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="14" fill="#8B5CF6"/>
+  <!-- one interface, many agents: three lines converging on a single node -->
+  <g stroke="#F5F3FF" stroke-width="4" stroke-linecap="round" fill="none">
+    <path d="M14 18h12l10 14"/>
+    <path d="M14 32h22"/>
+    <path d="M14 46h12l10-14"/>
+  </g>
+  <circle cx="44" cy="32" r="7" fill="#F5F3FF"/>
+</svg>

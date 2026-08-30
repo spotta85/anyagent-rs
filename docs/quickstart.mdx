@@ -1,6 +1,7 @@
 ---
 title: "Quickstart"
 description: "Install anyagent and run one turn against a real agent."
+icon: "rocket"
 ---
 
 ## Requirements
@@ -11,7 +12,7 @@ description: "Install anyagent and run one turn against a real agent."
 
 ## Install
 
-```toml
+```toml Cargo.toml
 [dependencies]
 anyagent = "0.0.1"
 futures = "0.3"
@@ -20,7 +21,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 ## One turn
 
-```rust
+```rust src/main.rs
 use anyagent::{EventKind, Runtime, SessionOptions};
 use futures::StreamExt;
 
