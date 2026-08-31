@@ -85,7 +85,7 @@ against the agents on your machine:
 |---|---|
 | Claude Code | native (stream-json) |
 | Codex | native (app-server) |
-| Antigravity | native |
+| Pi | native |
 | Grok, Hermes Agent, opencode, Kiro CLI, Qwen Code | ACP |
 
 Any other ACP agent works without a catalog entry via
