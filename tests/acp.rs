@@ -650,11 +650,18 @@ async fn losing_auth_mid_session_fails_the_turn_and_closes() {
         panic!("expected a terminal method");
     };
     assert_eq!(command[1..], ["auth".to_string(), "login".to_string()]);
-    // The stream closes and the session is gone.
-    let end = tokio::time::timeout(Duration::from_secs(10), events.next())
-        .await
-        .unwrap();
-    assert!(end.is_none(), "stream should close, got {end:?}");
+    // The stream closes (tolerating a trailing status flip) and the session
+    // is gone.
+    loop {
+        let end = tokio::time::timeout(Duration::from_secs(10), events.next())
+            .await
+            .unwrap();
+        match end {
+            None => break,
+            Some(Ok(event)) if matches!(event.kind, EventKind::StatusChanged(_)) => {}
+            other => panic!("stream should close, got {other:?}"),
+        }
+    }
     assert!(matches!(
         session.prompt("hi").await,
         Err(AgentError::SessionClosed)

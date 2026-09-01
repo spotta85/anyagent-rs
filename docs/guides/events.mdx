@@ -10,6 +10,7 @@ icon: "bolt"
 ```rust
 pub struct Event {
     pub sequence: u64,                   // starts at 1, increases per session
+    pub occurred_at: SystemTime,         // wall-clock; order comes from sequence
     pub session_id: SessionId,
     pub turn_info: Option<TurnContext>,  // present when it belongs to a turn
     pub kind: EventKind,
@@ -125,6 +126,14 @@ parent in a UI.
 <ResponseField name="SessionUpdated" type="SessionInfo">
   A new snapshot: configuration, resume token, title. Emitted after
   `configure`, `rollback`, and whenever the agent renames the session.
+</ResponseField>
+
+<ResponseField name="StatusChanged" type="SessionStatus">
+  The session's UI state flipped: `Working`, `NeedsInput` (an open request
+  is waiting for an answer), or `Idle`. Emitted only on change — a turn
+  ending with another prompt queued stays `Working`, never flashing `Idle`.
+  `session.status()` reads the current value without the stream, for
+  components that mount late.
 </ResponseField>
 
 <ResponseField name="ContextUsage" type="{ used_tokens, window_tokens, cost_usd }">

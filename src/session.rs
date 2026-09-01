@@ -45,6 +45,23 @@ pub struct SessionInfo {
     pub resume_token: Option<ResumeToken>,
     /// Agent-suggested title when the wire provides one.
     pub title: Option<String>,
+    /// Current UI state; kept fresh by the engine.
+    #[serde(default)]
+    pub status: SessionStatus,
+}
+
+/// What a UI should show for the session right now. Changes arrive as
+/// `EventKind::StatusChanged`; `Session::status` reads it without the stream.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum SessionStatus {
+    /// No turn running and nothing queued.
+    #[default]
+    Idle,
+    /// A turn is running.
+    Working,
+    /// The agent is blocked on an answer to at least one open request.
+    NeedsInput,
 }
 
 /// Command handle. Cheap to clone; every clone talks to the same engine task.
@@ -92,6 +109,12 @@ impl Session {
     /// Current snapshot; the same value the last `SessionUpdated` carried.
     pub fn info(&self) -> SessionInfo {
         self.info.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// What a UI should show right now: working, needing input, or idle.
+    /// The push form of the same fact is `EventKind::StatusChanged`.
+    pub fn status(&self) -> SessionStatus {
+        self.info.lock().unwrap_or_else(|e| e.into_inner()).status
     }
 
     /// Starts a turn when idle. During a turn, steers when possible or queues.
@@ -210,6 +233,7 @@ pub(crate) fn start(
         exit: None,
         noise_reported: false,
         awaiting_ack: false,
+        last_status: SessionStatus::Idle,
         done: false,
     };
     tokio::spawn(engine.run(commands_rx, connection.events));
@@ -245,6 +269,7 @@ fn session_info(id: SessionId, agent: AgentInstallation, info: &DriverInfo) -> S
         configuration: info.configuration.clone(),
         resume_token: info.resume_token.clone(),
         title: info.title.clone(),
+        status: SessionStatus::Idle,
     }
 }
 
@@ -377,6 +402,8 @@ struct Engine {
     noise_reported: bool,
     /// A `StartTurn` is unacknowledged: content arriving now is stale.
     awaiting_ack: bool,
+    /// The last status emitted, so `StatusChanged` fires only on change.
+    last_status: SessionStatus,
     done: bool,
 }
 
@@ -415,7 +442,28 @@ impl Engine {
             if driver_events.is_empty() {
                 self.promote().await;
             }
+            // After promotion, so a turn ending with another prompt queued
+            // reads as continuously Working, never a flash of Idle.
+            self.sync_status().await;
         }
+    }
+
+    /// Emits `StatusChanged` and refreshes the snapshot when the UI state
+    /// actually flipped.
+    async fn sync_status(&mut self) {
+        let status = match &self.state {
+            TurnState::Running { open_requests, .. } if !open_requests.is_empty() => {
+                SessionStatus::NeedsInput
+            }
+            TurnState::Running { .. } => SessionStatus::Working,
+            _ => SessionStatus::Idle,
+        };
+        if status == self.last_status {
+            return;
+        }
+        self.last_status = status;
+        self.info.lock().unwrap_or_else(|e| e.into_inner()).status = status;
+        self.emit(EventKind::StatusChanged(status), false).await;
     }
 
     // -- commands -----------------------------------------------------------
@@ -970,6 +1018,7 @@ impl Engine {
         self.seq += 1;
         let event = Event {
             sequence: self.seq,
+            occurred_at: std::time::SystemTime::now(),
             session_id: self.id.clone(),
             turn_info: turn,
             kind,
@@ -1003,6 +1052,7 @@ fn is_engine_owned(kind: &EventKind) -> bool {
             | EventKind::TurnEnded { .. }
             | EventKind::RequestClosed { .. }
             | EventKind::SessionUpdated(_)
+            | EventKind::StatusChanged(_)
     )
 }
 

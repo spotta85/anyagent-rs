@@ -32,6 +32,12 @@ OAuth for it.
 or set the provider's API-key variable.
 </Note>
 
+<Note>
+Hermes gates only its file tools behind permission requests — its terminal
+tool runs without asking, so a denied write does not stop the agent from
+writing via shell. Sandbox accordingly if that matters to your app.
+</Note>
+
 ## Any other ACP agent
 
 You don't need a catalog entry to use an agent that speaks

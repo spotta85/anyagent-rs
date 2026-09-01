@@ -8,7 +8,7 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::string_id;
-use crate::session::SessionInfo;
+use crate::session::{SessionInfo, SessionStatus};
 
 string_id!(SessionId);
 string_id!(TurnId);
@@ -28,6 +28,10 @@ pub type Extensions = BTreeMap<String, serde_json::Value>;
 pub struct Event {
     /// Starts at 1 and increases for every session event.
     pub sequence: u64,
+    /// When the engine produced this event — wall-clock, so transcripts can
+    /// be stored and merged without the app stamping receive time. Order
+    /// across events is guaranteed by `sequence`, not by this clock.
+    pub occurred_at: std::time::SystemTime,
     pub session_id: SessionId,
     /// Present when the event belongs to a turn.
     pub turn_info: Option<TurnContext>,
@@ -83,6 +87,9 @@ pub enum EventKind {
         request_id: RequestId,
     },
     SessionUpdated(SessionInfo),
+    /// The session's UI state flipped: working, needing input, or idle.
+    /// Emitted only on change; `session.status()` answers without the stream.
+    StatusChanged(SessionStatus),
     /// Context-window occupancy for this session.
     ContextUsage {
         used_tokens: u64,
