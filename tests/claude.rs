@@ -107,6 +107,7 @@ async fn echoed_turn(session: &Session, events: &mut Events, prompt: &str) -> St
         .to_owned()
 }
 
+/// Full turn maps text/reasoning/Write tool with diff, plan, usage, MessageEnded, and resume token.
 #[tokio::test]
 async fn a_full_turn_maps_every_frame_kind() {
     let (session, mut events) = open("full", "").await;
@@ -181,6 +182,7 @@ async fn a_full_turn_maps_every_frame_kind() {
     session.close().await.unwrap();
 }
 
+/// Rollback drops last turn via fork at kept assistant uuid; token cleared then renewed.
 #[tokio::test]
 async fn rollback_forks_at_the_cut_point_and_renews_the_token() {
     let (session, mut events) = open("rollback", "--echo-uuid").await;
@@ -216,6 +218,7 @@ async fn rollback_forks_at_the_cut_point_and_renews_the_token() {
     session.close().await.unwrap();
 }
 
+/// Files rollback rewinds file at first dropped turn's uuid and forks conversation at kept frame.
 #[tokio::test]
 async fn files_rollback_rewinds_at_the_first_dropped_turn() {
     let dir = std::env::temp_dir().join(format!("anyagent-rwfiles-{}", std::process::id()));
@@ -251,6 +254,7 @@ async fn files_rollback_rewinds_at_the_first_dropped_turn() {
     session.close().await.unwrap();
 }
 
+/// Files rollback refusal emits diagnostic and leaves session/token/files untouched.
 #[tokio::test]
 async fn files_rollback_refusal_leaves_the_session_untouched() {
     let dir = std::env::temp_dir().join(format!("anyagent-rwfail-{}", std::process::id()));
@@ -285,6 +289,7 @@ async fn files_rollback_refusal_leaves_the_session_untouched() {
     session.close().await.unwrap();
 }
 
+/// Fork at MessageEnded fork_point branches at cut; tip fork creates new session without cut.
 #[tokio::test]
 async fn fork_from_branches_at_a_message_and_at_the_tip() {
     let (session, mut events) = open("fork", "--echo-uuid").await;
@@ -350,6 +355,7 @@ async fn fork_from_branches_at_a_message_and_at_the_tip() {
     tip.close().await.unwrap();
 }
 
+/// Plan usage refreshed after each turn via get_usage with windows and resets_at.
 #[tokio::test]
 async fn plan_usage_is_refreshed_after_each_turn() {
     let (session, mut events) = open("usage", "").await;
@@ -388,6 +394,7 @@ async fn plan_usage_is_refreshed_after_each_turn() {
     session.close().await.unwrap();
 }
 
+/// Plan usage probed without session and cached for 60s TTL (same fetched_at).
 #[tokio::test]
 async fn runtime_plan_usage_probes_without_a_session_and_caches() {
     let runtime = Runtime::new();
@@ -400,6 +407,7 @@ async fn runtime_plan_usage_probes_without_a_session_and_caches() {
     assert_eq!(again.fetched_at, usage.fetched_at);
 }
 
+/// Handshake fills version, auth, 9 capabilities (!Steer), commands, and model/effort selects.
 #[tokio::test]
 async fn the_handshake_fills_details() {
     let (session, _events) = open("handshake", "").await;
@@ -463,6 +471,7 @@ async fn the_handshake_fills_details() {
     session.close().await.unwrap();
 }
 
+/// Probe reports identical details to open for explorer use.
 #[tokio::test]
 async fn probe_reports_the_same_details_as_open() {
     let runtime = Runtime::new();
@@ -487,6 +496,7 @@ async fn probe_reports_the_same_details_as_open() {
     assert!(probed.commands.iter().any(|c| c.name == "compact"));
 }
 
+/// Logged-out handshake maps to Unauthenticated with terminal method; verifies Subscription/ApiKey/Bedrock kinds.
 #[tokio::test]
 async fn a_logged_out_handshake_reports_unauthenticated_with_login_methods() {
     // The CLI sends an account object either way; only its contents separate
@@ -563,6 +573,7 @@ async fn a_logged_out_handshake_reports_unauthenticated_with_login_methods() {
     ));
 }
 
+/// Cancel mid-permission reaches agent and ends turn as Cancelled.
 #[tokio::test]
 async fn cancel_reaches_the_agent_and_ends_the_turn() {
     let (session, mut events) = open("cancel", "").await;
@@ -585,6 +596,7 @@ async fn cancel_reaches_the_agent_and_ends_the_turn() {
 // An interrupt can land before the CLI starts the turn: the prompt is
 // cancelled out of the CLI's own queue and no `result` frame ever comes —
 // the interrupt receipt ends the turn instead (probed live 2026-08-24).
+/// Cancel before turn starts ends that turn as Cancelled and promotes queued prompt.
 #[tokio::test]
 async fn cancel_before_the_turn_starts_ends_it_and_the_queue_advances() {
     let (session, mut events) = open("prestart", "").await;
@@ -624,6 +636,7 @@ async fn cancel_before_the_turn_starts_ends_it_and_the_queue_advances() {
 
 // The CLI queues mid-turn user messages as their own turns, so the engine
 // queues instead of steering — and every turn keeps the right prompt id.
+/// Mid-turn prompt queues (Queued{0}) and next turn keeps its prompt_id.
 #[tokio::test]
 async fn a_mid_turn_prompt_queues_and_runs_with_the_right_prompt_id() {
     let (session, mut events) = open("queue", "").await;
@@ -670,6 +683,7 @@ async fn a_mid_turn_prompt_queues_and_runs_with_the_right_prompt_id() {
     session.close().await.unwrap();
 }
 
+/// AskUserQuestion typed and answer echoed back as answer=Blue.
 #[tokio::test]
 async fn a_question_is_typed_and_the_answer_reaches_the_agent() {
     let (session, mut events) = open("question", "--question").await;
@@ -705,6 +719,7 @@ async fn a_question_is_typed_and_the_answer_reaches_the_agent() {
     session.close().await.unwrap();
 }
 
+/// Agent death mid-turn fails turn and yields ProcessExited status 3 with stderr.
 #[tokio::test]
 async fn agent_death_mid_turn_fails_the_turn() {
     let (session, mut events) = open("eof", "--eof").await;
@@ -735,6 +750,7 @@ async fn agent_death_mid_turn_fails_the_turn() {
     }
 }
 
+/// Attachments inline PNG, reference PDF/missing, report unreadable diagnostic.
 #[tokio::test]
 async fn attachments_inline_images_and_reference_paths() {
     let dir = attachment_dir("claude");
@@ -770,6 +786,7 @@ async fn attachments_inline_images_and_reference_paths() {
     session.close().await.unwrap();
 }
 
+/// Mode configure round-trips and updates SessionUpdated configuration.
 #[tokio::test]
 async fn configuring_the_mode_round_trips_and_updates_the_session() {
     let (session, mut events) = open("mode", "").await;
@@ -792,6 +809,7 @@ async fn configuring_the_mode_round_trips_and_updates_the_session() {
 
 // The model is switched live with the `set_model` control request, through
 // the same configure path as `mode` (probed live 2026-08-24).
+/// Model switch via set_model round-trips and updates session configuration.
 #[tokio::test]
 async fn switching_the_model_round_trips_and_updates_the_session() {
     let (session, mut events) = open("model", "").await;
@@ -809,6 +827,7 @@ async fn switching_the_model_round_trips_and_updates_the_session() {
     session.close().await.unwrap();
 }
 
+/// MCP http+stdio servers ride launch config and appear in wire.
 #[tokio::test]
 async fn mcp_servers_ride_the_launch_config() {
     let runtime = Runtime::new();
@@ -840,6 +859,7 @@ async fn mcp_servers_ride_the_launch_config() {
     session.close().await.unwrap();
 }
 
+/// Mismatched answer type or not-offered choice rejected typed; request stays open for correct answer.
 #[tokio::test]
 async fn a_mismatched_answer_is_rejected_and_the_request_stays_open() {
     let (session, mut events) = open("validate", "").await;
@@ -872,6 +892,7 @@ async fn a_mismatched_answer_is_rejected_and_the_request_stays_open() {
     session.close().await.unwrap();
 }
 
+/// Background Bash wakes agent-originated turn after bookkeeping completes.
 #[tokio::test]
 async fn a_background_task_wakes_an_agent_originated_turn() {
     let (session, mut events) = open("wake", "--wake").await;
@@ -915,6 +936,7 @@ async fn a_background_task_wakes_an_agent_originated_turn() {
     session.close().await.unwrap();
 }
 
+/// Subagent Task spawn and nested text/user messages carry parent_tool_id.
 #[tokio::test]
 async fn subagent_events_carry_the_parent_tool_id() {
     let (session, mut events) = open("subagent", "--subagent").await;
@@ -943,6 +965,7 @@ async fn subagent_events_carry_the_parent_tool_id() {
     session.close().await.unwrap();
 }
 
+/// Losing auth mid-session fails turn and closes with AuthRequired + EnvVar method.
 #[tokio::test]
 async fn losing_auth_mid_session_fails_the_turn_and_closes() {
     let (session, mut events) = open("auth", "").await;
@@ -981,6 +1004,7 @@ async fn losing_auth_mid_session_fails_the_turn_and_closes() {
     ));
 }
 
+/// Creation-time mode/model/effort ride launch args; unknown ids refused typed.
 #[tokio::test]
 async fn creation_time_config_rides_the_launch_args_and_unknown_ids_are_refused() {
     let runtime = Runtime::new();
@@ -1030,6 +1054,7 @@ async fn creation_time_config_rides_the_launch_args_and_unknown_ids_are_refused(
 
 /// `config_home` reaches the child as `CLAUDE_CONFIG_DIR`; the fixture echoes
 /// the value it received back in its turn text.
+/// Config_home reaches child as CLAUDE_CONFIG_DIR env var.
 #[tokio::test]
 async fn config_home_reaches_the_child_as_an_env_var() {
     let runtime = Runtime::new();
@@ -1069,6 +1094,7 @@ async fn recorded_lines(path: &Path, min: usize) -> Vec<serde_json::Value> {
 
 /// `record_wire` tees both directions, including the pre-turn handshake, as
 /// one valid JSON object per line.
+/// Record_wire tees both directions including pre-turn initialize handshake.
 #[tokio::test]
 async fn record_wire_tees_both_directions_including_handshake() {
     let dir = tempfile::tempdir().unwrap();

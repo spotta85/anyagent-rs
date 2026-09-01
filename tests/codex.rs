@@ -88,6 +88,7 @@ fn text_option(session: &anyagent::SessionInfo, id: &str) -> Option<String> {
     })
 }
 
+/// Handshake reports auth, version 0.147.0, capabilities, token, and deduped skills as commands.
 #[tokio::test]
 async fn handshake_reports_auth_version_options_and_token() {
     let (session, mut events) = open("handshake", "").await;
@@ -158,6 +159,7 @@ async fn handshake_reports_auth_version_options_and_token() {
     session.close().await.unwrap();
 }
 
+/// Probe returns commands in <2s without waiting full timeout.
 #[tokio::test]
 async fn probe_reads_commands_without_waiting_them_out() {
     let runtime = Runtime::new();
@@ -176,6 +178,7 @@ async fn probe_reads_commands_without_waiting_them_out() {
 /// A subagent's child thread runs a whole turn inside the parent's: its
 /// content must ride the subagent tool and its bookkeeping must not touch the
 /// parent turn.
+/// Subagent child thread's deltas/tool updates are attributed via parent_tool_id and don't settle parent turn.
 #[tokio::test]
 async fn a_subagent_child_thread_never_settles_the_parent_turn() {
     let (session, mut events) = open("subagent", "").await;
@@ -245,6 +248,7 @@ async fn a_subagent_child_thread_never_settles_the_parent_turn() {
     session.close().await.unwrap();
 }
 
+/// Failed child turn marks its subagent tool as Failed but parent still completes.
 #[tokio::test]
 async fn a_failed_child_turn_fails_its_subagent_tool() {
     let (session, mut events) = open("subagent-fail", "").await;
@@ -270,6 +274,7 @@ async fn a_failed_child_turn_fails_its_subagent_tool() {
     session.close().await.unwrap();
 }
 
+/// Full turn maps text/reasoning/execute tool, plan, usage, quota, and fork_point extension.
 #[tokio::test]
 async fn a_full_turn_maps_every_frame_kind() {
     let (session, mut events) = open("full", "").await;
@@ -342,6 +347,7 @@ async fn a_full_turn_maps_every_frame_kind() {
     session.close().await.unwrap();
 }
 
+/// Model+effort ride every turn; live model switch applies to next turn without wire call.
 #[tokio::test]
 async fn model_and_effort_ride_every_turn_and_switch_live() {
     let (session, mut events) = open_with(
@@ -371,6 +377,7 @@ async fn model_and_effort_ride_every_turn_and_switch_live() {
     session.close().await.unwrap();
 }
 
+/// Effort falls back to model's default when new model lacks previous level.
 #[tokio::test]
 async fn effort_falls_back_when_the_new_model_lacks_it() {
     let (session, mut events) = open_with(
@@ -408,6 +415,7 @@ async fn effort_falls_back_when_the_new_model_lacks_it() {
     session.close().await.unwrap();
 }
 
+/// Invalid model/effort at creation validated locally before reaching wire.
 #[tokio::test]
 async fn creation_config_is_validated_before_the_wire_sees_it() {
     // The wire would accept the model and fail the turn later; open refuses.
@@ -432,6 +440,7 @@ async fn creation_config_is_validated_before_the_wire_sees_it() {
     assert!(matches!(err, AgentError::InvalidConfiguration(_)), "{err}");
 }
 
+/// Mode/sandbox are creation-only; mid-session configure refused typed.
 #[tokio::test]
 async fn mode_and_sandbox_are_creation_only_thread_settings() {
     let (session, _events) = open_with(
@@ -455,6 +464,7 @@ async fn mode_and_sandbox_are_creation_only_thread_settings() {
     session.close().await.unwrap();
 }
 
+/// Approval accept completes tool with write=accept; decline marks tool Cancelled and turn continues.
 #[tokio::test]
 async fn approvals_map_accept_and_decline() {
     let (session, mut events) = open("approve", "").await;
@@ -517,6 +527,7 @@ async fn approvals_map_accept_and_decline() {
     session.close().await.unwrap();
 }
 
+/// Steer sent before turn/started is held until accepted and folded via Steered delivery.
 #[tokio::test]
 async fn a_steer_folds_into_the_running_turn() {
     let (session, mut events) = open("steer", "").await;
@@ -533,6 +544,7 @@ async fn a_steer_folds_into_the_running_turn() {
     session.close().await.unwrap();
 }
 
+/// Cancel interrupts running command, marks tool Cancelled, and ends turn as Cancelled; idle cancel is no-op.
 #[tokio::test]
 async fn cancel_interrupts_and_cancels_inflight_tools() {
     let (session, mut events) = open("cancel", "").await;
@@ -566,6 +578,7 @@ async fn cancel_interrupts_and_cancels_inflight_tools() {
     session.close().await.unwrap();
 }
 
+/// Logged-out reported at handshake; first model call surfaces AuthRequired without retries.
 #[tokio::test]
 async fn logged_out_is_reported_and_the_first_turn_surfaces_auth_required() {
     let (session, mut events) = open("logged-out", "--logged-out").await;
@@ -600,6 +613,7 @@ async fn logged_out_is_reported_and_the_first_turn_surfaces_auth_required() {
     assert!(failed);
 }
 
+/// Resume keeps thread id; fork at fork_point creates new id with correct fork anchor.
 #[tokio::test]
 async fn resume_keeps_the_thread_and_fork_cuts_at_the_anchor() {
     let (session, mut events) = open("resume-src", "").await;
@@ -634,6 +648,7 @@ async fn resume_keeps_the_thread_and_fork_cuts_at_the_anchor() {
     fork.close().await.unwrap();
 }
 
+/// Plan usage probe reads Session/Week windows with resets; logged-out typed AuthRequired.
 #[tokio::test]
 async fn plan_usage_probe_reads_the_windows() {
     let runtime = Runtime::new();
@@ -653,6 +668,7 @@ async fn plan_usage_probe_reads_the_windows() {
     assert!(matches!(err, AgentError::AuthRequired { .. }), "{err}");
 }
 
+/// requestUserInput question translates both ways even though capability not advertised.
 #[tokio::test]
 async fn a_question_request_translates_both_ways() {
     // `requestUserInput` is schema-confirmed but unobserved live (ticket 10):
@@ -685,6 +701,7 @@ async fn a_question_request_translates_both_ways() {
     session.close().await.unwrap();
 }
 
+/// MCP forwarding refused typed UnsupportedFeature.
 #[tokio::test]
 async fn mcp_forwarding_is_refused_typed() {
     let err = open_with(
@@ -699,6 +716,7 @@ async fn mcp_forwarding_is_refused_typed() {
     assert!(matches!(err, AgentError::UnsupportedFeature(_)), "{err}");
 }
 
+/// Config_home creates directory and reaches child as CODEX_HOME; turn echoes cfg path.
 #[tokio::test]
 async fn config_home_reaches_the_child_and_is_created() {
     let home = std::env::temp_dir().join(format!("anyagent-codex-home-{}", std::process::id()));
@@ -718,6 +736,7 @@ async fn config_home_reaches_the_child_and_is_created() {
     session.close().await.unwrap();
 }
 
+/// Attachments ride as path refs (ref count in wire).
 #[tokio::test]
 async fn attachments_ride_as_path_refs() {
     let dir = std::env::temp_dir().join(format!("anyagent-codex-att-{}", std::process::id()));
@@ -733,6 +752,7 @@ async fn attachments_ride_as_path_refs() {
     session.close().await.unwrap();
 }
 
+/// Dead agent surfaces ProcessExited status 3 and stderr boom.
 #[tokio::test]
 async fn a_dead_agent_surfaces_the_exit_and_stderr() {
     let (session, mut events) = open("die", "").await;

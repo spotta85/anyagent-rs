@@ -43,6 +43,7 @@ fn allow() -> Answer {
     Answer::Permission(PermissionChoice::AllowOnce)
 }
 
+/// Prompt->TurnStarted(Prompt) correlated id -> RequestOpened -> answer -> TurnEnded(Completed) contract.
 #[tokio::test]
 async fn prompt_request_answer_and_completion_share_one_contract() {
     let (session, mut events) = open(MockAdapter::permission_flow(), None).await;
@@ -79,6 +80,7 @@ async fn prompt_request_answer_and_completion_share_one_contract() {
     assert!(events.next().await.is_none(), "stream closes after close()");
 }
 
+/// Second prompt queued as Queued{0} and promoted FIFO after first ends.
 #[tokio::test]
 async fn queued_prompt_is_promoted_after_turn_end() {
     let script = Script::default()
@@ -94,6 +96,7 @@ async fn queued_prompt_is_promoted_after_turn_end() {
     assert_eq!(order, vec![first.prompt_id, second.prompt_id]);
 }
 
+/// Steer accepted -> Steered; rejected -> requeued at head as Queued{0}.
 #[tokio::test]
 async fn steer_is_reported_when_accepted_and_requeued_at_head_when_rejected() {
     let script = Script {
@@ -126,6 +129,7 @@ async fn steer_is_reported_when_accepted_and_requeued_at_head_when_rejected() {
     assert_eq!(order, vec![first.prompt_id, rejected.prompt_id]);
 }
 
+/// Quiet non-deterministic agent gets inferred completion after quiet_window.
 #[tokio::test(start_paused = true)]
 async fn quiet_agent_gets_inferred_completion() {
     let script = Script {
@@ -150,6 +154,7 @@ async fn quiet_agent_gets_inferred_completion() {
     );
 }
 
+/// Answering a request closes it and re-arms quiet-window inferred completion.
 #[tokio::test(start_paused = true)]
 async fn answering_a_request_rearms_inferred_completion() {
     let script = Script {
@@ -182,6 +187,7 @@ async fn answering_a_request_rearms_inferred_completion() {
     ));
 }
 
+/// Late content after TurnEnded opens agent-originated turn with MessageEnded.
 #[tokio::test]
 async fn content_after_turn_end_opens_an_agent_turn() {
     let script = Script::default().turn(vec![
@@ -212,6 +218,7 @@ async fn content_after_turn_end_opens_an_agent_turn() {
     assert!(matches!(kinds[5], EventKind::TurnEnded { .. }));
 }
 
+/// Trailing agent content after TurnEnded takes priority over queued prompt.
 #[tokio::test]
 async fn trailing_content_beats_a_queued_prompt_to_the_next_turn() {
     let script = Script::default().turn(vec![
@@ -260,6 +267,7 @@ async fn trailing_content_beats_a_queued_prompt_to_the_next_turn() {
     ));
 }
 
+/// Background bookkeeping after end carries no turn; extra stop becomes Diagnostic.
 #[tokio::test]
 async fn bookkeeping_after_turn_end_is_not_a_turn_and_late_stops_are_diagnostics() {
     let script = Script::default().turn(vec![
@@ -285,6 +293,7 @@ async fn bookkeeping_after_turn_end_is_not_a_turn_and_late_stops_are_diagnostics
     assert!(matches!(late_stop.kind, EventKind::Diagnostic(_)));
 }
 
+/// Stalled consumer (>1024 buffered events) is disconnected rather than growing memory unbounded.
 #[tokio::test]
 async fn a_stalled_consumer_is_disconnected_instead_of_growing_memory() {
     // More events than the consumer buffer (1024) holds, never drained.
@@ -312,6 +321,7 @@ async fn a_stalled_consumer_is_disconnected_instead_of_growing_memory() {
     );
 }
 
+/// Frames losing promotion race (stale_before_ack) are dropped, not reattributed to next turn.
 #[tokio::test]
 async fn frames_losing_the_promotion_race_are_dropped_not_reattributed() {
     // A frame from an ended turn that arrives after the engine promoted the
@@ -345,6 +355,7 @@ async fn frames_losing_the_promotion_race_are_dropped_not_reattributed() {
     assert_eq!(texts, vec!["first", "second"], "stale frames must not land");
 }
 
+/// Slow consumer with 1000 deltas (<1024) loses nothing and preserves sequence order.
 #[tokio::test]
 async fn slow_consumer_does_not_lose_events() {
     let mut steps: Vec<Step> = (0..1000)
@@ -381,6 +392,7 @@ async fn slow_consumer_does_not_lose_events() {
     assert_eq!(texts, 1000);
 }
 
+/// Cancel is not blocked by full bounded event buffer (backpressure fix).
 #[tokio::test]
 async fn cancel_is_not_blocked_by_full_event_buffer() {
     // Flood the bounded buffer (256) without draining, then cancel.
@@ -421,6 +433,7 @@ async fn cancel_is_not_blocked_by_full_event_buffer() {
     assert!(ended, "expected a Cancelled TurnEnded after cancel");
 }
 
+/// Cancel(false) closes requests and keeps queue; cancel(true) clears queue.
 #[tokio::test]
 async fn cancel_closes_requests_and_keeps_or_clears_the_queue() {
     let script = Script::default()
@@ -468,6 +481,7 @@ async fn cancel_closes_requests_and_keeps_or_clears_the_queue() {
     assert_eq!(third.prompt_id, PromptId::new("p3"));
 }
 
+/// AutoApprove mode answers permissions without emitting RequestOpened/Closed to caller.
 #[tokio::test]
 async fn auto_approve_answers_permissions_without_the_caller() {
     let dir = tempfile::tempdir().unwrap();
@@ -491,6 +505,7 @@ async fn auto_approve_answers_permissions_without_the_caller() {
     assert_eq!(text, "Let me check. Done.");
 }
 
+/// Close during a turn ends it as Cancelled and closes open requests.
 #[tokio::test]
 async fn close_during_a_turn_ends_it_and_closes_requests() {
     let script = Script::default().turn(parked_turn());
@@ -512,6 +527,7 @@ async fn close_during_a_turn_ends_it_and_closes_requests() {
     assert!(events.next().await.is_none(), "stream closes after close()");
 }
 
+/// Unknown RequestId/double answer/dequeue rejected typed InvalidRequest; dequeued prompt never starts.
 #[tokio::test]
 async fn unknown_requests_and_prompts_are_rejected() {
     let script = Script::default().turn(parked_turn());

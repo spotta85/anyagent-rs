@@ -71,6 +71,7 @@ fn enabled() -> Vec<&'static str> {
 
 // -- the features -----------------------------------------------------------
 
+/// Discovery finds each enabled harness and authenticates it; pi/kiro verified via probe where offline markers are absent.
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn discovery_finds_authenticated_harnesses() {
@@ -117,6 +118,7 @@ async fn discovery_finds_authenticated_harnesses() {
     }
 }
 
+/// Open returns resume token, version, harness-correct capabilities (Permissions/Steer/Images) and config options (mode/model/sandbox).
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn open_reports_token_capabilities_and_options() {
@@ -175,6 +177,7 @@ async fn open_reports_token_capabilities_and_options() {
     }
 }
 
+/// Probe returns version + model/mode + commands without creating a session or leaving claude transcripts.
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn probe_reports_details_without_a_session() {
@@ -230,6 +233,7 @@ async fn probe_reports_details_without_a_session() {
     }
 }
 
+/// Turn is bracketed by TurnStarted(Prompt)/TurnEnded(Completed), sequences strictly increase, and stays quiet after end.
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn turn_events_are_bracketed_ordered_and_quiet_after_end() {
@@ -305,6 +309,7 @@ async fn turn_events_are_bracketed_ordered_and_quiet_after_end() {
     }
 }
 
+/// Tool turn reaches ToolStatus::Completed and the requested file lands on disk (hermes quirk tolerated).
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn tools_run_to_completion_and_the_file_lands() {
@@ -348,6 +353,7 @@ async fn tools_run_to_completion_and_the_file_lands() {
     }
 }
 
+/// Permission allow writes the file, deny blocks it and leaves the session usable for the next prompt.
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn permissions_gate_the_write_and_deny_holds() {
@@ -426,6 +432,7 @@ async fn permissions_gate_the_write_and_deny_holds() {
     }
 }
 
+/// Question request round-trips: choices presented, answer selected, and response echoed (claude/codex only; codex unverified).
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn a_question_round_trips() {
@@ -486,6 +493,7 @@ async fn a_question_round_trips() {
     }
 }
 
+/// Claude must not advertise Steer; others with Steer fold a mid-turn prompt via DeliveryKind::Steered.
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn steering_is_absent_on_claude_and_folds_where_advertised() {
@@ -525,6 +533,7 @@ async fn steering_is_absent_on_claude_and_folds_where_advertised() {
     }
 }
 
+/// Queued prompts are FIFO (Queued{0,1}) and each turn's origin keeps its prompt_id.
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn the_queue_is_fifo_and_ids_stay_aligned() {
@@ -576,6 +585,7 @@ async fn the_queue_is_fifo_and_ids_stay_aligned() {
     }
 }
 
+/// Cancel ends the turn in every queue shape (empty, queued, clear-queue) and session survives; kiro quirk handled.
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn cancel_ends_the_turn_in_every_queue_shape() {
@@ -637,6 +647,7 @@ async fn cancel_ends_the_turn_in_every_queue_shape() {
     }
 }
 
+/// Resume recalls prior codeword without replaying old deltas; without Resume capability it fails typed ResumeFailed.
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn resume_recalls_without_replaying() {
@@ -704,6 +715,7 @@ async fn resume_recalls_without_replaying() {
     }
 }
 
+/// PlanUsageUpdated arrives within 10s after a turn with valid windows and reset times.
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn plan_usage_arrives_after_a_turn() {
@@ -779,6 +791,7 @@ async fn plan_usage_arrives_after_a_turn() {
     }
 }
 
+/// Rollback(1, Conversation) forgets exactly the last turn and changes the resume token.
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn rollback_forgets_the_rolled_back_turn() {
@@ -831,6 +844,7 @@ async fn rollback_forgets_the_rolled_back_turn() {
     }
 }
 
+/// Rollback(1, ConversationAndFiles) rewinds filesystem to pre-turn state and emits SessionUpdated.
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn files_rollback_restores_agent_written_files() {
@@ -880,6 +894,7 @@ async fn files_rollback_restores_agent_written_files() {
     }
 }
 
+/// Fork at a MessageEnded fork_point anchor forgets later turns; tip fork keeps all history; original untouched.
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn fork_from_branches_at_a_point_and_at_the_tip() {
@@ -971,6 +986,7 @@ async fn fork_from_branches_at_a_point_and_at_the_tip() {
     }
 }
 
+/// Runtime plan_usage probes quota without a session, caches within TTL, or returns UnsupportedFeature typed.
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn runtime_plan_usage_probes_without_a_session() {
@@ -996,6 +1012,7 @@ async fn runtime_plan_usage_probes_without_a_session() {
     }
 }
 
+/// Killed (-9) agent maps to TurnEnded(Failed) + ProcessExited(status 9) and closes the session.
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn a_killed_agent_fails_the_turn_and_closes_the_session() {
@@ -1037,6 +1054,7 @@ async fn a_killed_agent_fails_the_turn_and_closes_the_session() {
     }
 }
 
+/// Close returns within 10s and the event stream ends promptly.
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn close_returns_promptly_and_ends_the_stream() {
@@ -1059,6 +1077,7 @@ async fn close_returns_promptly_and_ends_the_stream() {
     }
 }
 
+/// Unadvertised rollback -> UnsupportedFeature, unknown request -> InvalidRequest, prompt after close -> SessionClosed.
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn errors_are_typed() {
