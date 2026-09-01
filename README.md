@@ -17,7 +17,8 @@ anyagent is that layer, **once: it finds the agents, speaks each one's protocol
 API — `Runtime`, `Session`, and a stream of `Events`**.
 
 #### Your app keeps its own transcript, UI, and policy. anyagent owns the processes, the wires, and the turn rules — every agent behaves the same way through it.
-![alt text](image-1.png)
+<img width="583" height="346" alt="image" src="https://github.com/user-attachments/assets/6133087d-e12a-4b66-9990-b7c5e8e81011" />
+
 
 
 ## Use
