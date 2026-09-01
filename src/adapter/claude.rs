@@ -579,6 +579,7 @@ impl Drive {
     async fn handle_command(&mut self, cmd: DriverCommand) -> Result<(), Gone> {
         match cmd {
             DriverCommand::StartTurn { input } => {
+                self.emit(DriverEvent::TurnAck).await?;
                 self.turn_uuid = Some(self.send_user(&input).await?);
             }
             // The CLI queues mid-turn user messages as their own turns

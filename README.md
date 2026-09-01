@@ -33,8 +33,9 @@ use anyagent::{EventKind, Runtime, SessionOptions};
 use futures::StreamExt;
 
 let runtime = Runtime::new();
-let agent = runtime.discover().await.require("claude")?;
-let (session, mut events) = runtime.open(&agent, SessionOptions::in_dir(".")).await?;
+let report = runtime.discover().await;
+let agent = report.require("claude")?;
+let (session, mut events) = runtime.open(agent, SessionOptions::in_dir(".")).await?;
 
 session.prompt("explain this repo").await?;
 while let Some(event) = events.next().await {
@@ -85,7 +86,8 @@ against the agents on your machine:
 |---|---|
 | Claude Code | native (stream-json) |
 | Codex | native (app-server) |
-| Pi | native |
+| Antigravity | native (adapter in progress) |
+| pi | native (pi RPC) |
 | Grok, Hermes Agent, opencode, Kiro CLI, Qwen Code | ACP |
 
 Any other ACP agent works without a catalog entry via
@@ -100,7 +102,7 @@ The generated API reference — every type and signature — is on
 [docs.rs/anyagent](https://docs.rs/anyagent).
 
 ## Contributions
-Contributions are welcome! Please be sure to open an issue first. Upon approval you may create a pr. Please avoid contributing AI-Slop :) ... unless fable wrote it. Read Contributions.md for more specifics!
+Contributions are welcome! Please be sure to open an issue first. Upon approval you may create a pr. Please avoid contributing AI-Slop :) ... unless fable wrote it. Read [contributions.md](contributions.md) for more specifics!
 
 ## License
 

@@ -1,0 +1,11 @@
+{"_sent": {"id": "c", "type": "get_commands"}}
+{"id": "c", "type": "response", "command": "get_commands", "success": true, "data": {"commands": [{"name": "uidemo", "description": "Extension UI demo", "source": "extension", "sourceInfo": {"path": "/private/tmp/claude-501/-Users-spotta-Desktop-Projects-anyagent/48b9235b-0113-4b0d-9541-e65a33355fd6/scratchpad/wire/ui-ext.ts", "source": "cli", "scope": "temporary", "origin": "top-level"}}, {"name": "llama", "description": "Manage llama.cpp router models", "source": "extension", "sourceInfo": {"path": "<inline:llama.cpp>", "source": "inline", "scope": "temporary", "origin": "top-level"}}, {"_trimmed": 9}]}}
+{"_sent": {"id": "u", "type": "prompt", "message": "/uidemo"}}
+{"type": "extension_ui_request", "id": "cf24f997-0bdc-42e1-a100-3de189e6ece4", "method": "select", "title": "Pick a colour", "options": ["Red", "Green"]}
+{"_sent": {"type": "extension_ui_response", "id": "cf24f997-0bdc-42e1-a100-3de189e6ece4", "value": "Green"}}
+{"type": "extension_ui_request", "id": "75a202b0-150e-4120-98b6-5193b4e4f068", "method": "input", "title": "Say something", "placeholder": {"placeholder": "here"}}
+{"_sent": {"type": "extension_ui_response", "id": "75a202b0-150e-4120-98b6-5193b4e4f068", "value": "hello there"}}
+{"type": "extension_ui_request", "id": "5b1162a8-57b9-4cdd-b348-168d099460a6", "method": "confirm", "title": "Sure?", "message": "Really sure?"}
+{"_sent": {"type": "extension_ui_response", "id": "5b1162a8-57b9-4cdd-b348-168d099460a6", "confirmed": true}}
+{"type": "extension_ui_request", "id": "4152f402-aef7-489c-a730-8865aa43831d", "method": "notify", "message": "picked=Green typed=hello there ok=true", "notifyType": "warning"}
+{"id": "u", "type": "response", "command": "prompt", "success": true}

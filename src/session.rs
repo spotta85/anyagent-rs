@@ -21,12 +21,14 @@ use crate::agent::{
 };
 use crate::error::AgentError;
 use crate::event::{
-    Answer, CompletionSource, Delivery, DeliveryKind, Diagnostic, DiagnosticLevel, Event,
-    EventKind, Extensions, MessageId, PermissionChoice, PromptId, Request, RequestId, SessionId,
-    StopReason, ToolId, TurnContext, TurnId, TurnOrigin,
+    Answer, ChoiceId, CompletionSource, Delivery, DeliveryKind, Diagnostic, DiagnosticLevel, Event,
+    EventKind, Extensions, MessageId, PermissionChoice, PromptId, QuestionAnswer, Request,
+    RequestId, SessionId, StopReason, ToolId, TurnContext, TurnId, TurnOrigin,
 };
 
-const EVENT_BUFFER: usize = 256;
+/// Consumer event buffer. Generous because the engine never waits on it: a
+/// consumer that falls this far behind is treated as gone (see `push`).
+const EVENT_BUFFER: usize = 1024;
 const CLOSE_GRACE: Duration = Duration::from_secs(5);
 const QUIET_USER_TURN: Duration = Duration::from_secs(120);
 const QUIET_AGENT_TURN: Duration = Duration::from_secs(20);
@@ -53,11 +55,12 @@ pub struct Session {
     info: Arc<Mutex<SessionInfo>>,
 }
 
-/// Ordered event stream. Buffers 256 events from the delivery task.
+/// Ordered event stream, buffering up to 1024 undrained events.
 ///
-/// Drain it continuously. A full buffer parks the delivery task, not the
-/// engine, so `cancel` and `answer` remain responsive even when the consumer
-/// stalls.
+/// Drain it continuously. The engine never waits on this buffer, so `cancel`
+/// and `answer` stay responsive — but a consumer that falls a full buffer
+/// behind is treated as gone: delivery stops and the session closes, the same
+/// as dropping `Events`.
 pub struct Events(mpsc::Receiver<Result<Event, AgentError>>);
 
 impl Stream for Events {
@@ -158,8 +161,8 @@ impl Session {
 }
 
 /// Spawns the engine task for a fresh driver connection and hands back the
-/// two handles. A delivery task sits between the engine and `Events` so a
-/// full consumer buffer never parks the engine — `cancel` stays responsive.
+/// two handles. The engine never waits on the consumer buffer (`push` uses
+/// `try_send`), so `cancel` stays responsive and memory stays bounded.
 pub(crate) fn start(
     agent: AgentInstallation,
     connection: DriverConnection,
@@ -172,10 +175,7 @@ pub(crate) fn start(
         &connection.info,
     )));
     let (commands_tx, commands_rx) = mpsc::channel(64);
-    let (bounded_tx, bounded_rx) = mpsc::channel(EVENT_BUFFER);
-    let (events_tx, events_rx) = mpsc::unbounded_channel();
-
-    tokio::spawn(delivery_task(events_rx, bounded_tx));
+    let (events_tx, events_rx) = mpsc::channel(EVENT_BUFFER);
 
     let engine = Engine {
         id: id.clone(),
@@ -209,6 +209,7 @@ pub(crate) fn start(
         auto_approve: matches!(options.permission_mode, PermissionMode::AutoApprove),
         exit: None,
         noise_reported: false,
+        awaiting_ack: false,
         done: false,
     };
     tokio::spawn(engine.run(commands_rx, connection.events));
@@ -219,21 +220,8 @@ pub(crate) fn start(
             commands: commands_tx,
             info,
         },
-        Events(bounded_rx),
+        Events(events_rx),
     )
-}
-
-/// Forwards from the engine's unbounded channel to the bounded `Events`
-/// channel. Parks only this task when the consumer stalls, not the engine.
-async fn delivery_task(
-    mut rx: mpsc::UnboundedReceiver<Result<Event, AgentError>>,
-    tx: mpsc::Sender<Result<Event, AgentError>>,
-) {
-    while let Some(event) = rx.recv().await {
-        if tx.send(event).await.is_err() {
-            break;
-        }
-    }
 }
 
 /// The quiet window for inferred completion, or `None` when the wire ends
@@ -282,15 +270,30 @@ enum TurnState {
 /// What an open request accepts, kept for answer validation.
 enum RequestShape {
     Permission(Vec<PermissionChoice>),
-    /// Number of questions asked; the answer must match it.
-    Question(usize),
+    Question(Vec<QuestionShape>),
+}
+
+/// What one question accepts.
+struct QuestionShape {
+    choices: Vec<ChoiceId>,
+    multi_select: bool,
+    allows_free_text: bool,
 }
 
 impl RequestShape {
     fn of(request: &Request) -> Self {
         match request {
             Request::Permission(r) => RequestShape::Permission(r.options.clone()),
-            Request::Question(r) => RequestShape::Question(r.questions.len()),
+            Request::Question(r) => RequestShape::Question(
+                r.questions
+                    .iter()
+                    .map(|q| QuestionShape {
+                        choices: q.choices.iter().map(|c| c.id.clone()).collect(),
+                        multi_select: q.multi_select,
+                        allows_free_text: q.allows_free_text,
+                    })
+                    .collect(),
+            ),
         }
     }
 
@@ -303,11 +306,23 @@ impl RequestShape {
                 }
                 format!("choice {choice:?} was not offered")
             }
-            (RequestShape::Question(count), Answer::Question(answers)) => {
-                if answers.len() == *count {
-                    return Ok(());
+            (RequestShape::Question(questions), Answer::Question(answers)) => {
+                if answers.len() != questions.len() {
+                    format!(
+                        "expected {} answers, got {}",
+                        questions.len(),
+                        answers.len()
+                    )
+                } else {
+                    match questions
+                        .iter()
+                        .zip(answers)
+                        .find_map(|(q, a)| question_complaint(q, a))
+                    {
+                        Some(complaint) => complaint,
+                        None => return Ok(()),
+                    }
                 }
-                format!("expected {count} answers, got {}", answers.len())
             }
             _ => "answer type does not match the request".into(),
         };
@@ -315,11 +330,31 @@ impl RequestShape {
     }
 }
 
+/// The first thing wrong with one question's answer, if anything.
+fn question_complaint(question: &QuestionShape, answer: &QuestionAnswer) -> Option<String> {
+    match answer {
+        QuestionAnswer::Text(_) if question.allows_free_text => None,
+        QuestionAnswer::Text(_) => Some("free text was not allowed".into()),
+        QuestionAnswer::Choices(choices) => {
+            if choices.is_empty() {
+                return Some("no choice given".into());
+            }
+            if choices.len() > 1 && !question.multi_select {
+                return Some("multiple choices for a single-select question".into());
+            }
+            choices
+                .iter()
+                .find(|c| !question.choices.contains(c))
+                .map(|c| format!("choice `{}` was not offered", c.as_str()))
+        }
+    }
+}
+
 struct Engine {
     id: SessionId,
     info: Arc<Mutex<SessionInfo>>,
     driver: mpsc::Sender<DriverCommand>,
-    events: mpsc::UnboundedSender<Result<Event, AgentError>>,
+    events: mpsc::Sender<Result<Event, AgentError>>,
     events_alive: bool,
     seq: u64,
     next_turn: u64,
@@ -340,6 +375,8 @@ struct Engine {
     /// Exit report from the adapter, delivered just before its channel closes.
     exit: Option<(String, String)>,
     noise_reported: bool,
+    /// A `StartTurn` is unacknowledged: content arriving now is stale.
+    awaiting_ack: bool,
     done: bool,
 }
 
@@ -589,7 +626,19 @@ impl Engine {
     // -- driver events --------------------------------------------------------
 
     async fn handle_driver_event(&mut self, ev: DriverEvent) {
+        // Turn content delivered between our `StartTurn` and the adapter's
+        // ack belongs to a turn the engine already ended; attributing it to
+        // the new turn would corrupt it, so it is dropped. Session-level
+        // bookkeeping (usage receipts, diagnostics) still passes.
+        if self.awaiting_ack {
+            match &ev {
+                DriverEvent::Event { kind, .. } if is_content(kind) => return,
+                DriverEvent::TurnEnded(_) => return,
+                _ => {}
+            }
+        }
         match ev {
+            DriverEvent::TurnAck => self.awaiting_ack = false,
             DriverEvent::Steered(accepted) => self.resolve_steer(accepted).await,
             DriverEvent::TurnEnded(stop) => self.handle_turn_ended(stop).await,
             DriverEvent::InfoChanged(info) => self.handle_info_changed(info).await,
@@ -709,7 +758,7 @@ impl Engine {
         if self.events_alive
             && self
                 .events
-                .send(Err(AgentError::AuthRequired { login }))
+                .try_send(Err(AgentError::AuthRequired { login }))
                 .is_err()
         {
             self.events_alive = false;
@@ -738,7 +787,7 @@ impl Engine {
                 .unwrap_or_else(|| ("unknown".into(), String::new()));
             if self
                 .events
-                .send(Err(AgentError::ProcessExited { status, stderr }))
+                .try_send(Err(AgentError::ProcessExited { status, stderr }))
                 .is_err()
             {
                 self.events_alive = false;
@@ -786,6 +835,7 @@ impl Engine {
     /// driver is reported by `driver_gone`, which ends the turn as Failed.
     async fn start_turn(&mut self, prompt_id: PromptId, input: Input) -> TurnId {
         let turn = self.enter_running(TurnOrigin::Prompt(prompt_id)).await;
+        self.awaiting_ack = true;
         let _ = self.forward(DriverCommand::StartTurn { input }).await;
         turn
     }
@@ -909,10 +959,10 @@ impl Engine {
         self.push(turn, kind, Extensions::new()).await;
     }
 
-    /// Assigns the sequence number and delivers. A dropped `Events` stops
-    /// delivery and starts shutdown. The unbounded channel never parks the
-    /// engine, so `cancel` stays responsive even when the bounded consumer
-    /// buffer is full.
+    /// Assigns the sequence number and delivers. `try_send` never parks the
+    /// engine, so `cancel` stays responsive; a dropped `Events` — or one so
+    /// stalled the buffer filled, which bounds memory — stops delivery and
+    /// starts shutdown.
     async fn push(&mut self, turn: Option<TurnContext>, kind: EventKind, extensions: Extensions) {
         if !self.events_alive {
             return;
@@ -925,7 +975,7 @@ impl Engine {
             kind,
             extensions,
         };
-        if self.events.send(Ok(event)).is_err() {
+        if self.events.try_send(Ok(event)).is_err() {
             self.events_alive = false;
             self.begin_close(None).await;
         }

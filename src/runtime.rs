@@ -52,6 +52,9 @@ impl Runtime {
                 Connection::Native(NativeKind::Codex) => {
                     Arc::new(crate::adapter::codex::CodexAdapter::new())
                 }
+                Connection::Native(NativeKind::Pi) => {
+                    Arc::new(crate::adapter::pi::PiAdapter::new())
+                }
                 // Antigravity's wire is unvalidated (ticket 05); no driver yet.
                 Connection::Native(NativeKind::Antigravity) => continue,
             };

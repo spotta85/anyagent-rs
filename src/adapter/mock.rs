@@ -48,6 +48,9 @@ pub(crate) struct Script {
     pub deterministic_agent: bool,
     /// Driver event channel capacity; small values exercise backpressure.
     pub buffer: usize,
+    /// Emitted before each `StartTurn`'s ack, modelling a frame from the
+    /// previous turn that lost the promotion race.
+    pub stale_before_ack: Option<EventKind>,
 }
 
 impl Default for Script {
@@ -59,6 +62,7 @@ impl Default for Script {
             deterministic: true,
             deterministic_agent: true,
             buffer: 64,
+            stale_before_ack: None,
         }
     }
 }
@@ -166,6 +170,14 @@ async fn drive(
         };
         match cmd {
             DriverCommand::StartTurn { .. } => {
+                if let Some(kind) = script.stale_before_ack.clone()
+                    && !send(DriverEvent::event(kind)).await
+                {
+                    return;
+                }
+                if !send(DriverEvent::TurnAck).await {
+                    return;
+                }
                 steps = script.turns.pop_front().unwrap_or_default().into();
                 turn_open = true;
             }

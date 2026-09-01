@@ -28,6 +28,8 @@ use anyagent::{
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(120);
 const OPENCODE_MODEL: &str = "openrouter/meta/muse-spark-1.2";
+/// pi's model values are `provider/modelId`.
+const PI_MODEL: &str = "openrouter/nvidia/nemotron-3-super-120b-a12b:free";
 const COUNT: &str = "Count from 1 to 400, one number per line. No other text. No tools.";
 
 // -- gate -------------------------------------------------------------------
@@ -52,13 +54,15 @@ fn enabled() -> Vec<&'static str> {
         println!("SKIP all: ANYAGENT_LIVE is not set");
         return Vec::new();
     };
-    ["claude", "codex", "opencode", "hermes", "kiro"]
+    ["claude", "codex", "opencode", "hermes", "kiro", "pi"]
         .into_iter()
         .filter(|h| list == "all" || list.split(',').any(|p| p.trim() == *h))
         .filter(|h| {
-            let keyless = *h == "opencode" && std::env::var("OPENROUTER_API_KEY").is_err();
+            // opencode and pi are pinned to an openrouter model.
+            let keyless =
+                (*h == "opencode" || *h == "pi") && std::env::var("OPENROUTER_API_KEY").is_err();
             if keyless {
-                println!("SKIP opencode: OPENROUTER_API_KEY is not set");
+                println!("SKIP {h}: OPENROUTER_API_KEY is not set");
             }
             !keyless
         })
@@ -76,6 +80,23 @@ async fn discovery_finds_authenticated_harnesses() {
             .require(h)
             .unwrap_or_else(|_| panic!("{h}: not discovered"));
         assert!(agent.executable_path.exists(), "{h}: executable missing");
+        // pi writes an empty auth.json on first run, so its existence proves
+        // nothing: the only offline markers are the provider key env vars,
+        // and `probe` answers for real from `pi auth check`.
+        if h == "pi" && !matches!(agent.auth, Some(AuthStatus::Authenticated { .. })) {
+            assert!(
+                matches!(agent.auth, Some(AuthStatus::Unauthenticated { .. })),
+                "{h}: unexpected marker: {:?}",
+                agent.auth
+            );
+            let auth = Runtime::new().probe_auth(agent).await.unwrap();
+            assert!(
+                matches!(auth, AuthStatus::Authenticated { .. }),
+                "{h}: probe says not authenticated: {auth:?}"
+            );
+            pass(h, "discovered, authenticated by probe (no offline marker)");
+            continue;
+        }
         // kiro has no honest offline marker (sqlite credential): discovery
         // reports no auth and `probe` answers for real.
         if h == "kiro" {
@@ -111,11 +132,22 @@ async fn open_reports_token_capabilities_and_options() {
                 .iter()
                 .any(|o| o.id.as_str() == id)
         };
-        assert!(
-            caps.supports(Capability::Permissions),
-            "{h}: no Permissions"
-        );
-        assert!(has_option("mode"), "{h}: no `mode` config option");
+        // pi has no permission protocol on its wire and no permission mode:
+        // its `mode`-shaped knob is the model's thinking level.
+        if h == "pi" {
+            assert!(
+                !caps.supports(Capability::Permissions),
+                "{h}: has Permissions"
+            );
+            assert!(caps.supports(Capability::Steer), "{h}: no Steer");
+            assert!(has_option("model"), "{h}: no `model` config option");
+        } else {
+            assert!(
+                caps.supports(Capability::Permissions),
+                "{h}: no Permissions"
+            );
+            assert!(has_option("mode"), "{h}: no `mode` config option");
+        }
         if h == "claude" {
             for cap in [
                 Capability::Images,
@@ -324,6 +356,16 @@ async fn permissions_gate_the_write_and_deny_holds() {
             "Create a file named note.txt containing exactly the word HELLO. Use your file tools.";
         // Session A: allow — the request closes and the file lands.
         let (session, mut events, dir) = open(h).await;
+        if !session
+            .info()
+            .details
+            .capabilities
+            .supports(Capability::Permissions)
+        {
+            println!("SKIP {h}: permissions not advertised");
+            session.close().await.unwrap();
+            continue;
+        }
         session.prompt(write).await.unwrap();
         let mut asked = false;
         loop {
@@ -1078,6 +1120,9 @@ async fn open(harness: &str) -> (Session, Events, tempfile::TempDir) {
     if harness == "opencode" {
         options = options.configure("model", OPENCODE_MODEL);
     }
+    if harness == "pi" {
+        options = options.configure("model", PI_MODEL);
+    }
     if harness == "codex" {
         // Deterministic approvals regardless of the host config: a write
         // escalates past the read-only sandbox and asks.
@@ -1147,14 +1192,18 @@ async fn expect_cancelled(events: &mut Events, step: &str) {
         .unwrap_or_else(|_| panic!("no Cancelled turn end within 10s at {step}"));
 }
 
-/// Asserts no turn traffic arrives for `secs` seconds. Diagnostics are the
-/// sanctioned form of out-of-turn noise (kiro emits metadata notifications
-/// between turns) and don't break the quiet.
+/// Asserts no turn traffic arrives for `secs` seconds. Diagnostics (kiro
+/// emits metadata notifications between turns) and plan-usage receipts
+/// (claude fetches usage after each result frame, so the receipt lands
+/// post-turn by design) are the sanctioned out-of-turn events.
 async fn quiet(events: &mut Events, secs: u64, step: &str) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
     while let Ok(Some(event)) = tokio::time::timeout_at(deadline, events.next()).await {
         let kind = event.map(|e| e.kind);
-        if !matches!(kind, Ok(EventKind::Diagnostic(_))) {
+        if !matches!(
+            kind,
+            Ok(EventKind::Diagnostic(_) | EventKind::PlanUsageUpdated(_))
+        ) {
             panic!("expected quiet at {step}, got {kind:?}");
         }
     }
@@ -1166,20 +1215,22 @@ fn kill_child(harness: &str, session: &Session) {
     // its newest `opencode acp` process.
     let (args, pattern): (&[&str], String) = match harness {
         "claude" => (
-            &[],
+            &["-f"],
             session.info().resume_token.unwrap().as_str().to_owned(),
         ),
         // Both halves: `kiro-cli acp` dispatches to a `kiro-cli-chat acp`
         // worker that inherits the pipes — killing only the dispatcher lets
         // the turn complete. Anchored so the user's Kiro apps' own
         // `kiro-cli acp --agent <name>` processes never match.
-        "kiro" => (&[], "kiro-cli(-chat)? acp$".to_owned()),
-        "codex" => (&["-n"], "codex app-server".to_owned()),
-        _ => (&["-n"], "opencode acp".to_owned()),
+        "kiro" => (&["-f"], "kiro-cli(-chat)? acp$".to_owned()),
+        "codex" => (&["-n", "-f"], "codex app-server".to_owned()),
+        // pi overwrites its argv with its own process title, so there is no
+        // command line to match: the exact name plus newest-first is ours.
+        "pi" => (&["-n", "-x"], "pi".to_owned()),
+        _ => (&["-n", "-f"], "opencode acp".to_owned()),
     };
     let out = std::process::Command::new("pgrep")
         .args(args)
-        .arg("-f")
         .arg(&pattern)
         .output()
         .unwrap();
@@ -1264,19 +1315,22 @@ fn claude_transcripts() -> std::collections::BTreeSet<std::path::PathBuf> {
 #[ignore = "live: talks to real agents"]
 async fn config_home_isolates_login() {
     for h in enabled() {
-        if h != "claude" && h != "codex" {
-            println!("SKIP {h}: config-home isolation asserted on claude and codex");
+        if h != "claude" && h != "codex" && h != "pi" {
+            println!("SKIP {h}: config-home isolation asserted on claude, codex and pi");
             continue;
         }
         let runtime = Runtime::new();
         let report = runtime.discover().await;
         let agent = report.require(h).unwrap();
-        // The real login is present (offline marker), proving the default
-        // path is authenticated.
+        // The real login is present, proving the default path is
+        // authenticated. pi has no offline marker, so its probe answers.
+        let auth = match h {
+            "pi" => runtime.probe_auth(agent).await.unwrap(),
+            _ => agent.auth.clone().unwrap(),
+        };
         assert!(
-            matches!(agent.auth, Some(AuthStatus::Authenticated { .. })),
-            "{h}: default login is not authenticated: {:?}",
-            agent.auth
+            matches!(auth, AuthStatus::Authenticated { .. }),
+            "{h}: default login is not authenticated: {auth:?}"
         );
         // An empty temp config home has no credentials. NEVER touch ~/.claude
         // itself; the temp dir is discarded at the end of the test.

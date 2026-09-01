@@ -14,16 +14,22 @@ real install.
 |---|---|---|---|---|
 | Claude Code | `claude` | `claude` | native (stream-json) | `npm install -g @anthropic-ai/claude-code` |
 | Codex | `codex` | `codex` | native (app-server) | `npm install -g @openai/codex` |
-| Antigravity | `antigravity` | `agy` | native | [antigravity.google](https://antigravity.google), then `agy install` |
+| Antigravity | `antigravity` | `agy` | native (adapter in progress — not yet openable) | [antigravity.google](https://antigravity.google), then `agy install` |
 | Grok | `grok` | `grok` | ACP | `npm install -g @xai-official/grok` |
 | Hermes Agent | `hermes` | `hermes` | ACP | [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) |
 | opencode | `opencode` | `opencode` | ACP | `brew install sst/tap/opencode` |
 | Kiro CLI | `kiro` | `kiro-cli` | ACP | [kiro.dev](https://kiro.dev) |
 | Qwen Code | `qwen` | `qwen` | ACP | `npm install -g @qwen-code/qwen-code` |
+| pi | `pi` | `pi` | native (pi RPC) | `npm install -g @earendil-works/pi-coding-agent` |
 
 <Note>
 Gemini CLI was removed in favour of Antigravity after Google sunset personal
 OAuth for it.
+</Note>
+
+<Note>
+`pi` is provider-key based: log in with `/login <provider>` inside the CLI,
+or set the provider's API-key variable.
 </Note>
 
 ## Any other ACP agent
@@ -71,5 +77,6 @@ SessionOptions::in_dir(".").config_home("/path/to/work-account")
 ```
 
 anyagent sets the agent's own config-home variable (`CLAUDE_CONFIG_DIR`,
-`CODEX_HOME`, …) for that process. Agents whose profile has no such variable
-ignore the option.
+`CODEX_HOME`, …) for that process. Opening an agent whose profile has no such
+variable with `config_home` set fails with `InvalidConfiguration` — an
+isolation request is never silently dropped.
