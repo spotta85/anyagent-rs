@@ -572,6 +572,7 @@ impl Drive {
     async fn handle_command(&mut self, cmd: DriverCommand) -> Result<(), Gone> {
         match cmd {
             DriverCommand::StartTurn { input } => {
+                self.emit(DriverEvent::TurnAck).await?;
                 // `_meta.promptId` lets grok's prompt-complete extension name
                 // this exact prompt; spec-conformant agents ignore `_meta`.
                 self.prompt_seq += 1;

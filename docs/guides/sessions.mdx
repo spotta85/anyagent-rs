@@ -35,7 +35,8 @@ let (session, events) = runtime
 | `record_wire(path)` | Dump the raw protocol traffic to a file |
 
 `record_wire` is the one to reach for when an agent misbehaves — it captures
-exactly what crossed the wire.
+exactly what crossed the wire, unredacted (prompts, file contents, command
+output — possibly secrets), so treat the file as sensitive.
 
 ## Prompting
 
@@ -77,7 +78,9 @@ session
     .await?;
 ```
 
-Check `Capability::Images` first — agents that can't take images will reject it.
+Check `Capability::Images` to know how it lands: agents that take images get
+them inline; for the rest the attachment degrades to a path reference in the
+prompt text, which the agent can read with its own file tools.
 
 ## Answering requests
 
@@ -141,8 +144,9 @@ Ends the agent session and waits for cleanup, capped by a grace period.
 
 <Warning>
 Processes the agent spawned itself — backgrounded shells, subagents — may
-outlive the session. If your app needs them dead, track them from
-`TurnEnded { background, .. }` and clean up yourself.
+outlive the session. `TurnEnded { background, .. }` names the tools still
+running so a UI can show them, but tool ids are not process handles: an app
+that must kill such processes needs its own OS-level tracking.
 </Warning>
 
 ## Capabilities

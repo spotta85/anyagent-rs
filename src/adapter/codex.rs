@@ -581,6 +581,7 @@ impl Drive {
     async fn handle_command(&mut self, cmd: DriverCommand) -> Result<(), Gone> {
         match cmd {
             DriverCommand::StartTurn { input } => {
+                self.emit(DriverEvent::TurnAck).await?;
                 let text = self.input_text(&input).await?;
                 // model and effort ride on every turn (per-turn parameters).
                 let mut params = json!({

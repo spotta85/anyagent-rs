@@ -286,6 +286,66 @@ async fn bookkeeping_after_turn_end_is_not_a_turn_and_late_stops_are_diagnostics
 }
 
 #[tokio::test]
+async fn a_stalled_consumer_is_disconnected_instead_of_growing_memory() {
+    // More events than the consumer buffer (1024) holds, never drained.
+    let mut steps: Vec<Step> = (0..1300)
+        .map(|i| Step::Emit(text("m1", &format!("{i} "))))
+        .collect();
+    steps.push(Step::End(completed()));
+    let (session, mut events) = open(MockAdapter::new(Script::default().turn(steps)), None).await;
+    session.prompt("go").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The engine treats a consumer this far behind as gone: the stream
+    // delivers what the buffer held, then ends — it never grows unbounded.
+    let mut delivered = 0;
+    while tokio::time::timeout(Duration::from_secs(5), events.next())
+        .await
+        .expect("the stream should end after the disconnect")
+        .is_some()
+    {
+        delivered += 1;
+    }
+    assert!(
+        delivered <= 1024,
+        "buffer overflowed: {delivered} delivered"
+    );
+}
+
+#[tokio::test]
+async fn frames_losing_the_promotion_race_are_dropped_not_reattributed() {
+    // A frame from an ended turn that arrives after the engine promoted the
+    // next prompt used to land in the new turn. Adapters now ack `StartTurn`;
+    // the engine drops anything delivered before the ack.
+    let script = Script {
+        stale_before_ack: Some(text("m-old", "stale tail")),
+        ..Script::default()
+    }
+    .turn(vec![
+        Step::Emit(text("m1", "first")),
+        Step::End(completed()),
+    ])
+    .turn(vec![
+        Step::Emit(text("m2", "second")),
+        Step::End(completed()),
+    ]);
+    let (session, mut events) = open(MockAdapter::new(script), None).await;
+    session.prompt("go").await.unwrap();
+    session.prompt("then").await.unwrap();
+
+    let mut texts = Vec::new();
+    let mut ended = 0;
+    while ended < 2 {
+        match next(&mut events).await.kind {
+            EventKind::TextDelta { text, .. } => texts.push(text),
+            EventKind::TurnEnded { .. } => ended += 1,
+            _ => {}
+        }
+    }
+    assert_eq!(texts, vec!["first", "second"], "stale frames must not land");
+}
+
+#[tokio::test]
 async fn slow_consumer_does_not_lose_events() {
     let mut steps: Vec<Step> = (0..1000)
         .map(|i| Step::Emit(text("m1", &format!("{i} "))))
@@ -302,10 +362,8 @@ async fn slow_consumer_does_not_lose_events() {
     session.prompt("go").await.unwrap();
 
     // Slow consumer: do not drain for a bit, then verify nothing was lost
-    // and ordering is preserved. The delivery task buffers between the engine
-    // and the bounded `Events` channel, so the driver may have already sent
-    // all 1000 deltas — that is fine; the invariant is no loss, not that the
-    // driver was held back.
+    // and ordering is preserved. 1000 deltas fit in the consumer buffer
+    // (1024); the invariant is no loss below the disconnect threshold.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let mut texts = 0;
@@ -335,7 +393,7 @@ async fn cancel_is_not_blocked_by_full_event_buffer() {
     let (session, mut events) = open(adapter, None).await;
     session.prompt("go").await.unwrap();
 
-    // Let the engine fill the consumer buffer and park the delivery task.
+    // Let the engine deliver a large backlog without the consumer draining.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     tokio::time::timeout(Duration::from_secs(1), session.cancel(false))

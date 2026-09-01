@@ -15,7 +15,7 @@ use anyagent::Runtime;
 let runtime = Runtime::new();
 let report = runtime.discover().await;
 
-for agent in &report.installed {
+for agent in &report.agents {
     println!("{} at {}", agent.name, agent.executable_path.display());
 }
 for missing in &report.missing {
@@ -32,12 +32,14 @@ how to install it" are the same lookup.
 let agent = report.require("claude")?;
 ```
 
-`require` returns `AgentError` naming the agent and its install hint when it
-isn't there, which is usually the error you want to bubble straight to the user.
+`require` returns `AgentError::NotInstalled` naming the agent when it isn't
+there; the matching `report.missing` entry carries the install hint to show.
 
 <Tip>
-Discovery is filesystem work only — no processes launched, no network. Call
-`runtime.prewarm()` early if you want the scan warmed before the user needs it.
+Discovery never launches an agent and never touches the network. (It may run
+the user's login shell once to learn the real `PATH`, and the macOS `security`
+tool to check keychain markers.) Call `runtime.prewarm()` early if you want
+the scan warmed before the user needs it.
 </Tip>
 
 ## Probe
@@ -52,7 +54,7 @@ println!("version {:?}", details.version);
 println!("auth: {:?}", details.auth);
 
 for option in &details.config_options {
-    println!("option {} = {:?}", option.id.as_str(), option.value);
+    println!("option {} = {:?}", option.id.as_str(), option.current);
 }
 for command in &details.commands {
     println!("/{}", command.name);
@@ -70,10 +72,11 @@ If you only need the login state, `probe_auth` is the cheaper path:
 let status = runtime.probe_auth(&agent).await?;
 ```
 
-It answers from login markers where an agent has an honest one, and falls back
-to asking the agent when it doesn't. Kiro CLI is the second case: its credential
-lives in a sqlite row that exists logged out too, so discovery reports `Unknown`
-and the probe gives the real answer.
+It opens a short-lived session and reads the answer from the agent itself, so
+it is right even for agents with no honest offline marker. Kiro CLI is one:
+its credential lives in a sqlite row that exists logged out too, so discovery
+reports `Unknown` and the probe gives the real answer. (Offline markers are
+what `discover()` reports — instant, best-effort.)
 
 <Warning>
 anyagent never reads or holds credentials. It checks whether a marker exists,

@@ -167,9 +167,15 @@ live connection, never assumed. The full set: `Images`, `Resume`, `Steer`,
 **How:** `SessionOptions::record_wire(path)` tees every raw protocol frame,
 both directions, to a JSONL file. A recording failure never fails a turn.
 
+<Warning>
+A recording contains everything that crossed the wire: prompts, file
+contents, command output, paths — possibly secrets. It is unredacted and
+append-only. Treat the file as sensitive and delete it after debugging.
+</Warning>
+
 ## See it all run
 
-The [`examples/`](https://github.com/spotta85/anyagent/tree/main/examples)
+The [`examples/`](https://github.com/spotta85/anyagent-rs/tree/main/examples)
 folder is the tour: `chat.rs` (the core loop), `sessions.rs` (concurrent
 sessions + resume), `probe.rs` (discovery + probe). Each is small, commented,
 and runs against the agents on your machine.

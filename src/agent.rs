@@ -452,6 +452,9 @@ impl SessionOptions {
     /// reports: one JSON object per line, `{"dir":"in"|"out","frame":<frame>}`,
     /// append-only and flushed per line. A recording failure never fails a
     /// turn. Unset (the default) records nothing.
+    ///
+    /// The file is unredacted — prompts, file contents, command output, and
+    /// possibly secrets — so treat it as sensitive and delete it after use.
     pub fn record_wire(mut self, path: impl Into<PathBuf>) -> Self {
         self.record_wire = Some(path.into());
         self

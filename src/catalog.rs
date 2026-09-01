@@ -49,6 +49,8 @@ pub(crate) enum NativeKind {
     /// Antigravity's `agy` CLI: its own stream-json event dialect
     /// (`--input-format=stream-json`, validated 2026-08-23). Adapter pending.
     Antigravity,
+    /// The pi RPC wire (`--mode rpc`).
+    Pi,
 }
 
 /// Offline auth markers for fast discovery.
@@ -200,6 +202,36 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         install_hint: "install Kiro CLI from https://kiro.dev",
         extra_paths: &[".local/bin"],
     },
+    AgentProfile {
+        id: "pi",
+        name: "pi",
+        cli: "pi",
+        executable_env: "ANYAGENT_PI_BIN",
+        // The agent dir itself, which is what `PI_CODING_AGENT_DIR` replaces
+        // (documented in `pi --help`, probed 2026-08-30).
+        config_dir: ".pi/agent",
+        config_home_env: Some("PI_CODING_AGENT_DIR"),
+        connection: Connection::Native(NativeKind::Pi),
+        // No file marker: `auth.json` is written empty on first run, so it
+        // exists logged out too (probed 2026-08-30). The adapter answers for
+        // real from `pi auth check`; these are the API-key alternatives pi
+        // documents, and they double as its `EnvVar` login methods.
+        auth_markers: &[
+            AuthMarker::ApiKeyEnv("ANTHROPIC_API_KEY"),
+            AuthMarker::ApiKeyEnv("OPENAI_API_KEY"),
+            AuthMarker::ApiKeyEnv("OPENROUTER_API_KEY"),
+        ],
+        // A session opens fine with no provider configured, so an open proves
+        // nothing (probed 2026-08-30).
+        open_auth_kind: None,
+        auth_error_hints: &[],
+        // Login is the TUI's own `/login <provider>`; there is no CLI verb.
+        login_args: &[],
+        install_hint: "npm install -g @earendil-works/pi-coding-agent",
+        extra_paths: &[".bun/bin", ".local/bin"],
+    },
+    // oh-my-pi (`omp`) speaks the same pi RPC wire and would be one more
+    // profile on `NativeKind::Pi`; deferred to its own ticket.
     AgentProfile {
         id: "qwen",
         name: "Qwen Code",

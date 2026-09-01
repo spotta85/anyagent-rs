@@ -28,6 +28,7 @@ pub(crate) mod codex;
 mod conformance;
 #[cfg(test)]
 pub(crate) mod mock;
+pub(crate) mod pi;
 
 /// What the engine asks an adapter to do.
 #[derive(Debug)]
@@ -67,6 +68,10 @@ pub(crate) enum DriverEvent {
         parent_tool_id: Option<ToolId>,
         extensions: Extensions,
     },
+    /// Acknowledges `StartTurn`, sent before any of the new turn's events.
+    /// Content and turn ends delivered before it belong to earlier turns;
+    /// the engine drops them instead of attributing them to the new one.
+    TurnAck,
     /// Wire evidence that the current turn ended.
     TurnEnded(StopReason),
     /// Outcome of the last `Steer` command.

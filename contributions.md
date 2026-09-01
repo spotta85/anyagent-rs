@@ -23,9 +23,16 @@ Docs must be updated in the same PR. A PR that changes the interface without upd
 
 ## Testing
 
-Every change needs proof it works.
+Every change needs proof it works. The `justfile` is the front door (install [just](https://github.com/casey/just), run `just` to see all commands):
 
-- Show it working against every harness it touches for the relevent feature.
+- `just check` — format, lint, and offline tests. Must pass on every PR.
+- `just features` — lists the live feature tests in `tests/live.rs`.
+- `just live <harness> [feature]` — runs live tests against a real installed agent, e.g. `just live claude cancel`.
+
+Rules:
+
+- Show it working against every harness it touches for the relevent feature: `just live <harness> <feature>` and paste the output in the PR.
+- If you add or change a feature, add or update its test in `tests/live.rs` so `just live` covers it.
 - Run a live test. This can be done through the llm of your choice or manually. Include a script of the test + a video if necessary and the test output. 
   - For example, if you made a change to the auth discovery feature for antigravity, the write a script that will launch antigravity cli using anyagent code, use the updated discovery function, and output result and then show that result is true (video of antygravity being logged out / loggin in if that's what the change was relating to).
 
