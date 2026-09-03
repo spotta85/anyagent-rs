@@ -88,7 +88,8 @@ against the agents on your machine:
 | Codex | native (app-server) |
 | Antigravity | native (adapter in progress) |
 | pi | native (pi RPC) |
-| Grok, Hermes Agent, opencode, Kiro CLI, Qwen Code | ACP |
+| opencode | native (HTTP + SSE) |
+| Grok, Hermes Agent, Kiro CLI, Qwen Code | ACP |
 
 Any other ACP agent works without a catalog entry via
 `AgentInstallation::acp(name, path, args)`.

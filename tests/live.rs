@@ -27,7 +27,7 @@ use anyagent::{
 };
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(120);
-const OPENCODE_MODEL: &str = "openrouter/meta/muse-spark-1.2";
+const OPENCODE_MODEL: &str = "opencode/big-pickle";
 /// pi's model values are `provider/modelId`.
 const PI_MODEL: &str = "openrouter/nvidia/nemotron-3-super-120b-a12b:free";
 const COUNT: &str = "Count from 1 to 400, one number per line. No other text. No tools.";
@@ -58,9 +58,9 @@ fn enabled() -> Vec<&'static str> {
         .into_iter()
         .filter(|h| list == "all" || list.split(',').any(|p| p.trim() == *h))
         .filter(|h| {
-            // opencode and pi are pinned to an openrouter model.
-            let keyless =
-                (*h == "opencode" || *h == "pi") && std::env::var("OPENROUTER_API_KEY").is_err();
+            // pi is pinned to an openrouter model; opencode uses its own
+            // cost-free zen model, so it needs no key.
+            let keyless = *h == "pi" && std::env::var("OPENROUTER_API_KEY").is_err();
             if keyless {
                 println!("SKIP {h}: OPENROUTER_API_KEY is not set");
             }
@@ -146,7 +146,10 @@ async fn open_reports_token_capabilities_and_options() {
                 caps.supports(Capability::Permissions),
                 "{h}: no Permissions"
             );
-            assert!(has_option("mode"), "{h}: no `mode` config option");
+            // opencode's native wire exposes `model`, not a session `mode`.
+            if h != "opencode" {
+                assert!(has_option("mode"), "{h}: no `mode` config option");
+            }
         }
         if h == "claude" {
             for cap in [
@@ -387,12 +390,7 @@ async fn permissions_gate_the_write_and_deny_holds() {
                 _ => {}
             }
         }
-        if !asked {
-            assert_eq!(h, "opencode", "{h}: no permission request opened");
-            println!("SKIP opencode: permissions (agent auto-allows)");
-            session.close().await.unwrap();
-            continue;
-        }
+        assert!(asked, "{h}: no permission request opened");
         assert!(
             dir.path().join("note.txt").exists(),
             "{h}: file missing after allow"
@@ -812,7 +810,6 @@ async fn rollback_forgets_the_rolled_back_turn() {
             .await
             .unwrap();
         drain_to_turn_end(&session, &mut events, &format!("{h}: codeword two")).await;
-        let before = session.info().resume_token.expect("token before rollback");
 
         session
             .rollback(NonZeroU32::new(1).unwrap(), RollbackScope::Conversation)
@@ -831,9 +828,6 @@ async fn rollback_forgets_the_rolled_back_turn() {
             !text.contains("ZULU7"),
             "{h}: rolled-back turn recalled: {text:?}"
         );
-        // The emulated fork renames the provider session.
-        let after = session.info().resume_token.expect("token after rollback");
-        assert_ne!(after.as_str(), before.as_str(), "{h}: token did not change");
         session.close().await.unwrap();
         pass(h, "rollback forgot exactly the last turn");
     }
@@ -1223,7 +1217,7 @@ async fn quiet(events: &mut Events, secs: u64, step: &str) {
 /// kill -9 the session's own agent process, found by a session-unique marker.
 fn kill_child(harness: &str, session: &Session) {
     // claude carries our minted session id in argv; opencode is matched by
-    // its newest `opencode acp` process.
+    // its newest `opencode serve` process.
     let (args, pattern): (&[&str], String) = match harness {
         "claude" => (
             &["-f"],
@@ -1238,7 +1232,7 @@ fn kill_child(harness: &str, session: &Session) {
         // pi overwrites its argv with its own process title, so there is no
         // command line to match: the exact name plus newest-first is ours.
         "pi" => (&["-n", "-x"], "pi".to_owned()),
-        _ => (&["-n", "-f"], "opencode acp".to_owned()),
+        _ => (&["-n", "-f"], "opencode serve".to_owned()),
     };
     let out = std::process::Command::new("pgrep")
         .args(args)

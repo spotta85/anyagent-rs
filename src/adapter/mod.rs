@@ -28,6 +28,7 @@ pub(crate) mod codex;
 mod conformance;
 #[cfg(test)]
 pub(crate) mod mock;
+pub(crate) mod opencode;
 pub(crate) mod pi;
 
 /// What the engine asks an adapter to do.
@@ -278,4 +279,23 @@ pub(crate) trait Adapter: Send + Sync {
         let _ = installation;
         Err(AgentError::UnsupportedFeature("plan usage".into()))
     }
+}
+
+/// A `todos` array (`{content, status}` items, the Claude/opencode shape) as
+/// plan entries.
+pub(crate) fn plan_entries(todos: &Value) -> Vec<crate::event::PlanEntry> {
+    use crate::event::{PlanEntry, PlanStatus};
+    todos
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|todo| PlanEntry {
+            text: todo["content"].as_str().unwrap_or_default().to_owned(),
+            status: match todo["status"].as_str().unwrap_or_default() {
+                "in_progress" => PlanStatus::InProgress,
+                "completed" => PlanStatus::Completed,
+                _ => PlanStatus::Pending,
+            },
+        })
+        .collect()
 }
