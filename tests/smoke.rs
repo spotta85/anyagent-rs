@@ -1,3 +1,4 @@
+/// Smoke-prints discovered agents and missing agents without asserting.
 #[tokio::test]
 async fn discover_smoke() {
     let report = anyagent::Runtime::new().discover().await;

@@ -207,6 +207,7 @@ mod tests {
         }
     }
 
+    /// compose_path dedupes and orders exec dir > own PATH > login-shell PATH.
     #[test]
     fn compose_path_orders_and_dedupes() {
         let path = compose_path(
@@ -217,6 +218,7 @@ mod tests {
         assert_eq!(path, "/opt/agent/bin:/usr/bin:/home/u/.volta/bin");
     }
 
+    /// Shutdown escalates to SIGKILL when child traps SIGTERM within grace.
     #[tokio::test]
     async fn shutdown_escalates_to_sigkill_within_grace() {
         let mut child = spawn(sh("trap '' TERM; sleep 30")).await.unwrap();
@@ -225,12 +227,14 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(5));
     }
 
+    /// Shutdown lets cooperative child exit cleanly on SIGTERM.
     #[tokio::test]
     async fn shutdown_lets_a_cooperative_child_exit_on_sigterm() {
         let mut child = spawn(sh("sleep 30")).await.unwrap();
         child.shutdown(Duration::from_secs(5)).await;
     }
 
+    /// stderr_tail retains last 6 lines for ProcessExited reports.
     #[tokio::test]
     async fn stderr_tail_keeps_the_last_lines() {
         let mut child = spawn(sh("for i in 1 2 3 4 5 6 7 8; do echo line$i 1>&2; done"))

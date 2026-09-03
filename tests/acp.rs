@@ -64,6 +64,7 @@ fn catalog_wrapper(agent: &str, name: &str, flags: &str) -> AgentInstallation {
     AgentInstallation::at(agent, path)
 }
 
+/// Full turn maps every ACP update kind: text, reasoning, tool, plan, usage, SessionUpdated, permission request, and agent-originated turn.
 #[tokio::test]
 async fn a_full_turn_maps_every_update_kind() {
     let (session, mut events) = open(&[]).await;
@@ -164,6 +165,7 @@ async fn a_full_turn_maps_every_update_kind() {
     session.close().await.unwrap();
 }
 
+/// Handshake fills SessionInfo with version 0.0.1, capabilities, config options, and resume token.
 #[tokio::test]
 async fn the_handshake_fills_session_info() {
     let (session, _events) = open(&[]).await;
@@ -188,6 +190,7 @@ async fn the_handshake_fills_session_info() {
     session.close().await.unwrap();
 }
 
+/// Probe waits for late available-commands SessionUpdated instead of returning empty commands.
 #[tokio::test]
 async fn probe_reports_details_and_waits_for_late_commands() {
     let details = Runtime::new()
@@ -210,6 +213,7 @@ async fn probe_reports_details_and_waits_for_late_commands() {
     );
 }
 
+/// Cancel mid-permission reaches the agent and ends the turn as Cancelled.
 #[tokio::test]
 async fn cancel_reaches_the_agent_and_ends_the_turn() {
     let (session, mut events) = open(&[]).await;
@@ -229,6 +233,7 @@ async fn cancel_reaches_the_agent_and_ends_the_turn() {
     session.close().await.unwrap();
 }
 
+/// Mid-turn steer is accepted and delivered as Steered with same turn_id.
 #[tokio::test]
 async fn steering_mid_turn_is_accepted() {
     let (session, mut events) = open(&[]).await;
@@ -251,6 +256,7 @@ async fn steering_mid_turn_is_accepted() {
     session.close().await.unwrap();
 }
 
+/// Attachments inline PNG as image block, PDF/missing as path refs, unreadable emits diagnostic.
 #[tokio::test]
 async fn attachments_inline_images_and_reference_paths() {
     let dir = std::env::temp_dir().join(format!("anyagent-att-acp-{}", std::process::id()));
@@ -289,6 +295,7 @@ async fn attachments_inline_images_and_reference_paths() {
     session.close().await.unwrap();
 }
 
+/// Agent exit mid-turn fails the turn and surfaces ProcessExited with stderr.
 #[tokio::test]
 async fn agent_death_mid_turn_fails_the_turn() {
     let (session, mut events) = open(&["--eof"]).await;
@@ -319,6 +326,7 @@ async fn agent_death_mid_turn_fails_the_turn() {
     }
 }
 
+/// Configure mode round-trips via SessionUpdated; invalid value/unknown id rejected typed locally.
 #[tokio::test]
 async fn configuring_the_mode_round_trips_and_updates_the_session() {
     let (session, mut events) = open(&[]).await;
@@ -345,6 +353,7 @@ async fn configuring_the_mode_round_trips_and_updates_the_session() {
     session.close().await.unwrap();
 }
 
+/// Kiro probe: successful open proves login -> Authenticated Subscription.
 #[tokio::test]
 async fn probe_confirms_login_when_an_open_proves_it() {
     // kiro refuses to open logged out (probed 2026-08-28), so a successful
@@ -360,6 +369,7 @@ async fn probe_confirms_login_when_an_open_proves_it() {
     );
 }
 
+/// Stale Unauthenticated marker overridden to Authenticated ApiKey after proven open.
 #[tokio::test]
 async fn probe_overrides_a_stale_logged_out_marker_after_a_proven_open() {
     let mut agent = catalog_wrapper("hermes", "auth-stale", "");
@@ -374,6 +384,7 @@ async fn probe_overrides_a_stale_logged_out_marker_after_a_proven_open() {
     );
 }
 
+/// Existing Authenticated ApiKey kind preserved after proven open.
 #[tokio::test]
 async fn probe_preserves_a_marker_kind_after_a_proven_open() {
     let mut agent = catalog_wrapper("qwen", "auth-kind", "");
@@ -391,6 +402,7 @@ async fn probe_preserves_a_marker_kind_after_a_proven_open() {
     ));
 }
 
+/// Pre-protocol exit (kiro not logged in) mapped to Unauthenticated with terminal login method.
 #[tokio::test]
 async fn probe_maps_a_pre_protocol_exit_to_logged_out() {
     // The kiro logged-out shape: complain on stderr, exit before speaking ACP.
@@ -405,6 +417,7 @@ async fn probe_maps_a_pre_protocol_exit_to_logged_out() {
     assert_eq!(command[1..], ["login"]);
 }
 
+/// Session/new internal error hinted 'No LLM provider' mapped to Unauthenticated.
 #[tokio::test]
 async fn probe_maps_a_hinted_wire_error_to_logged_out() {
     // The hermes logged-out shape: session/new fails with a plain internal
@@ -420,6 +433,7 @@ async fn probe_maps_a_hinted_wire_error_to_logged_out() {
     assert_eq!(command[1..], ["login"]);
 }
 
+/// Empty auth methods fall back to profile executable + EnvVar XAI_API_KEY alternative.
 #[tokio::test]
 async fn probe_uses_the_profile_fallback_when_auth_methods_are_empty() {
     // Grok returns the auth code without a runnable method. Its profile maps
@@ -446,6 +460,7 @@ async fn probe_uses_the_profile_fallback_when_auth_methods_are_empty() {
     );
 }
 
+/// Meta-shaped auth method still yields runnable terminal login command.
 #[tokio::test]
 async fn probe_reads_a_meta_shaped_login_method() {
     // The qwen shape: the auth method's type/args ride in `_meta`, so the
@@ -467,6 +482,7 @@ async fn probe_reads_a_meta_shaped_login_method() {
     );
 }
 
+/// Two overlapping configures (slow model reply) both apply, not just the last.
 #[tokio::test]
 async fn overlapping_configures_both_apply() {
     // The model reply is delayed past the mode round-trip, so both changes
@@ -486,6 +502,7 @@ async fn overlapping_configures_both_apply() {
     session.close().await.unwrap();
 }
 
+/// MCP http+stdio servers forwarded; capabilities advertised and wire contains http:voice/stdio:tool.
 #[tokio::test]
 async fn mcp_servers_forward_when_the_transport_is_supported() {
     let runtime = Runtime::new();
@@ -523,6 +540,7 @@ async fn mcp_servers_forward_when_the_transport_is_supported() {
     session.close().await.unwrap();
 }
 
+/// Unsupported SSE transport refused typed UnsupportedFeature at open.
 #[tokio::test]
 async fn an_unsupported_mcp_transport_is_refused() {
     let runtime = Runtime::new();
@@ -538,6 +556,7 @@ async fn an_unsupported_mcp_transport_is_refused() {
     assert!(matches!(error, AgentError::UnsupportedFeature(_)));
 }
 
+/// Resume without load-session support fails typed ResumeFailed.
 #[tokio::test]
 async fn resuming_an_agent_without_load_session_fails() {
     let runtime = Runtime::new();
@@ -552,6 +571,7 @@ async fn resuming_an_agent_without_load_session_fails() {
     assert!(matches!(error, AgentError::ResumeFailed(_)));
 }
 
+/// Fork on ACP agent fails typed UnsupportedFeature.
 #[tokio::test]
 async fn forking_an_acp_agent_fails_typed() {
     let runtime = Runtime::new();
@@ -567,6 +587,7 @@ async fn forking_an_acp_agent_fails_typed() {
     assert!(matches!(error, AgentError::UnsupportedFeature(_)));
 }
 
+/// Auth-required open fails typed AuthRequired carrying terminal login command.
 #[tokio::test]
 async fn auth_required_carries_runnable_login_methods() {
     let runtime = Runtime::new();
@@ -586,6 +607,7 @@ async fn auth_required_carries_runnable_login_methods() {
     assert_eq!(command[1..], ["auth".to_string(), "login".to_string()]);
 }
 
+/// Probe on logged-out reports Unauthenticated with empty config/commands instead of failing.
 #[tokio::test]
 async fn probe_reports_a_logged_out_agent_instead_of_failing() {
     // `open` refuses a logged-out agent; `probe` inspects it and answers.
@@ -605,6 +627,7 @@ async fn probe_reports_a_logged_out_agent_instead_of_failing() {
     assert!(details.commands.is_empty());
 }
 
+/// Flood of 500 chunks arrives completely and in order by sequence.
 #[tokio::test]
 async fn a_flood_of_chunks_arrives_completely_and_in_order() {
     let (session, mut events) = open(&["--flood=500"]).await;
@@ -628,6 +651,7 @@ async fn a_flood_of_chunks_arrives_completely_and_in_order() {
     session.close().await.unwrap();
 }
 
+/// Losing auth mid-session fails turn and closes stream with AuthRequired + SessionClosed.
 #[tokio::test]
 async fn losing_auth_mid_session_fails_the_turn_and_closes() {
     let (session, mut events) = open(&[]).await;
@@ -661,6 +685,7 @@ async fn losing_auth_mid_session_fails_the_turn_and_closes() {
     ));
 }
 
+/// Plain prompt RPC error fails turn as Failed but session survives for next turn.
 #[tokio::test]
 async fn a_plain_prompt_error_fails_the_turn_and_the_session_survives() {
     let (session, mut events) = open(&[]).await;
@@ -693,6 +718,7 @@ async fn a_plain_prompt_error_fails_the_turn_and_the_session_survives() {
     session.close().await.unwrap();
 }
 
+/// Creation-time configure applies at open; unknown id refused typed InvalidConfiguration.
 #[tokio::test]
 async fn creation_time_config_applies_at_open_and_a_refusal_fails_it() {
     let runtime = Runtime::new();
@@ -725,6 +751,7 @@ async fn creation_time_config_applies_at_open_and_a_refusal_fails_it() {
     assert!(message.contains("bogus"), "got: {message}");
 }
 
+/// Grok prompt_complete settles hung turn; stale promptId frame ignored; session reusable.
 #[tokio::test]
 async fn grok_prompt_complete_ends_a_hung_turn_and_stale_ids_are_ignored() {
     let (session, mut events) = open(&[]).await;
@@ -768,6 +795,7 @@ async fn grok_prompt_complete_ends_a_hung_turn_and_stale_ids_are_ignored() {
     assert!(text.starts_with("Hello"), "got: {text}");
 }
 
+/// Grok questions surface typed with header/choices; answer returns labels keyed by question text.
 #[tokio::test]
 async fn grok_questions_surface_typed_and_answers_return_labels() {
     let (session, mut events) = open(&[]).await;
@@ -801,6 +829,7 @@ async fn grok_questions_surface_typed_and_answers_return_labels() {
     assert_eq!(text, r#"q={"Pick a fruit":["Grape"]} "#);
 }
 
+/// Grok first-class models surface as live model select and switch via session/set_model.
 #[tokio::test]
 async fn grok_first_class_models_surface_as_the_model_option_and_switch_via_set_model() {
     let (session, mut events) = open(&["--grok-models"]).await;
@@ -834,6 +863,7 @@ async fn grok_first_class_models_surface_as_the_model_option_and_switch_via_set_
     }
 }
 
+/// Config_home on agent without known var refused typed InvalidConfiguration.
 #[tokio::test]
 async fn config_home_on_an_agent_without_a_known_var_is_refused() {
     let runtime = Runtime::new();
@@ -852,6 +882,7 @@ async fn config_home_on_an_agent_without_a_known_var_is_refused() {
 
 /// `record_wire` tees the ACP JSON-RPC wire too, both directions and including
 /// the handshake, as one valid JSON object per line.
+/// Record_wire tees both directions including initialize handshake as JSONL per direction.
 #[tokio::test]
 async fn record_wire_tees_the_acp_wire_including_handshake() {
     let dir = tempfile::tempdir().unwrap();

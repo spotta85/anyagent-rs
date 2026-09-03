@@ -116,6 +116,7 @@ pub(crate) fn base64(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// base64 encodes RFC4648 vectors correctly with padding.
     #[test]
     fn base64_matches_known_vectors() {
         assert_eq!(base64(b""), "");
@@ -126,6 +127,7 @@ mod tests {
         assert_eq!(base64(&[0xFF, 0x00, 0xFF]), "/wD/");
     }
 
+    /// sniff detects PNG/JPEG/GIF/WEBP magic bytes and returns None for PDF/empty.
     #[test]
     fn sniff_knows_the_inline_formats() {
         assert_eq!(sniff(b"\x89PNG\r\n\x1a\n"), Some("image/png"));
@@ -136,6 +138,7 @@ mod tests {
         assert_eq!(sniff(b""), None);
     }
 
+    /// load inlines small PNG, leaves PDF as ref, and reports unreadable/missing files with problem.
     #[tokio::test]
     async fn load_inlines_images_and_reports_unreadable_files() {
         let dir = std::env::temp_dir().join(format!("anyagent-attach-{}", std::process::id()));
