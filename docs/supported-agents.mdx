@@ -40,12 +40,13 @@ writing via shell. Sandbox accordingly if that matters to your app.
 
 <Note>
 opencode runs native: anyagent starts `opencode serve` on a private localhost
-port per session and drives its HTTP + SSE wire. This adds permissions,
-questions, rollback, fork, slash commands, plans, and context usage over the
-ACP path. It does not steer (the engine queues mid-turn prompts instead), and
-it has no plan quota. Pass a model with `configure("model", "provider/id")`;
-opencode's own free `opencode/…` models need no extra key. To drive it over
-ACP instead, build it with `AgentInstallation::acp("opencode", path, ["acp"])`.
+port per session, gated by a per-session secret, and drives its HTTP + SSE
+wire. This adds permissions, questions, rollback, fork, slash commands, plans,
+and context usage over the ACP path. It does not steer (the engine queues
+mid-turn prompts instead), and it has no plan quota. Pass a model with
+`configure("model", "provider/id")`; opencode's own free `opencode/…` models
+need no extra key. To drive it over ACP instead, build it with
+`AgentInstallation::acp("opencode", path, ["acp"])`.
 </Note>
 
 ## Any other ACP agent

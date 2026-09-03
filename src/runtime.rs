@@ -115,10 +115,11 @@ impl Runtime {
         agent: &AgentInstallation,
         options: SessionOptions,
     ) -> Result<(Session, Events), AgentError> {
-        // Use the catalog adapter, or create ACP for an ad-hoc installation.
+        // An explicit `AgentInstallation::acp` drives ACP even for a catalog
+        // agent with a native adapter; otherwise the catalog adapter.
         let adapter: Arc<dyn Adapter> = match (self.adapters.get(&agent.id), &agent.acp_args) {
-            (Some(adapter), _) => Arc::clone(adapter),
-            (None, Some(args)) => Arc::new(crate::adapter::acp::AcpAdapter::new(args.clone())),
+            (_, Some(args)) => Arc::new(crate::adapter::acp::AcpAdapter::new(args.clone())),
+            (Some(adapter), None) => Arc::clone(adapter),
             (None, None) => {
                 return Err(AgentError::ProtocolFailed(format!(
                     "no adapter implemented for {} yet",

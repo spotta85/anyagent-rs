@@ -3,7 +3,8 @@
 //! per session, bound to a free localhost port with the session dir as cwd.
 //! Commands are HTTP POSTs; content arrives on the `/event` SSE bus, filtered
 //! to this session. Turn end is deterministic: the `session.idle` that
-//! follows the server going busy for our prompt.
+//! follows the server going busy for our prompt, confirmed against the
+//! server's status (an abort republishes idle once more, late).
 //!
 //! We drive the legacy ("v1") engine on purpose. It emits permission,
 //! question, and idle events the "v2" engine makes a client poll for, and its
@@ -61,18 +62,18 @@ impl Adapter for OpencodeAdapter {
     async fn connect(&self, request: ConnectRequest) -> Result<DriverConnection, AgentError> {
         let (ev_tx, ev_rx) = mpsc::channel(FRAME_BUFFER);
         let recorder = WireRecorder::for_session(&request.options, &ev_tx).await;
-        let (server, http, info, session_id, window) = launch(&request, recorder.clone()).await?;
-        let frames = open_bus(http.clone(), recorder);
+        let launched = launch(&request, recorder).await?;
+        let info = launched.info.clone();
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
         tokio::spawn(
             Drive {
-                http,
-                server,
-                frames,
+                http: launched.http,
+                server: launched.server,
+                frames: launched.frames,
                 events: ev_tx,
-                info: info.clone(),
-                session_id,
-                window,
+                info: launched.info,
+                session_id: launched.session_id,
+                window: launched.window,
                 login: login_methods(&request.installation),
                 messages: HashMap::new(),
                 parts: HashMap::new(),
@@ -99,13 +100,22 @@ impl Adapter for OpencodeAdapter {
 // Launch and handshake
 // ---------------------------------------------------------------------------
 
-/// Spawns the server, waits for health, binds the session, and reads the
-/// catalogs behind the advertised options. Returns the current model's
-/// context window alongside.
+/// A booted server with its session bound.
+struct Launched {
+    server: process::Child,
+    http: Http,
+    frames: mpsc::Receiver<Value>,
+    info: DriverInfo,
+    session_id: String,
+    window: Option<u64>,
+}
+
+/// Spawns the server, waits for health, subscribes to the event bus, binds
+/// the session, and reads the catalogs behind the advertised options.
 async fn launch(
     request: &ConnectRequest,
     recorder: Option<WireRecorder>,
-) -> Result<(process::Child, Http, DriverInfo, String, Option<u64>), AgentError> {
+) -> Result<Launched, AgentError> {
     if !request.options.mcp_servers.is_empty() {
         // Client MCP servers would need a `POST /mcp` per server after open;
         // deferred until a consumer needs it.
@@ -114,17 +124,41 @@ async fn launch(
         ));
     }
     let port = free_port()?;
-    let mut server = spawn_server(request, port).await?;
+    let secret = secret();
+    let mut server = spawn_server(request, port, &secret).await?;
     let http = Http {
         port,
         directory: request.options.cwd().to_string_lossy().into_owned(),
+        auth: format!(
+            "Basic {}",
+            attach::base64(format!("opencode:{secret}").as_bytes())
+        ),
     };
     // The piped stdout must be drained or the server blocks on a full pipe.
     drain(server.stdout.take());
-    let outcome =
-        tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&http, request, recorder)).await;
+    let boot = async {
+        let version = await_health(&http).await?;
+        let frames = open_bus(&http, recorder.clone()).await?;
+        let (info, session_id, window) = handshake(&http, request, recorder, version).await?;
+        Ok((frames, info, session_id, window))
+    };
+    let outcome = tokio::time::timeout(HANDSHAKE_TIMEOUT, boot).await;
+    // A squatter on the picked port (the pick-then-bind race) makes opencode
+    // exit at once, so whoever answered above was not our server.
+    if !server.is_running() {
+        let status = server.exit_status(CLOSE_GRACE).await;
+        let stderr = server.stderr_tail();
+        return Err(AgentError::ProcessExited { status, stderr });
+    }
     match outcome {
-        Ok(Ok((info, session_id, window))) => Ok((server, http, info, session_id, window)),
+        Ok(Ok((frames, info, session_id, window))) => Ok(Launched {
+            server,
+            http,
+            frames,
+            info,
+            session_id,
+            window,
+        }),
         Ok(Err(e)) => {
             let e = crate::adapter::with_stderr(e, &server);
             server.shutdown(CLOSE_GRACE).await;
@@ -138,17 +172,21 @@ async fn launch(
 }
 
 /// Launches `opencode serve` on the given port, with the session dir as cwd,
-/// the basic-auth gate stripped (localhost), and the permission mode as
+/// the basic-auth gate keyed to this session, and the permission mode as
 /// config.
-async fn spawn_server(request: &ConnectRequest, port: u16) -> Result<process::Child, AgentError> {
+async fn spawn_server(
+    request: &ConnectRequest,
+    port: u16,
+    secret: &str,
+) -> Result<process::Child, AgentError> {
     let mut env = crate::adapter::config_home_env(&request.installation, &request.options)?;
-    // The desktop app exports these to secure its own server; empty values
-    // mean "unsecured" and let the adapter talk to localhost without a header.
-    env.push(("OPENCODE_SERVER_PASSWORD".into(), String::new()));
-    env.push(("OPENCODE_SERVER_USERNAME".into(), String::new()));
+    // The server's basic-auth gate: a per-session secret, so no other local
+    // process can drive the port.
+    env.push(("OPENCODE_SERVER_USERNAME".into(), "opencode".into()));
+    env.push(("OPENCODE_SERVER_PASSWORD".into(), secret.to_owned()));
     env.push((
         "OPENCODE_CONFIG_CONTENT".into(),
-        permission_config(request.options.permission_mode).to_string(),
+        config_content(request.options.permission_mode).to_string(),
     ));
     process::spawn(Spawn {
         exec_path: request.installation.executable_path.clone(),
@@ -171,8 +209,8 @@ async fn handshake(
     http: &Http,
     request: &ConnectRequest,
     recorder: Option<WireRecorder>,
+    version: Option<String>,
 ) -> Result<(DriverInfo, String, Option<u64>), AgentError> {
-    let version = await_health(http).await?;
     let providers = http.get("/config/providers").await?;
     let connected = http.get("/provider").await?["connected"].clone();
     let commands = http.get("/command").await?;
@@ -184,9 +222,10 @@ async fn handshake(
         .as_str()
         .ok_or_else(|| AgentError::ProtocolFailed("session create returned no id".into()))?
         .to_owned();
+    let choices = model_choices(&providers, &connected);
+    let configured = start_model(&request.options, &choices)?;
     let mut info = driver_info(
-        &providers,
-        &connected,
+        choices,
         &commands,
         &session,
         auth_status(request, &connected),
@@ -195,7 +234,7 @@ async fn handshake(
     // A creation-time `configure("model", …)` overrides the session default
     // (v1 has no model endpoint, so it rides every prompt) — apply it before
     // reading the window so the window matches the model actually used.
-    if let Some(model) = configured_model(&request.options) {
+    if let Some(model) = configured {
         apply_selection(
             &mut info,
             &ConfigId::new("model"),
@@ -256,20 +295,40 @@ fn auth_status(request: &ConnectRequest, connected: &Value) -> AuthStatus {
     }
 }
 
-/// The permission config merged into the server via `OPENCODE_CONFIG_CONTENT`.
-/// `Ask` forces every tool to prompt but lets the question tool run so it
-/// surfaces as a question, not a permission.
+/// The server's `OPENCODE_CONFIG_CONTENT`: the host's own value, if any (a
+/// sandbox or tool policy survives), with our permission rules layered on.
+fn config_content(mode: PermissionMode) -> Value {
+    let host = std::env::var("OPENCODE_CONFIG_CONTENT")
+        .ok()
+        .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    with_permission(host, permission_config(mode))
+}
+
+/// Layers permission rules onto a config, ours winning on the same key.
+fn with_permission(mut config: Value, ours: Value) -> Value {
+    let mut permission = config["permission"].take();
+    match permission.as_object_mut() {
+        Some(host) => host.extend(ours.as_object().cloned().unwrap_or_default()),
+        None => permission = ours,
+    }
+    config["permission"] = permission;
+    config
+}
+
+/// The permission rules for a mode. `Ask` forces every tool to prompt but
+/// lets the question tool run so it surfaces as a question, not a permission.
 fn permission_config(mode: PermissionMode) -> Value {
     match mode {
-        PermissionMode::Ask => json!({ "permission": { "*": "ask", "question": "allow" } }),
-        PermissionMode::AutoApprove => json!({ "permission": { "*": "allow" } }),
+        PermissionMode::Ask => json!({ "*": "ask", "question": "allow" }),
+        PermissionMode::AutoApprove => json!({ "*": "allow" }),
     }
 }
 
 /// Folds the handshake responses into the advertised state.
 fn driver_info(
-    providers: &Value,
-    connected: &Value,
+    choices: Vec<ConfigChoice>,
     commands: &Value,
     session: &Value,
     auth: AuthStatus,
@@ -286,9 +345,7 @@ fn driver_info(
         id: ConfigId::new("model"),
         name: "Model".into(),
         category: Some("model".into()),
-        kind: ConfigKind::Select {
-            choices: model_choices(providers, connected),
-        },
+        kind: ConfigKind::Select { choices },
         current: model.map(ConfigValue::Text),
         live: true,
     }];
@@ -395,15 +452,35 @@ fn current_model(info: &DriverInfo) -> Option<String> {
     }
 }
 
-/// The creation-time `configure("model", …)` value, if any.
-fn configured_model(options: &SessionOptions) -> Option<String> {
-    options
-        .configure
-        .iter()
-        .find_map(|(id, value)| match value {
-            ConfigValue::Text(model) if id.as_str() == "model" => Some(model.clone()),
-            _ => None,
-        })
+/// Creation-time `configure` values, validated: only `model`, and only one
+/// of the advertised choices (an unknown model would fail the first turn).
+fn start_model(
+    options: &SessionOptions,
+    choices: &[ConfigChoice],
+) -> Result<Option<String>, AgentError> {
+    let mut model = None;
+    for (id, value) in &options.configure {
+        let text = match (id.as_str(), value) {
+            ("model", ConfigValue::Text(text)) => text,
+            ("model", _) => {
+                return Err(AgentError::InvalidConfiguration(
+                    "`model` takes a text value".into(),
+                ));
+            }
+            _ => {
+                return Err(AgentError::InvalidConfiguration(format!(
+                    "`{id}` is not a creation-time option of this agent"
+                )));
+            }
+        };
+        if !choices.iter().any(|c| &c.value == text) {
+            return Err(AgentError::InvalidConfiguration(format!(
+                "`{text}` is not a choice for `model`"
+            )));
+        }
+        model = Some(text.clone());
+    }
+    Ok(model)
 }
 
 // ---------------------------------------------------------------------------
@@ -515,7 +592,9 @@ impl Drive {
             DriverCommand::Answer { request, answer } => self.answer(request, answer).await?,
             DriverCommand::Cancel => {
                 self.aborting = true;
-                self.post(&format!("/session/{}/abort", self.session_id), json!({}))
+                let _ = self
+                    .http
+                    .post(&format!("/session/{}/abort", self.session_id), json!({}))
                     .await;
             }
             DriverCommand::Configure(id, value) => self.configure(id, value).await?,
@@ -589,7 +668,16 @@ impl Drive {
                 }
                 Ok(())
             }
-            "session.idle" if self.turn == Turn::Busy => self.on_idle().await,
+            "session.idle" if self.turn == Turn::Busy => {
+                // An abort's tail republishes idle, and that copy can land
+                // after the next prompt went busy; the server's live status
+                // settles whose idle this is (T3 reconciles the same way).
+                if self.server_busy().await {
+                    Ok(())
+                } else {
+                    self.on_idle().await
+                }
+            }
             "message.updated" => self.on_message(props).await,
             "message.part.updated" => self.on_part(&props["part"]).await,
             "message.part.delta" => self.on_delta(props).await,
@@ -797,29 +885,39 @@ impl Drive {
         let Some(pending) = self.requests.remove(&request) else {
             return Ok(());
         };
-        match (pending, answer) {
+        let sent = match (pending, answer) {
             (PendingRequest::Permission { permission_id }, Answer::Permission(choice)) => {
                 let response = match choice {
                     PermissionChoice::AllowOnce => "once",
                     PermissionChoice::AllowAlways => "always",
                     _ => "reject",
                 };
-                self.post(
-                    &format!("/session/{}/permissions/{permission_id}", self.session_id),
-                    json!({ "response": response }),
-                )
-                .await;
+                self.http
+                    .post(
+                        &format!("/session/{}/permissions/{permission_id}", self.session_id),
+                        json!({ "response": response }),
+                    )
+                    .await
             }
             (PendingRequest::Question { question_id }, Answer::Question(answers)) => {
-                self.post(
-                    &format!("/question/{question_id}/reply"),
-                    json!({ "answers": question_answers(&answers) }),
-                )
-                .await;
+                self.http
+                    .post(
+                        &format!("/question/{question_id}/reply"),
+                        json!({ "answers": question_answers(&answers) }),
+                    )
+                    .await
             }
-            _ => {}
+            _ => return Ok(()),
+        };
+        // The engine has already closed the request; a refusal is reported,
+        // and the agent stays parked on it until its turn is cancelled.
+        match sent {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                self.diagnostic(DiagnosticLevel::Warning, format!("answer not taken: {e}"))
+                    .await
+            }
         }
-        Ok(())
     }
 
     /// `session.idle`: the running turn is really over.
@@ -887,12 +985,22 @@ impl Drive {
                 .diagnostic(DiagnosticLevel::Warning, "nothing to roll back")
                 .await;
         };
-        self.post(
-            &format!("/session/{}/revert", self.session_id),
-            json!({ "messageID": anchor }),
-        )
-        .await;
-        Ok(())
+        let reverted = self
+            .http
+            .post(
+                &format!("/session/{}/revert", self.session_id),
+                json!({ "messageID": anchor }),
+            )
+            .await;
+        match reverted {
+            // Nothing advertised changes (the session rewinds in place), but
+            // the resulting `SessionUpdated` is the documented confirmation.
+            Ok(_) => self.emit(DriverEvent::InfoChanged(self.info.clone())).await,
+            Err(e) => {
+                self.diagnostic(DiagnosticLevel::Warning, format!("rollback rejected: {e}"))
+                    .await
+            }
+        }
     }
 
     /// Applies a live model change; it rides the next prompt.
@@ -927,6 +1035,15 @@ impl Drive {
         Some(json!({ "providerID": provider, "modelID": model }))
     }
 
+    /// Whether the server still reports this session busy. An unreachable
+    /// server counts as idle: it is dying, and the bus closing follows.
+    async fn server_busy(&self) -> bool {
+        match self.http.get("/session/status").await {
+            Ok(status) => status[&self.session_id]["type"].as_str() == Some("busy"),
+            Err(_) => false,
+        }
+    }
+
     /// Mints the next request id.
     fn request_id(&mut self) -> RequestId {
         self.next_request += 1;
@@ -942,11 +1059,6 @@ impl Drive {
         let id = MessageId::new(format!("m{}", self.next_message));
         self.messages.insert(oc_id.to_owned(), id.clone());
         id
-    }
-
-    /// Fire-and-forget POST: a command whose body we do not need.
-    async fn post(&self, path: &str, body: Value) {
-        let _ = self.http.post(path, body).await;
     }
 
     async fn report_exit(&mut self) {
@@ -1189,11 +1301,14 @@ fn user_anchor(messages: &Value, turns: u32) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// A minimal HTTP/1.1 client for the local opencode server. Every call is one
-/// connection closed by the server; the session dir rides as a query param.
+/// connection; the session dir rides as a query param and the session secret
+/// as basic auth.
 #[derive(Clone)]
 struct Http {
     port: u16,
     directory: String,
+    /// The `Authorization` header value.
+    auth: String,
 }
 
 impl Http {
@@ -1222,11 +1337,12 @@ impl Http {
         // Bun keeps some sockets open despite `Connection: close`, so the
         // body is read by its declared length, not until the server hangs up.
         let mut reader = BufReader::new(stream);
-        let (status, length) = read_head(&mut reader)
+        let head = read_head(&mut reader)
             .await
             .map_err(|e| closed(&e.to_string()))?;
+        let status = head.status;
         let mut payload = Vec::new();
-        let read = match length {
+        let read = match head.length {
             Some(n) => {
                 payload.resize(n, 0);
                 reader.read_exact(&mut payload).await.map(|_| ())
@@ -1257,34 +1373,53 @@ impl Http {
     /// A raw HTTP/1.1 request with the directory query param.
     fn raw(&self, method: &str, path: &str, headers: &str, body: &str) -> Vec<u8> {
         let target = format!("{path}?directory={}", encode(&self.directory));
-        format!("{method} {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n{headers}\r\n\r\n{body}")
-            .into_bytes()
+        format!(
+            "{method} {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: {}\r\n\
+             {headers}\r\n\r\n{body}",
+            self.auth
+        )
+        .into_bytes()
     }
 }
 
 /// Opens the SSE `/event` bus: one long-lived request whose decoded frames
-/// feed the returned channel. The stream closing (server death) closes it.
-fn open_bus(http: Http, recorder: Option<WireRecorder>) -> mpsc::Receiver<Value> {
+/// feed the returned channel. Returns once the server has accepted the
+/// subscription, so a prompt sent right after cannot lose its frames. The
+/// stream closing (server death) closes the channel.
+async fn open_bus(
+    http: &Http,
+    recorder: Option<WireRecorder>,
+) -> Result<mpsc::Receiver<Value>, AgentError> {
+    let mut stream = TcpStream::connect(("127.0.0.1", http.port))
+        .await
+        .map_err(|e| closed(&e.to_string()))?;
+    stream
+        .write_all(&http.raw("GET", "/event", "Accept: text/event-stream", ""))
+        .await
+        .map_err(|e| closed(&e.to_string()))?;
+    let mut reader = BufReader::new(stream);
+    let head = read_head(&mut reader)
+        .await
+        .map_err(|e| closed(&e.to_string()))?;
+    if head.status != 200 {
+        return Err(AgentError::ProtocolFailed(format!(
+            "GET /event -> {}",
+            head.status
+        )));
+    }
     let (tx, frames) = mpsc::channel(FRAME_BUFFER);
-    tokio::spawn(read_bus(http, tx, recorder));
-    frames
+    tokio::spawn(read_bus(reader, head.chunked, tx, recorder));
+    Ok(frames)
 }
 
-/// Connects to `/event` and forwards each decoded SSE frame until the stream
-/// or the channel ends.
-async fn read_bus(http: Http, tx: mpsc::Sender<Value>, recorder: Option<WireRecorder>) {
-    let Ok(mut stream) = TcpStream::connect(("127.0.0.1", http.port)).await else {
-        return;
-    };
-    let request = http.raw("GET", "/event", "Accept: text/event-stream", "");
-    if stream.write_all(&request).await.is_err() {
-        return;
-    }
-    let mut reader = BufReader::new(stream);
-    if read_head(&mut reader).await.is_err() {
-        return;
-    }
-    let mut sse = SseDecoder::new();
+/// Forwards each decoded SSE frame until the stream or the channel ends.
+async fn read_bus(
+    mut reader: BufReader<TcpStream>,
+    chunked: bool,
+    tx: mpsc::Sender<Value>,
+    recorder: Option<WireRecorder>,
+) {
+    let mut sse = SseDecoder::new(chunked);
     let mut chunk = [0u8; 4096];
     loop {
         let n = match reader.read(&mut chunk).await {
@@ -1305,64 +1440,80 @@ async fn read_bus(http: Http, tx: mpsc::Sender<Value>, recorder: Option<WireReco
     }
 }
 
-/// Reads the status line and headers up to the blank line, returning the
-/// status code and the `Content-Length` if one was sent.
-async fn read_head<R: tokio::io::AsyncBufRead + Unpin>(
-    reader: &mut R,
-) -> std::io::Result<(u16, Option<usize>)> {
+/// The status line and headers of a response.
+struct Head {
+    status: u16,
+    length: Option<usize>,
+    chunked: bool,
+}
+
+/// Reads the status line and headers up to the blank line.
+async fn read_head<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> std::io::Result<Head> {
     let mut line = String::new();
-    let mut status = None;
-    let mut length = None;
+    let mut head = Head {
+        status: 0,
+        length: None,
+        chunked: false,
+    };
     loop {
         line.clear();
         if reader.read_line(&mut line).await? == 0 {
             return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
         }
         let line = line.trim_end();
-        if line.is_empty() {
-            return status
-                .map(|s| (s, length))
-                .ok_or_else(|| std::io::Error::other("missing HTTP status"));
-        }
-        if status.is_none() {
-            status = Some(
-                line.split_whitespace()
-                    .nth(1)
-                    .and_then(|c| c.parse().ok())
-                    .unwrap_or(0),
-            );
-        } else if let Some((name, value)) = line.split_once(':')
-            && name.eq_ignore_ascii_case("content-length")
-        {
-            length = value.trim().parse().ok();
+        if head.status == 0 {
+            let status = line.split_whitespace().nth(1).and_then(|c| c.parse().ok());
+            head.status = status.ok_or_else(|| std::io::Error::other("missing HTTP status"))?;
+        } else if line.is_empty() {
+            return Ok(head);
+        } else if let Some((name, value)) = line.split_once(':') {
+            let value = value.trim();
+            if name.eq_ignore_ascii_case("content-length") {
+                head.length = value.parse().ok();
+            } else if name.eq_ignore_ascii_case("transfer-encoding") {
+                head.chunked = value.contains("chunked");
+            }
         }
     }
 }
 
-/// Reassembles SSE frames from a chunked, arbitrarily-split byte stream. It
-/// tolerates the HTTP chunk-size lines interleaved with the body by keeping
-/// only `data:` lines, which the size lines never are. `\r` is dropped up
-/// front so a frame always ends at `\n\n` (JSON payloads never carry a raw
-/// `\r`).
+/// Reassembles SSE `data:` payloads from the `/event` body, fed in arbitrary
+/// byte slices. HTTP chunk framing is stripped first when the response is
+/// chunked, and a frame is decoded only once whole, so a multi-byte character
+/// split across reads stays intact. `\r` is dropped so a frame always ends
+/// at `\n\n` (JSON never carries a raw `\r`).
 struct SseDecoder {
-    buffer: String,
+    chunked: bool,
+    /// Undecoded chunked bytes.
+    raw: Vec<u8>,
+    /// Payload bytes still owed by the current chunk.
+    remaining: usize,
+    /// The SSE body so far.
+    body: Vec<u8>,
 }
 
 impl SseDecoder {
-    fn new() -> Self {
+    fn new(chunked: bool) -> Self {
         Self {
-            buffer: String::new(),
+            chunked,
+            raw: Vec::new(),
+            remaining: 0,
+            body: Vec::new(),
         }
     }
 
     /// Feeds raw bytes, returning any complete SSE data payloads.
     fn feed(&mut self, bytes: &[u8]) -> Vec<String> {
-        self.buffer
-            .push_str(&String::from_utf8_lossy(bytes).replace('\r', ""));
+        if self.chunked {
+            self.raw.extend_from_slice(bytes);
+            self.dechunk();
+        } else {
+            self.body.extend(bytes.iter().filter(|b| **b != b'\r'));
+        }
         let mut frames = Vec::new();
-        while let Some(end) = self.buffer.find("\n\n") {
-            let frame: String = self.buffer.drain(..end + 2).collect();
-            let data: String = frame
+        while let Some(end) = self.body.windows(2).position(|w| w == b"\n\n") {
+            let frame: Vec<u8> = self.body.drain(..end + 2).collect();
+            let data: String = String::from_utf8_lossy(&frame)
                 .lines()
                 .filter_map(|line| line.strip_prefix("data:"))
                 .map(|line| line.strip_prefix(' ').unwrap_or(line))
@@ -1372,6 +1523,36 @@ impl SseDecoder {
             }
         }
         frames
+    }
+
+    /// Moves the payload of every complete-enough chunk from `raw` to
+    /// `body`, dropping the size lines and the CRLF after each payload.
+    fn dechunk(&mut self) {
+        loop {
+            if self.remaining == 0 {
+                let Some(end) = self.raw.windows(2).position(|w| w == b"\r\n") else {
+                    return;
+                };
+                let line = String::from_utf8_lossy(&self.raw[..end]).into_owned();
+                self.raw.drain(..end + 2);
+                // An empty line is the CRLF that closed the previous payload.
+                if line.is_empty() {
+                    continue;
+                }
+                let size = line.split(';').next().unwrap_or_default().trim();
+                self.remaining = usize::from_str_radix(size, 16).unwrap_or(0);
+                if self.remaining == 0 {
+                    return; // the last chunk
+                }
+            }
+            let take = self.remaining.min(self.raw.len());
+            self.body
+                .extend(self.raw.drain(..take).filter(|b| *b != b'\r'));
+            self.remaining -= take;
+            if self.remaining > 0 {
+                return;
+            }
+        }
     }
 }
 
@@ -1403,13 +1584,27 @@ fn drain(stdout: Option<tokio::process::ChildStdout>) {
     }
 }
 
-/// A free localhost TCP port, handed to the server. A tiny race with another
-/// binder is possible; the server would then fail health and time out.
+/// A free localhost TCP port, handed to the server. Another binder can win
+/// the pick-then-bind race; opencode then exits and `launch` reports it.
 fn free_port() -> Result<u16, AgentError> {
     std::net::TcpListener::bind(("127.0.0.1", 0))
         .and_then(|l| l.local_addr())
         .map(|addr| addr.port())
         .map_err(|e| AgentError::SpawnFailed(format!("could not pick a port: {e}")))
+}
+
+/// A per-session secret for the server's basic-auth gate: two hashes under
+/// the process's OS-seeded random keys, 128 bits in hex.
+fn secret() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let keys = std::collections::hash_map::RandomState::new();
+    (0..2u64)
+        .map(|i| {
+            let mut hasher = keys.build_hasher();
+            hasher.write_u64(i);
+            format!("{:016x}", hasher.finish())
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1418,12 +1613,41 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn sse_decoder_reassembles_split_and_chunked_frames() {
-        let mut sse = SseDecoder::new();
-        // A chunk-size line, then a frame split across two feeds.
-        assert!(sse.feed(b"2a\r\ndata: {\"a\":").is_empty());
-        let frames = sse.feed(b"1}\n\n1c\r\ndata: {\"b\":2}\n\n");
+    fn sse_decoder_reassembles_frames_split_across_reads() {
+        let mut sse = SseDecoder::new(false);
+        assert!(sse.feed(b"data: {\"a\":").is_empty());
+        let frames = sse.feed(b"1}\n\ndata: {\"b\":2}\n\n");
         assert_eq!(frames, vec![r#"{"a":1}"#, r#"{"b":2}"#]);
+    }
+
+    #[test]
+    fn sse_decoder_strips_chunk_framing_and_keeps_split_characters() {
+        // One event over two HTTP chunks; the second chunk arrives in two
+        // reads that split the em dash (three bytes) in the middle.
+        let event = "data: {\"t\":\"a \u{2014} b\"}\n\n".as_bytes();
+        let (first, second) = event.split_at(12);
+        let mut wire = format!("{:x}\r\n", first.len()).into_bytes();
+        wire.extend(first);
+        wire.extend(format!("\r\n{:x}\r\n", second.len()).bytes());
+        let cut = wire.len() + 3; // inside the em dash of the second chunk
+        wire.extend(second);
+        wire.extend(b"\r\n0\r\n\r\n");
+        let mut sse = SseDecoder::new(true);
+        assert!(sse.feed(&wire[..cut]).is_empty());
+        let frames = sse.feed(&wire[cut..]);
+        assert_eq!(frames, vec!["{\"t\":\"a \u{2014} b\"}"]);
+    }
+
+    #[test]
+    fn permission_rules_layer_onto_the_host_config() {
+        let host = json!({ "sandbox": true, "permission": { "bash": "deny" } });
+        let merged = with_permission(host, permission_config(PermissionMode::Ask));
+        assert_eq!(
+            merged,
+            json!({ "sandbox": true, "permission": { "bash": "deny", "*": "ask", "question": "allow" } })
+        );
+        let bare = with_permission(json!({}), permission_config(PermissionMode::AutoApprove));
+        assert_eq!(bare, json!({ "permission": { "*": "allow" } }));
     }
 
     #[test]
@@ -1438,11 +1662,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_head_parses_status_and_length() {
+    async fn read_head_parses_status_length_and_chunking() {
         let mut raw: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nVary: Origin\r\n\r\n{}";
-        let (status, length) = read_head(&mut raw).await.unwrap();
-        assert_eq!((status, length), (200, Some(2)));
+        let head = read_head(&mut raw).await.unwrap();
+        assert_eq!(
+            (head.status, head.length, head.chunked),
+            (200, Some(2), false)
+        );
         assert_eq!(raw, b"{}");
+        let mut sse: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let head = read_head(&mut sse).await.unwrap();
+        assert_eq!((head.status, head.length, head.chunked), (200, None, true));
     }
 
     #[test]
