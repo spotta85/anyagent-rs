@@ -73,7 +73,7 @@ impl Adapter for OpencodeAdapter {
                 events: ev_tx,
                 info: launched.info,
                 session_id: launched.session_id,
-                window: launched.window,
+                windows: launched.windows,
                 login: login_methods(&request.installation),
                 messages: HashMap::new(),
                 parts: HashMap::new(),
@@ -107,7 +107,7 @@ struct Launched {
     frames: mpsc::Receiver<Value>,
     info: DriverInfo,
     session_id: String,
-    window: Option<u64>,
+    windows: HashMap<String, u64>,
 }
 
 /// Spawns the server, waits for health, subscribes to the event bus, binds
@@ -139,8 +139,8 @@ async fn launch(
     let boot = async {
         let version = await_health(&http).await?;
         let frames = open_bus(&http, recorder.clone()).await?;
-        let (info, session_id, window) = handshake(&http, request, recorder, version).await?;
-        Ok((frames, info, session_id, window))
+        let (info, session_id, windows) = handshake(&http, request, recorder, version).await?;
+        Ok((frames, info, session_id, windows))
     };
     let outcome = tokio::time::timeout(HANDSHAKE_TIMEOUT, boot).await;
     // A squatter on the picked port (the pick-then-bind race) makes opencode
@@ -151,13 +151,13 @@ async fn launch(
         return Err(AgentError::ProcessExited { status, stderr });
     }
     match outcome {
-        Ok(Ok((frames, info, session_id, window))) => Ok(Launched {
+        Ok(Ok((frames, info, session_id, windows))) => Ok(Launched {
             server,
             http,
             frames,
             info,
             session_id,
-            window,
+            windows,
         }),
         Ok(Err(e)) => {
             let e = crate::adapter::with_stderr(e, &server);
@@ -210,7 +210,7 @@ async fn handshake(
     request: &ConnectRequest,
     recorder: Option<WireRecorder>,
     version: Option<String>,
-) -> Result<(DriverInfo, String, Option<u64>), AgentError> {
+) -> Result<(DriverInfo, String, HashMap<String, u64>), AgentError> {
     let providers = http.get("/config/providers").await?;
     let connected = http.get("/provider").await?["connected"].clone();
     let commands = http.get("/command").await?;
@@ -232,8 +232,7 @@ async fn handshake(
         version,
     );
     // A creation-time `configure("model", …)` overrides the session default
-    // (v1 has no model endpoint, so it rides every prompt) — apply it before
-    // reading the window so the window matches the model actually used.
+    // (v1 has no model endpoint, so it rides every prompt).
     if let Some(model) = configured {
         apply_selection(
             &mut info,
@@ -241,10 +240,9 @@ async fn handshake(
             &ConfigValue::Text(model),
         );
     }
-    let window = context_window(&providers, current_model(&info).as_deref());
     // The `ses_…` id is the durable handle: resuming re-adopts it.
     info.resume_token = Some(ResumeToken::new(&session_id));
-    Ok((info, session_id, window))
+    Ok((info, session_id, model_windows(&providers)))
 }
 
 /// Polls `/global/health` until the server answers, returning its version.
@@ -414,15 +412,21 @@ fn model_value(model: &Value) -> Option<String> {
     (!provider.is_empty() && !id.is_empty()).then(|| format!("{provider}/{id}"))
 }
 
-/// The current model's context window, from the provider catalog.
-fn context_window(providers: &Value, model: Option<&str>) -> Option<u64> {
-    let (pid, mid) = model?.split_once('/')?;
-    providers["providers"]
-        .as_array()?
-        .iter()
-        .find(|p| p["id"].as_str() == Some(pid))?["models"][mid]["limit"]["context"]
-        .as_u64()
-        .filter(|w| *w > 0)
+/// Every model's context window from the provider catalog, keyed
+/// `providerID/modelID`, so a live model switch keeps `ContextUsage` whole.
+fn model_windows(providers: &Value) -> HashMap<String, u64> {
+    let mut windows = HashMap::new();
+    for provider in providers["providers"].as_array().into_iter().flatten() {
+        let Some(pid) = provider["id"].as_str() else {
+            continue;
+        };
+        for (mid, model) in provider["models"].as_object().into_iter().flatten() {
+            if let Some(window) = model["limit"]["context"].as_u64().filter(|w| *w > 0) {
+                windows.insert(format!("{pid}/{mid}"), window);
+            }
+        }
+    }
+    windows
 }
 
 /// Commands, prompt templates, and skills, all invoked with `/`.
@@ -504,8 +508,8 @@ struct Drive {
     session_id: String,
     /// Login methods for a mid-session credential loss.
     login: Vec<LoginMethod>,
-    /// Current model's context window, for `ContextUsage`.
-    window: Option<u64>,
+    /// Context window per model, for `ContextUsage`.
+    windows: HashMap<String, u64>,
     /// Assistant `msg_…` id → our streaming message id. Only assistant
     /// messages are minted, so membership gates what streams (the user
     /// message carries a replay of our own prompt).
@@ -591,11 +595,16 @@ impl Drive {
             DriverCommand::Steer { .. } => self.emit(DriverEvent::Steered(false)).await?,
             DriverCommand::Answer { request, answer } => self.answer(request, answer).await?,
             DriverCommand::Cancel => {
-                self.aborting = true;
-                let _ = self
-                    .http
-                    .post(&format!("/session/{}/abort", self.session_id), json!({}))
-                    .await;
+                // Armed only once the server took the abort, so a refused
+                // one lets the turn end as what it was.
+                let abort = format!("/session/{}/abort", self.session_id);
+                match self.http.post(&abort, json!({})).await {
+                    Ok(_) => self.aborting = true,
+                    Err(e) => {
+                        self.diagnostic(DiagnosticLevel::Warning, format!("cancel not taken: {e}"))
+                            .await?
+                    }
+                }
             }
             DriverCommand::Configure(id, value) => self.configure(id, value).await?,
             DriverCommand::Rollback(turns, _) => self.rollback(turns.get()).await?,
@@ -816,7 +825,7 @@ impl Drive {
         };
         self.emit_kind(EventKind::ContextUsage {
             used_tokens: used,
-            window_tokens: self.window,
+            window_tokens: current_model(&self.info).and_then(|m| self.windows.get(&m).copied()),
             cost_usd: (self.cost > 0.0).then_some(self.cost),
         })
         .await
@@ -1019,8 +1028,6 @@ impl Drive {
                 )
                 .await;
         }
-        // The window belongs to the old model; the next connect re-reads it.
-        self.window = None;
         if apply_selection(&mut self.info, &id, &value) {
             self.emit(DriverEvent::InfoChanged(self.info.clone()))
                 .await?;
