@@ -432,6 +432,45 @@ async fn permissions_gate_the_write_and_deny_holds() {
     }
 }
 
+/// opencode's task tool runs in a child session whose permissions ask on the
+/// child's own session id; they must still reach the caller or the subagent
+/// stalls parked forever.
+#[tokio::test]
+#[ignore = "live: talks to real agents"]
+async fn opencode_child_session_permissions_reach_the_caller() {
+    if !enabled().contains(&"opencode") {
+        println!("SKIP: opencode not enabled");
+        return;
+    }
+    let (session, mut events, _dir) = open("opencode").await;
+    session
+        .prompt(
+            "Use your task tool to spawn a subagent whose prompt is: run the bash \
+             command `echo child-probe`. You must use the task tool.",
+        )
+        .await
+        .unwrap();
+    let mut approved = 0;
+    loop {
+        let event = next(&mut events, "opencode: child permission").await;
+        match event.kind {
+            EventKind::RequestOpened(Request::Permission(request)) => {
+                approved += 1;
+                session.answer(request.id, allow()).await.unwrap();
+            }
+            EventKind::TurnEnded { .. } => break,
+            _ => {}
+        }
+    }
+    // The task tool asks on the root, its bash on the child.
+    assert!(
+        approved >= 2,
+        "expected the task and child bash permissions, saw {approved}"
+    );
+    session.close().await.unwrap();
+    pass("opencode", "child session permissions reached the caller");
+}
+
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn a_question_round_trips() {

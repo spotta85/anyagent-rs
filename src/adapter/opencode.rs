@@ -81,6 +81,7 @@ impl Adapter for OpencodeAdapter {
                 ended: HashSet::new(),
                 parts: HashMap::new(),
                 tools: HashMap::new(),
+                children: HashSet::new(),
                 requests: HashMap::new(),
                 cost: 0.0,
                 turn: Turn::Idle,
@@ -137,6 +138,7 @@ async fn launch(
             "Basic {}",
             attach::base64(format!("opencode:{secret}").as_bytes())
         ),
+        recorder: recorder.clone(),
     };
     // The piped stdout must be drained or the server blocks on a full pipe.
     drain(server.stdout.take());
@@ -285,18 +287,22 @@ async fn bind_session(http: &Http, request: &ConnectRequest) -> Result<Value, Ag
 }
 
 /// opencode reports login only as which providers are connected; an empty
-/// list is the one honest "logged out" (probed 2026-09-03).
+/// list is the one honest "logged out" (probed 2026-09-03). A connected
+/// provider proves a working credential, not its kind — the offline
+/// marker's kind stands where discovery read one.
 fn auth_status(request: &ConnectRequest, connected: &Value) -> AuthStatus {
     let any = connected.as_array().is_some_and(|c| !c.is_empty());
-    if any {
-        AuthStatus::Authenticated {
-            kind: AuthKind::Subscription,
-            account: None,
-        }
-    } else {
-        AuthStatus::Unauthenticated {
+    if !any {
+        return AuthStatus::Unauthenticated {
             login: login_methods(&request.installation),
-        }
+        };
+    }
+    match &request.installation.auth {
+        Some(auth @ AuthStatus::Authenticated { .. }) => auth.clone(),
+        _ => AuthStatus::Authenticated {
+            kind: AuthKind::Other("connected provider".into()),
+            account: None,
+        },
     }
 }
 
@@ -499,10 +505,23 @@ fn start_model(
 // Drive task: engine commands out (HTTP), SSE frames in
 // ---------------------------------------------------------------------------
 
-/// One open request awaiting the caller's answer.
-enum PendingRequest {
-    Permission { permission_id: String },
-    Question { question_id: String },
+/// One open request awaiting the caller's answer. The payload is kept so a
+/// refused reply can reopen the request for a retry.
+struct Pending {
+    reply: Reply,
+    request: Request,
+}
+
+/// How the answer reaches the server. Permissions reply on their owning
+/// session: a task-tool child asks on its own session id.
+enum Reply {
+    Permission {
+        permission_id: String,
+        session_id: String,
+    },
+    Question {
+        question_id: String,
+    },
 }
 
 struct Drive {
@@ -529,7 +548,10 @@ struct Drive {
     parts: HashMap<String, PartState>,
     /// Tool snapshots by `callID`, for the permission that references one.
     tools: HashMap<String, ToolUpdate>,
-    requests: HashMap<RequestId, PendingRequest>,
+    /// Task-tool child sessions of this turn; their permission and question
+    /// asks reach the caller, the rest of their traffic does not.
+    children: HashSet<String>,
+    requests: HashMap<RequestId, Pending>,
     /// Session cost so far, summed over step-finishes.
     cost: f64,
     turn: Turn,
@@ -644,6 +666,13 @@ impl Drive {
         if let Some((command, arguments)) =
             slash_command(&text).filter(|(name, _)| self.has_command(name))
         {
+            if loaded.iter().any(|l| l.image.is_some()) {
+                self.diagnostic(
+                    DiagnosticLevel::Warning,
+                    "images do not ride slash commands and were dropped",
+                )
+                .await?;
+            }
             return self.start_command(command, arguments);
         }
         let mut parts = vec![json!({ "type": "text", "text": text })];
@@ -688,7 +717,7 @@ impl Drive {
         let path = format!("/session/{}/command", self.session_id);
         let events = self.events.clone();
         tokio::spawn(async move {
-            if let Err(e) = http.post(&path, body).await {
+            if let Err(e) = http.post_unbounded(&path, body).await {
                 let kind = EventKind::Diagnostic(Diagnostic {
                     level: DiagnosticLevel::Warning,
                     message: format!("command rejected: {e}"),
@@ -717,10 +746,27 @@ impl Drive {
         let kind = frame["type"].as_str().unwrap_or_default();
         // Global frames (`server.connected`, installation notices) have no
         // session; session frames not ours are other sessions on the bus.
+        // A task-tool child's input requests reach the caller (it stalls
+        // parked otherwise); the rest of its traffic — content, idle — is the
+        // parent's task tool's business, and an abort of the root cascades to
+        // children server-side (probed 2026-09-04).
         if let Some(session) = props["sessionID"].as_str()
             && session != self.session_id
         {
-            return Ok(());
+            // `session.created` frames carry the newborn's own id; one whose
+            // parent is ours registers a child.
+            if kind == "session.created" {
+                self.on_session_created(&props["info"]);
+                return Ok(());
+            }
+            if !self.children.contains(session) {
+                return Ok(());
+            }
+            return match kind {
+                "permission.asked" => self.on_permission(props).await,
+                "question.asked" => self.on_question(props).await,
+                _ => Ok(()),
+            };
         }
         // The generated title lands as post-idle bookkeeping, so it is read
         // before the turn gate.
@@ -737,6 +783,12 @@ impl Drive {
             "session.status" if busy_status(&props["status"]) => {
                 if self.turn == Turn::Sent {
                     self.turn = Turn::Busy;
+                }
+                if props["status"]["type"].as_str() == Some("retry") {
+                    let message = props["status"]["message"]
+                        .as_str()
+                        .unwrap_or("the provider is retrying");
+                    return self.diagnostic(DiagnosticLevel::Info, message).await;
                 }
                 Ok(())
             }
@@ -793,6 +845,16 @@ impl Drive {
             extensions,
         })
         .await
+    }
+
+    /// Registers a task-tool child: a newborn session whose parent is us or
+    /// one of ours. Its permission asks must reach the caller or it stalls.
+    fn on_session_created(&mut self, info: &Value) {
+        if let (Some(id), Some(parent)) = (info["id"].as_str(), info["parentID"].as_str())
+            && (parent == self.session_id || self.children.contains(parent))
+        {
+            self.children.insert(id.to_owned());
+        }
     }
 
     /// Post-turn bookkeeping renames the session; a real (non-placeholder)
@@ -918,9 +980,21 @@ impl Drive {
     async fn on_step_finish(&mut self, part: &Value) -> Result<(), Gone> {
         let tokens = &part["tokens"];
         self.cost += part["cost"].as_f64().unwrap_or_default();
-        let Some(used) = tokens["total"].as_u64().filter(|t| *t > 0) else {
+        // Other step-finish shapes carry the components without a `total`.
+        let sum = |v: &Value| v.as_u64().unwrap_or_default();
+        let used = tokens["total"]
+            .as_u64()
+            .filter(|t| *t > 0)
+            .unwrap_or_else(|| {
+                sum(&tokens["input"])
+                    + sum(&tokens["output"])
+                    + sum(&tokens["reasoning"])
+                    + sum(&tokens["cache"]["read"])
+                    + sum(&tokens["cache"]["write"])
+            });
+        if used == 0 {
             return Ok(());
-        };
+        }
         self.emit_kind(EventKind::ContextUsage {
             used_tokens: used,
             window_tokens: current_model(&self.info).and_then(|m| self.windows.get(&m).copied()),
@@ -941,25 +1015,31 @@ impl Drive {
             .get(call_id)
             .cloned()
             .unwrap_or_else(|| permission_tool(props));
+        let request = Request::Permission(PermissionRequest {
+            id: id.clone(),
+            tool,
+            options: vec![
+                PermissionChoice::AllowOnce,
+                PermissionChoice::AllowAlways,
+                PermissionChoice::DenyOnce,
+            ],
+            detail: permission_detail(props),
+        });
+        let session_id = props["sessionID"]
+            .as_str()
+            .unwrap_or(&self.session_id)
+            .to_owned();
         self.requests.insert(
-            id.clone(),
-            PendingRequest::Permission {
-                permission_id: permission_id.to_owned(),
+            id,
+            Pending {
+                reply: Reply::Permission {
+                    permission_id: permission_id.to_owned(),
+                    session_id,
+                },
+                request: request.clone(),
             },
         );
-        self.emit_kind(EventKind::RequestOpened(Request::Permission(
-            PermissionRequest {
-                id,
-                tool,
-                options: vec![
-                    PermissionChoice::AllowOnce,
-                    PermissionChoice::AllowAlways,
-                    PermissionChoice::DenyOnce,
-                ],
-                detail: permission_detail(props),
-            },
-        )))
-        .await
+        self.emit_kind(EventKind::RequestOpened(request)).await
     }
 
     /// The question tool becomes a question request.
@@ -975,16 +1055,20 @@ impl Drive {
             .enumerate()
             .map(|(i, q)| question(&id, i, q))
             .collect();
+        let request = Request::Question(QuestionRequest {
+            id: id.clone(),
+            questions,
+        });
         self.requests.insert(
-            id.clone(),
-            PendingRequest::Question {
-                question_id: question_id.to_owned(),
+            id,
+            Pending {
+                reply: Reply::Question {
+                    question_id: question_id.to_owned(),
+                },
+                request: request.clone(),
             },
         );
-        self.emit_kind(EventKind::RequestOpened(Request::Question(
-            QuestionRequest { id, questions },
-        )))
-        .await
+        self.emit_kind(EventKind::RequestOpened(request)).await
     }
 
     /// Replies to one open request in the shape opencode expects.
@@ -992,8 +1076,14 @@ impl Drive {
         let Some(pending) = self.requests.remove(&request) else {
             return Ok(());
         };
-        let sent = match (pending, answer) {
-            (PendingRequest::Permission { permission_id }, Answer::Permission(choice)) => {
+        let sent = match (&pending.reply, &answer) {
+            (
+                Reply::Permission {
+                    permission_id,
+                    session_id,
+                },
+                Answer::Permission(choice),
+            ) => {
                 let response = match choice {
                     PermissionChoice::AllowOnce => "once",
                     PermissionChoice::AllowAlways => "always",
@@ -1001,28 +1091,31 @@ impl Drive {
                 };
                 self.http
                     .post(
-                        &format!("/session/{}/permissions/{permission_id}", self.session_id),
+                        &format!("/session/{session_id}/permissions/{permission_id}"),
                         json!({ "response": response }),
                     )
                     .await
             }
-            (PendingRequest::Question { question_id }, Answer::Question(answers)) => {
+            (Reply::Question { question_id }, Answer::Question(answers)) => {
                 self.http
                     .post(
                         &format!("/question/{question_id}/reply"),
-                        json!({ "answers": question_answers(&answers) }),
+                        json!({ "answers": question_answers(answers) }),
                     )
                     .await
             }
             _ => return Ok(()),
         };
-        // The engine has already closed the request; a refusal is reported,
-        // and the agent stays parked on it until its turn is cancelled.
         match sent {
             Ok(_) => Ok(()),
+            // The agent is still parked on it: report the refusal and reopen
+            // the request under the same id so the caller can answer again.
             Err(e) => {
                 self.diagnostic(DiagnosticLevel::Warning, format!("answer not taken: {e}"))
-                    .await
+                    .await?;
+                let reopened = pending.request.clone();
+                self.requests.insert(request, pending);
+                self.emit_kind(EventKind::RequestOpened(reopened)).await
             }
         }
     }
@@ -1049,12 +1142,13 @@ impl Drive {
         for (oc_id, message_id) in open {
             self.end_message(oc_id, message_id).await?;
         }
-        // A settled turn leaves nothing more for its parts, tools, or an
-        // unanswered dialog (the engine already closed the request).
+        // A settled turn leaves nothing more for its parts, tools, children,
+        // or an unanswered dialog (the engine already closed the request).
         self.parts.clear();
         self.tools.clear();
         self.messages.clear();
         self.ended.clear();
+        self.children.clear();
         self.requests.clear();
         self.emit(DriverEvent::TurnEnded(stop)).await
     }
@@ -1074,13 +1168,18 @@ impl Drive {
             Some("MessageAbortedError") => Ok(()),
             _ if self.turn == Turn::Idle => Ok(()),
             _ => {
-                // The turn is failing; the idle that follows reports it.
+                // The turn is failing; idle normally follows and reports it.
+                // A turn that died outright is already idle server-side and
+                // sends nothing more, so settle now.
                 let message = error["data"]["message"]
                     .as_str()
                     .unwrap_or("the agent reported an error");
                 self.turn_error = Some(StopReason::Failed {
                     message: message.to_owned(),
                 });
+                if self.turn == Turn::Busy && !self.server_busy().await {
+                    return self.on_idle().await;
+                }
                 Ok(())
             }
         }
@@ -1478,19 +1577,55 @@ struct Http {
     directory: String,
     /// The `Authorization` header value.
     auth: String,
+    /// Tees outgoing requests when wire recording is on.
+    recorder: Option<WireRecorder>,
 }
+
+/// How long a request/response call may take; a wedged server must not
+/// block the drive loop (and with it cancel and close) forever.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl Http {
     async fn get(&self, path: &str) -> Result<Value, AgentError> {
-        self.request("GET", path, None).await
+        self.request("GET", path, None, Some(HTTP_TIMEOUT)).await
     }
 
     async fn post(&self, path: &str, body: Value) -> Result<Value, AgentError> {
-        self.request("POST", path, Some(body)).await
+        self.request("POST", path, Some(body), Some(HTTP_TIMEOUT))
+            .await
+    }
+
+    /// A POST that legitimately runs as long as a turn (`/command` answers
+    /// with the finished message); callers run it off the drive loop.
+    async fn post_unbounded(&self, path: &str, body: Value) -> Result<Value, AgentError> {
+        self.request("POST", path, Some(body), None).await
     }
 
     /// Sends one request and returns the decoded JSON body (or `Null`).
     async fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        limit: Option<Duration>,
+    ) -> Result<Value, AgentError> {
+        if let Some(recorder) = &self.recorder {
+            recorder.record(
+                "out",
+                &json!({ "method": method, "path": path, "body": body }),
+            );
+        }
+        let io = self.exchange(method, path, body);
+        match limit {
+            Some(limit) => tokio::time::timeout(limit, io)
+                .await
+                .map_err(|_| AgentError::ProtocolFailed(format!("{method} {path} timed out")))?,
+            None => io.await,
+        }
+    }
+
+    /// One connection, one request, one length-framed response.
+    async fn exchange(
         &self,
         method: &str,
         path: &str,

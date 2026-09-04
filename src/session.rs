@@ -456,6 +456,9 @@ impl Engine {
                 SessionStatus::NeedsInput
             }
             TurnState::Running { .. } => SessionStatus::Working,
+            // A queued prompt promotes on the next pass (trailing driver
+            // events can defer it); the gap must not flash Idle.
+            _ if !self.queue.is_empty() => SessionStatus::Working,
             _ => SessionStatus::Idle,
         };
         if status == self.last_status {
