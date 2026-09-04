@@ -82,6 +82,11 @@ pub(crate) async fn spawn(spec: Spawn) -> Result<Child, AgentError> {
 }
 
 impl Child {
+    /// Whether the child is still running, without waiting.
+    pub fn is_running(&mut self) -> bool {
+        matches!(self.inner.try_wait(), Ok(None))
+    }
+
     /// Last stderr lines, for error reports.
     pub fn stderr_tail(&self) -> String {
         let tail = self.stderr_tail.lock().unwrap_or_else(|e| e.into_inner());

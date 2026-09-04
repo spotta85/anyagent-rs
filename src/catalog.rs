@@ -51,6 +51,8 @@ pub(crate) enum NativeKind {
     Antigravity,
     /// The pi RPC wire (`--mode rpc`).
     Pi,
+    /// opencode's HTTP + SSE server (`opencode serve`), legacy engine.
+    Opencode,
 }
 
 /// Offline auth markers for fast discovery.
@@ -175,8 +177,11 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         executable_env: "ANYAGENT_OPENCODE_BIN",
         // Data home; `opencode auth login` writes auth.json here.
         config_dir: ".local/share/opencode",
+        // `XDG_DATA_HOME` relocates opencode's db/state but not its login
+        // (auth stays in the shared keychain/auth.json), so it does not
+        // isolate accounts — left unset, an isolation request fails typed.
         config_home_env: None,
-        connection: Connection::Acp { args: &["acp"] },
+        connection: Connection::Native(NativeKind::Opencode),
         auth_markers: &[AuthMarker::ConfigFile("auth.json", AuthKind::Subscription)],
         open_auth_kind: None,
         auth_error_hints: &[],

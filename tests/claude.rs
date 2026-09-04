@@ -994,10 +994,17 @@ async fn losing_auth_mid_session_fails_the_turn_and_closes() {
         &login[1],
         anyagent::LoginMethod::EnvVar { name } if name == "ANTHROPIC_API_KEY"
     ));
-    let end = tokio::time::timeout(Duration::from_secs(10), events.next())
-        .await
-        .unwrap();
-    assert!(end.is_none(), "stream should close, got {end:?}");
+    // Only trailing status flips may remain; then the stream closes.
+    loop {
+        let end = tokio::time::timeout(Duration::from_secs(10), events.next())
+            .await
+            .unwrap();
+        match end {
+            None => break,
+            Some(Ok(event)) if matches!(event.kind, EventKind::StatusChanged(_)) => {}
+            other => panic!("stream should close, got {other:?}"),
+        }
+    }
     assert!(matches!(
         session.prompt("hi").await,
         Err(AgentError::SessionClosed)

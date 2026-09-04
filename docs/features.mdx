@@ -58,6 +58,10 @@ event's `extensions` map instead of leaking into the types.
 let (session, mut events) = runtime.open(&agent, SessionOptions::in_dir(".")).await?;
 ```
 
+The session's UI state — `Working`, `NeedsInput`, `Idle` — is pushed as a
+`StatusChanged` event on every flip, and `session.status()` answers on
+demand, so thread lists and "needs you" badges need no event reducer.
+
 → [Sessions guide](/guides/sessions) · [Events guide](/guides/events)
 
 ## Prompting, steering, queueing

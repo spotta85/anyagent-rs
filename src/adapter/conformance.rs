@@ -21,13 +21,20 @@ async fn open(adapter: MockAdapter, options: Option<SessionOptions>) -> (Session
     runtime.open(agent, options).await.unwrap()
 }
 
-/// Next event within two seconds, or panic.
+/// Next event within two seconds, or panic. Skips `StatusChanged` so the
+/// sequence assertions stay about content; the dedicated status test reads
+/// the raw stream.
 async fn next(events: &mut Events) -> Event {
-    tokio::time::timeout(Duration::from_secs(2), events.next())
-        .await
-        .expect("timed out waiting for an event")
-        .expect("stream ended")
-        .expect("stream error")
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), events.next())
+            .await
+            .expect("timed out waiting for an event")
+            .expect("stream ended")
+            .expect("stream error");
+        if !matches!(event.kind, EventKind::StatusChanged(_)) {
+            return event;
+        }
+    }
 }
 
 /// A turn that parks on a permission request until answered, then ends.
@@ -77,7 +84,18 @@ async fn prompt_request_answer_and_completion_share_one_contract() {
     }
     assert_eq!(text_seen, "Let me check. Done.");
     session.close().await.unwrap();
-    assert!(events.next().await.is_none(), "stream closes after close()");
+    stream_closes(&mut events).await;
+}
+
+/// Asserts the stream ends, tolerating only a trailing status flip.
+async fn stream_closes(events: &mut Events) {
+    loop {
+        match events.next().await {
+            None => break,
+            Some(Ok(event)) if matches!(event.kind, EventKind::StatusChanged(_)) => {}
+            other => panic!("stream should close after close(), got {other:?}"),
+        }
+    }
 }
 
 /// Second prompt queued as Queued{0} and promoted FIFO after first ends.
@@ -357,6 +375,73 @@ async fn frames_losing_the_promotion_race_are_dropped_not_reattributed() {
 
 /// Slow consumer with 1000 deltas (<1024) loses nothing and preserves sequence order.
 #[tokio::test]
+async fn status_flips_working_needs_input_and_back_and_never_flashes_idle() {
+    use crate::SessionStatus;
+
+    // A permission turn: Working -> NeedsInput -> Working -> Idle, pushed
+    // only on change, and readable from the handle without the stream.
+    let (session, mut events) = open(MockAdapter::permission_flow(), None).await;
+    assert_eq!(session.status(), SessionStatus::Idle);
+    session.prompt("go").await.unwrap();
+
+    let mut statuses = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), events.next())
+            .await
+            .expect("timed out")
+            .expect("stream ended")
+            .expect("stream error");
+        match event.kind {
+            EventKind::StatusChanged(status) => {
+                statuses.push(status);
+                if status == SessionStatus::Idle {
+                    break;
+                }
+            }
+            EventKind::RequestOpened(request) => {
+                session.answer(request.id(), allow()).await.unwrap();
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        statuses,
+        vec![
+            SessionStatus::Working,
+            SessionStatus::NeedsInput,
+            SessionStatus::Working,
+            SessionStatus::Idle,
+        ]
+    );
+    assert_eq!(session.status(), SessionStatus::Idle);
+
+    // A turn ending with another prompt queued stays Working throughout:
+    // promotion happens before the status check, so Idle never flashes.
+    let script = Script::default()
+        .turn(vec![Step::Emit(text("m1", "one")), Step::End(completed())])
+        .turn(vec![Step::Emit(text("m2", "two")), Step::End(completed())]);
+    let (session, mut events) = open(MockAdapter::new(script), None).await;
+    session.prompt("first").await.unwrap();
+    session.prompt("second").await.unwrap();
+
+    let mut statuses = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), events.next())
+            .await
+            .expect("timed out")
+            .expect("stream ended")
+            .expect("stream error");
+        if let EventKind::StatusChanged(status) = event.kind {
+            statuses.push(status);
+            if status == SessionStatus::Idle {
+                break;
+            }
+        }
+    }
+    assert_eq!(statuses, vec![SessionStatus::Working, SessionStatus::Idle]);
+}
+
+#[tokio::test]
 async fn a_stalled_consumer_is_disconnected_instead_of_growing_memory() {
     // More events than the consumer buffer (1024) holds, never drained.
     let mut steps: Vec<Step> = (0..1300)
@@ -584,7 +669,7 @@ async fn close_during_a_turn_ends_it_and_closes_requests() {
             ..
         }
     ));
-    assert!(events.next().await.is_none(), "stream closes after close()");
+    stream_closes(&mut events).await;
 }
 
 /// Unknown RequestId/double answer/dequeue rejected typed InvalidRequest; dequeued prompt never starts.
@@ -619,7 +704,7 @@ async fn unknown_requests_and_prompts_are_rejected() {
     let kinds = collect(&mut events, 2).await;
     assert!(matches!(kinds[1], EventKind::TurnEnded { .. }));
     assert!(
-        tokio::time::timeout(Duration::from_millis(200), events.next())
+        tokio::time::timeout(Duration::from_millis(200), next(&mut events))
             .await
             .is_err(),
         "the dequeued prompt never starts"

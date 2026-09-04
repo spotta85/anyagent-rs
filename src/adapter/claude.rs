@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
+use crate::adapter::plan_entries;
 use crate::adapter::{
     Adapter, ConnectRequest, DriverCommand, DriverConnection, DriverEvent, DriverInfo,
     WireRecorder, attach, cap, login_methods, with_stderr,
@@ -21,9 +22,9 @@ use crate::agent::{
 use crate::error::AgentError;
 use crate::event::{
     Answer, Choice, ChoiceId, CompletionSource, Diagnostic, DiagnosticLevel, EventKind, Extensions,
-    FileDiff, MessageId, PermissionChoice, PermissionRequest, PlanEntry, PlanStatus, PlanUsage,
-    Question, QuestionAnswer, QuestionId, QuestionRequest, RawTool, Request, RequestId, StopReason,
-    ToolId, ToolInput, ToolKind, ToolStatus, ToolUpdate, UsageWindow,
+    FileDiff, MessageId, PermissionChoice, PermissionRequest, PlanUsage, Question, QuestionAnswer,
+    QuestionId, QuestionRequest, RawTool, Request, RequestId, StopReason, ToolId, ToolInput,
+    ToolKind, ToolStatus, ToolUpdate, UsageWindow,
 };
 use crate::process::{self, Spawn};
 
@@ -1373,25 +1374,6 @@ fn file_diff(path: &str, typed: &Value) -> Option<FileDiff> {
         old_text: typed["originalFile"].as_str().map(str::to_owned),
         new_text: content.to_owned(),
     })
-}
-
-fn plan_entries(todos: &Value) -> Vec<PlanEntry> {
-    todos
-        .as_array()
-        .map(|todos| {
-            todos
-                .iter()
-                .map(|todo| PlanEntry {
-                    text: todo["content"].as_str().unwrap_or_default().to_owned(),
-                    status: match todo["status"].as_str().unwrap_or_default() {
-                        "in_progress" => PlanStatus::InProgress,
-                        "completed" => PlanStatus::Completed,
-                        _ => PlanStatus::Pending,
-                    },
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Claude offers allow/deny; `AllowAlways` exists when the CLI suggested a

@@ -56,7 +56,10 @@
 //! app is written once. Turn rules are enforced by anyagent, not trusted
 //! from the provider: exactly one `TurnEnded` per turn, no phantom turns.
 //! Anything provider-specific rides in [`Event::extensions`] instead of
-//! leaking into the types.
+//! leaking into the types. The UI state — [`SessionStatus`]: working,
+//! needing input, idle — is pushed as `StatusChanged` on every flip and
+//! read on demand with [`Session::status`], so thread lists and "needs
+//! you" badges need no event reducer.
 //!
 //! **Prompting.** [`Session::prompt`] takes text or an [`Input`] with file
 //! attachments (images inline when the wire supports them). A prompt sent
@@ -120,4 +123,4 @@ pub use agent::*;
 pub use error::AgentError;
 pub use event::*;
 pub use runtime::{AgentPlanUsage, DiscoveryReport, MissingAgent, Runtime};
-pub use session::{Events, Session, SessionInfo};
+pub use session::{Events, Session, SessionInfo, SessionStatus};

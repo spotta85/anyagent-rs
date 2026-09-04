@@ -17,7 +17,7 @@ real install.
 | Antigravity | `antigravity` | `agy` | native (adapter in progress — not yet openable) | [antigravity.google](https://antigravity.google), then `agy install` |
 | Grok | `grok` | `grok` | ACP | `npm install -g @xai-official/grok` |
 | Hermes Agent | `hermes` | `hermes` | ACP | [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) |
-| opencode | `opencode` | `opencode` | ACP | `brew install sst/tap/opencode` |
+| opencode | `opencode` | `opencode` | native (HTTP + SSE) | `brew install sst/tap/opencode` |
 | Kiro CLI | `kiro` | `kiro-cli` | ACP | [kiro.dev](https://kiro.dev) |
 | Qwen Code | `qwen` | `qwen` | ACP | `npm install -g @qwen-code/qwen-code` |
 | pi | `pi` | `pi` | native (pi RPC) | `npm install -g @earendil-works/pi-coding-agent` |
@@ -30,6 +30,23 @@ OAuth for it.
 <Note>
 `pi` is provider-key based: log in with `/login <provider>` inside the CLI,
 or set the provider's API-key variable.
+</Note>
+
+<Note>
+Hermes gates only its file tools behind permission requests — its terminal
+tool runs without asking, so a denied write does not stop the agent from
+writing via shell. Sandbox accordingly if that matters to your app.
+</Note>
+
+<Note>
+opencode runs native: anyagent starts `opencode serve` on a private localhost
+port per session, gated by a per-session secret, and drives its HTTP + SSE
+wire. This adds permissions, questions, rollback, fork, slash commands, plans,
+and context usage over the ACP path. It does not steer (the engine queues
+mid-turn prompts instead), and it has no plan quota. Pass a model with
+`configure("model", "provider/id")`; opencode's own free `opencode/…` models
+need no extra key. To drive it over ACP instead, build it with
+`AgentInstallation::acp("opencode", path, ["acp"])`.
 </Note>
 
 ## Any other ACP agent

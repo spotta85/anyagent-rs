@@ -8,7 +8,7 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::string_id;
-use crate::session::SessionInfo;
+use crate::session::{SessionInfo, SessionStatus};
 
 string_id!(SessionId);
 string_id!(TurnId);
@@ -28,12 +28,23 @@ pub type Extensions = BTreeMap<String, serde_json::Value>;
 pub struct Event {
     /// Starts at 1 and increases for every session event.
     pub sequence: u64,
+    /// When the engine produced this event — wall-clock, so transcripts can
+    /// be stored and merged without the app stamping receive time. Order
+    /// across events is guaranteed by `sequence`, not by this clock. A
+    /// transcript stored before this field existed reads as the epoch.
+    #[serde(default = "unix_epoch")]
+    pub occurred_at: SystemTime,
     pub session_id: SessionId,
     /// Present when the event belongs to a turn.
     pub turn_info: Option<TurnContext>,
     pub kind: EventKind,
     /// Provider-specific data that has not been normalized.
     pub extensions: Extensions,
+}
+
+/// The `occurred_at` of a transcript older than the field.
+fn unix_epoch() -> SystemTime {
+    SystemTime::UNIX_EPOCH
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +94,9 @@ pub enum EventKind {
         request_id: RequestId,
     },
     SessionUpdated(SessionInfo),
+    /// The session's UI state flipped: working, needing input, or idle.
+    /// Emitted only on change; `session.status()` answers without the stream.
+    StatusChanged(SessionStatus),
     /// Context-window occupancy for this session.
     ContextUsage {
         used_tokens: u64,
@@ -361,4 +375,26 @@ pub enum DeliveryKind {
         /// Number of prompts ahead of this one.
         position: u32,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_event_stored_without_occurred_at_still_loads() {
+        let event = Event {
+            sequence: 1,
+            occurred_at: SystemTime::UNIX_EPOCH,
+            session_id: SessionId::new("s1"),
+            turn_info: None,
+            kind: EventKind::TurnStarted {
+                origin: TurnOrigin::Agent,
+            },
+            extensions: Extensions::new(),
+        };
+        let mut stored = serde_json::to_value(&event).unwrap();
+        stored.as_object_mut().unwrap().remove("occurred_at");
+        assert_eq!(serde_json::from_value::<Event>(stored).unwrap(), event);
+    }
 }
