@@ -939,7 +939,12 @@ impl Drive {
         if text.len() <= state.emitted {
             return Ok(());
         }
-        let delta = text[state.emitted..].to_owned();
+        // A revised snapshot (not prefixed by the streamed deltas) can put
+        // the cut inside a multi-byte character; dropping it is safe — the
+        // deltas carry the live content and the next snapshot retries.
+        let Some(delta) = text.get(state.emitted..).map(str::to_owned) else {
+            return Ok(());
+        };
         state.emitted = text.len();
         self.emit_text(kind, message_id, delta).await
     }
@@ -1114,7 +1119,13 @@ impl Drive {
                     )
                     .await
             }
-            _ => return Ok(()),
+            // Unreachable past engine shape validation; reopen rather than
+            // leave the agent parked on a silently dropped request.
+            _ => {
+                let reopened = pending.request.clone();
+                self.requests.insert(request, pending);
+                return self.emit_kind(EventKind::RequestOpened(reopened)).await;
+            }
         };
         match sent {
             Ok(_) => Ok(()),
@@ -1258,25 +1269,31 @@ impl Drive {
     }
 
     /// Whether the server still reports this session busy. An unreachable
-    /// server counts as idle: it is dying, and the bus closing follows.
+    /// server counts as idle: it is dying, and the bus closing follows. The
+    /// short timeout keeps a wedged handler from stalling the drive loop.
     async fn server_busy(&self) -> bool {
-        match self.http.get("/session/status").await {
+        match self.http.get_quick("/session/status").await {
             Ok(status) => busy_status(&status[&self.session_id]),
             Err(_) => false,
         }
     }
 
     /// The admission deadline passed without the server going busy: adopt a
-    /// busy whose frame was missed, or fail the turn rather than hang.
+    /// busy whose frame was missed, or end the turn rather than hang. A
+    /// cancel taken while the prompt sat unadmitted ends it as cancelled.
     async fn check_admission(&mut self) -> Result<(), Gone> {
         if self.server_busy().await {
             self.turn = Turn::Busy;
             return Ok(());
         }
         self.turn = Turn::Idle;
-        let stop = self.turn_error.take().unwrap_or(StopReason::Failed {
-            message: "opencode took the prompt but never started on it".into(),
-        });
+        let stop = if std::mem::take(&mut self.aborting) {
+            StopReason::Cancelled
+        } else {
+            self.turn_error.take().unwrap_or(StopReason::Failed {
+                message: "opencode took the prompt but never started on it".into(),
+            })
+        };
         self.emit(DriverEvent::TurnEnded(stop)).await
     }
 
@@ -1597,10 +1614,18 @@ struct Http {
 /// How long a request/response call may take; a wedged server must not
 /// block the drive loop (and with it cancel and close) forever.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Status reads reconcile turn ends inline in the drive loop, so they get
+/// a much shorter leash.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(3);
 
 impl Http {
     async fn get(&self, path: &str) -> Result<Value, AgentError> {
         self.request("GET", path, None, Some(HTTP_TIMEOUT)).await
+    }
+
+    /// A GET that must answer fast or not at all (status reconciles).
+    async fn get_quick(&self, path: &str) -> Result<Value, AgentError> {
+        self.request("GET", path, None, Some(STATUS_TIMEOUT)).await
     }
 
     async fn post(&self, path: &str, body: Value) -> Result<Value, AgentError> {

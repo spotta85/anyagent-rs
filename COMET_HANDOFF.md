@@ -95,7 +95,9 @@ Comet ──> anyagent Session ──> opencode adapter ──HTTP──> openco
      message-end, turn-end). A `Diagnostic` must not disarm the bound.
    - b. Translate `Diagnostic` at Warning and above into `AgentEvent::Error`
      (non-fatal, visible): this is how provider-retry storms and
-     answer-refused notices reach the user.
+     answer-refused notices reach the user. Info stays hidden — it is other
+     wires' frame chatter ("unrecognized ACP update") — with one exception:
+     opencode, whose only Info diagnostic is the provider-retry notice.
    - c. Keep `OPENCODE_STALL` at 60s as the bound for retry-forever.
    (`bridge.rs`: consts at the top, disarm in `drive()`, catch-all in
    `on_event()`.)
