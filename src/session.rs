@@ -483,7 +483,10 @@ impl Engine {
                 });
             }
             Command::Answer(request, answer, reply) => {
-                let _ = reply.send(self.handle_answer(request, answer).await);
+                let result = self.handle_answer(request, answer).await;
+                // Snapshot before the reply, as for `prompt`.
+                self.sync_status().await;
+                let _ = reply.send(result);
             }
             Command::Configure(id, value, reply) => {
                 let _ = reply.send(self.handle_configure(id, value).await);
@@ -508,6 +511,9 @@ impl Engine {
             }
             TurnState::Idle => {
                 let turn_id = self.start_turn(prompt_id.clone(), input).await;
+                // Snapshot first, so `status()` right after `prompt()`
+                // returns already reads Working.
+                self.sync_status().await;
                 let _ = reply.send(Ok(Delivery {
                     prompt_id,
                     kind: DeliveryKind::Started { turn_id },
