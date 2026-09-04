@@ -458,6 +458,16 @@ async fn the_handshake_fills_details() {
     };
     let levels: Vec<&str> = choices.iter().map(|c| c.value.as_str()).collect();
     assert_eq!(levels, ["low", "medium", "high", "xhigh", "max"]);
+    // Fast mode: offered because the catalog supports it, off until the
+    // creation-time settings flag turns it on.
+    let fast = details
+        .config_options
+        .iter()
+        .find(|o| o.id.as_str() == "fastMode")
+        .unwrap();
+    assert!(!fast.live);
+    assert_eq!(fast.kind, ConfigKind::Boolean);
+    assert_eq!(fast.current, Some(ConfigValue::Bool(false)));
     // The adapter mints the session id, so the token exists before any turn.
     assert!(session.info().resume_token.is_some());
     session.close().await.unwrap();
@@ -998,7 +1008,8 @@ async fn creation_time_config_rides_the_launch_args_and_unknown_ids_are_refused(
             SessionOptions::in_dir(std::env::temp_dir())
                 .configure("mode", "plan")
                 .configure("model", "sonnet")
-                .configure("effort", "low"),
+                .configure("effort", "low")
+                .configure("fastMode", true),
         )
         .await
         .unwrap();
@@ -1016,6 +1027,11 @@ async fn creation_time_config_rides_the_launch_args_and_unknown_ids_are_refused(
     assert_eq!(
         info.configuration.options.get(&ConfigId::new("effort")),
         Some(&ConfigValue::Text("low".into()))
+    );
+    // The `--settings {"fastMode":true}` flag round-trips as state "on".
+    assert_eq!(
+        info.configuration.options.get(&ConfigId::new("fastMode")),
+        Some(&ConfigValue::Bool(true))
     );
     assert!(info.resume_token.is_some());
     session.close().await.unwrap();

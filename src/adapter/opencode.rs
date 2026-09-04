@@ -83,6 +83,9 @@ impl Adapter for OpencodeAdapter {
                 parts: HashMap::new(),
                 tools: HashMap::new(),
                 children: HashSet::new(),
+                child_of: HashMap::new(),
+                spawn_order: Vec::new(),
+                child_messages: HashMap::new(),
                 requests: HashMap::new(),
                 cost: 0.0,
                 turn: Turn::Idle,
@@ -554,8 +557,19 @@ struct Drive {
     /// Tool snapshots by `callID`, for the permission that references one.
     tools: HashMap<String, ToolUpdate>,
     /// Task-tool child sessions of this turn; their permission and question
-    /// asks reach the caller, the rest of their traffic does not.
+    /// asks reach the caller, and bound children's turn content streams
+    /// under their spawning tool call.
     children: HashSet<String>,
+    /// Child session id → spawning task-tool call, for transcript nesting.
+    /// Bound at `session.created`; cleared with `children` at turn end.
+    child_of: HashMap<String, ToolId>,
+    /// Own task-tool `callID`s in first-seen order, for oldest-unbound
+    /// binding. A child's own task tools stay out: grandchildren bind
+    /// through their parent, never through this list.
+    spawn_order: Vec<String>,
+    /// Child assistant `msg_…` id → spawning task-tool call, so the turn-end
+    /// sweep closes stragglers under the right parent.
+    child_messages: HashMap<String, ToolId>,
     requests: HashMap<RequestId, Pending>,
     /// Session cost so far, summed over step-finishes.
     cost: f64,
@@ -752,8 +766,9 @@ impl Drive {
         // Global frames (`server.connected`, installation notices) have no
         // session; session frames not ours are other sessions on the bus.
         // A task-tool child's input requests reach the caller (it stalls
-        // parked otherwise); the rest of its traffic — content, idle — is the
-        // parent's task tool's business, and an abort of the root cascades to
+        // parked otherwise), and a bound child's turn content streams under
+        // its spawning tool call. Turn state (busy/idle/admission) never
+        // listens to child frames, and an abort of the root cascades to
         // children server-side (probed 2026-09-04).
         if let Some(session) = props["sessionID"].as_str()
             && session != self.session_id
@@ -767,9 +782,21 @@ impl Drive {
             if !self.children.contains(session) {
                 return Ok(());
             }
+            // An unbound child's content is dropped: no transcript beats a
+            // misattributed one.
+            let parent = self.child_of.get(session).cloned();
             return match kind {
                 "permission.asked" => self.on_permission(props).await,
                 "question.asked" => self.on_question(props).await,
+                "message.updated" if parent.is_some() => {
+                    self.on_message(props, parent).await
+                }
+                "message.part.updated" if parent.is_some() => {
+                    self.on_part(&props["part"], parent).await
+                }
+                "message.part.delta" if parent.is_some() => {
+                    self.on_delta(props, parent).await
+                }
                 _ => Ok(()),
             };
         }
@@ -807,9 +834,9 @@ impl Drive {
                     self.on_idle().await
                 }
             }
-            "message.updated" => self.on_message(props).await,
-            "message.part.updated" => self.on_part(&props["part"]).await,
-            "message.part.delta" => self.on_delta(props).await,
+            "message.updated" => self.on_message(props, None).await,
+            "message.part.updated" => self.on_part(&props["part"], None).await,
+            "message.part.delta" => self.on_delta(props, None).await,
             "permission.asked" => self.on_permission(props).await,
             "question.asked" => self.on_question(props).await,
             "session.error" => self.on_error(props).await,
@@ -821,7 +848,10 @@ impl Drive {
     /// An assistant message: mint its streaming id, record any error, and
     /// close it once the server marks it completed (a turn can hold several
     /// assistant messages). The user-role echo of our own prompt is dropped.
-    async fn on_message(&mut self, props: &Value) -> Result<(), Gone> {
+    /// A bound child's message streams under its task tool (`parent`): no
+    /// tide gate (that guards our own settled-turn republishes) and no turn
+    /// failure capture — the child's failure surfaces through its task tool.
+    async fn on_message(&mut self, props: &Value, parent: Option<ToolId>) -> Result<(), Gone> {
         let info = &props["info"];
         if info["role"].as_str() != Some("assistant") {
             return Ok(());
@@ -831,39 +861,66 @@ impl Drive {
         };
         // A republished message of a settled turn must not re-mint: its
         // part snapshots would stream into the next turn.
-        if !self.messages.contains_key(oc_id) && oc_id <= self.tide.as_str() {
+        if parent.is_none()
+            && !self.messages.contains_key(oc_id)
+            && oc_id <= self.tide.as_str()
+        {
             return Ok(());
         }
         let message_id = self.message_id(oc_id);
-        if let Some(error) = info.get("error").filter(|e| !e.is_null()) {
+        if let Some(parent) = &parent {
+            self.child_messages
+                .insert(oc_id.to_owned(), parent.clone());
+        } else if let Some(error) = info.get("error").filter(|e| !e.is_null()) {
             self.turn_error = Some(message_error(error));
         }
         if info["time"]["completed"].is_null() || !self.ended.insert(oc_id.to_owned()) {
             return Ok(());
         }
-        self.end_message(oc_id.to_owned(), message_id).await
+        self.end_message(oc_id.to_owned(), message_id, parent).await
     }
 
     /// `MessageEnded`, carrying the message's own id as the fork anchor:
     /// opencode can fork at any message boundary, and ids sort by time.
-    async fn end_message(&mut self, oc_id: String, message_id: MessageId) -> Result<(), Gone> {
+    /// A child's close rides its task tool and carries no fork anchor.
+    async fn end_message(
+        &mut self,
+        oc_id: String,
+        message_id: MessageId,
+        parent: Option<ToolId>,
+    ) -> Result<(), Gone> {
         let mut extensions = Extensions::new();
-        extensions.insert("opencode/fork_point".into(), Value::from(oc_id));
+        if parent.is_none() {
+            extensions.insert("opencode/fork_point".into(), Value::from(oc_id));
+        }
         self.emit(DriverEvent::Event {
             kind: EventKind::MessageEnded { message_id },
-            parent_tool_id: None,
+            parent_tool_id: parent,
             extensions,
         })
         .await
     }
 
     /// Registers a task-tool child: a newborn session whose parent is us or
-    /// one of ours. Its permission asks must reach the caller or it stalls.
+    /// one of ours. A direct child binds to its spawning task tool (oldest
+    /// still-running spawn without a child of its own); a grandchild binds
+    /// through its parent. Parallel same-parent tasks can misattribute —
+    /// documented, accepted: nesting under a sibling beats silence, and an
+    /// unbound child stays silent rather than guessing.
     fn on_session_created(&mut self, info: &Value) {
-        if let (Some(id), Some(parent)) = (info["id"].as_str(), info["parentID"].as_str())
-            && (parent == self.session_id || self.children.contains(parent))
-        {
+        let (Some(id), Some(parent)) = (info["id"].as_str(), info["parentID"].as_str()) else {
+            return;
+        };
+        if parent == self.session_id {
             self.children.insert(id.to_owned());
+            if let Some(spawn) = select_spawn(&self.spawn_order, &self.tools, &self.child_of) {
+                self.child_of.insert(id.to_owned(), spawn);
+            }
+        } else if self.children.contains(parent) {
+            self.children.insert(id.to_owned());
+            if let Some(spawn) = self.child_of.get(parent).cloned() {
+                self.child_of.insert(id.to_owned(), spawn);
+            }
         }
     }
 
@@ -884,29 +941,36 @@ impl Drive {
     }
 
     /// One part snapshot: stream text and reasoning, track tools. Parts of the
-    /// user message (our own prompt) are ignored.
-    async fn on_part(&mut self, part: &Value) -> Result<(), Gone> {
+    /// user message (our own prompt) are ignored. A bound child's parts ride
+    /// its task tool (`parent`); its step finishes stay out — usage
+    /// attribution across models is murky, so fail silent, not wrong.
+    async fn on_part(&mut self, part: &Value, parent: Option<ToolId>) -> Result<(), Gone> {
         let oc_id = part["messageID"].as_str().unwrap_or_default();
         let Some(message_id) = self.messages.get(oc_id).cloned() else {
             return Ok(());
         };
         match part["type"].as_str().unwrap_or_default() {
-            "text" => self.stream_part(part, PartKind::Text, message_id).await,
-            "reasoning" => {
-                self.stream_part(part, PartKind::Reasoning, message_id)
+            "text" => {
+                self.stream_part(part, PartKind::Text, message_id, parent)
                     .await
             }
-            "tool" if part["tool"].as_str() == Some("todowrite") => self.on_plan(part).await,
+            "reasoning" => {
+                self.stream_part(part, PartKind::Reasoning, message_id, parent)
+                    .await
+            }
+            "tool" if part["tool"].as_str() == Some("todowrite") => {
+                self.on_plan(part, parent).await
+            }
             // Questions surface as requests (`question.asked`), not tools.
             "tool" if part["tool"].as_str() == Some("question") => Ok(()),
-            "tool" => self.on_tool(part).await,
-            "step-finish" => self.on_step_finish(part).await,
+            "tool" => self.on_tool(part, parent).await,
+            "step-finish" if parent.is_none() => self.on_step_finish(part).await,
             _ => Ok(()),
         }
     }
 
     /// A token-level delta for a known text or reasoning part.
-    async fn on_delta(&mut self, props: &Value) -> Result<(), Gone> {
+    async fn on_delta(&mut self, props: &Value, parent: Option<ToolId>) -> Result<(), Gone> {
         if props["field"].as_str() != Some("text") {
             return Ok(());
         }
@@ -919,8 +983,13 @@ impl Drive {
         let kind = state.kind;
         let delta = props["delta"].as_str().unwrap_or_default().to_owned();
         state.emitted += delta.len();
-        let message_id = self.message_id(props["messageID"].as_str().unwrap_or_default());
-        self.emit_text(kind, message_id, delta).await
+        let oc_id = props["messageID"].as_str().unwrap_or_default();
+        let message_id = self.message_id(oc_id);
+        if let Some(parent) = &parent {
+            self.child_messages
+                .insert(oc_id.to_owned(), parent.clone());
+        }
+        self.emit_text(kind, message_id, delta, parent).await
     }
 
     /// Emits whatever of a part's full snapshot has not been streamed yet.
@@ -929,6 +998,7 @@ impl Drive {
         part: &Value,
         kind: PartKind,
         message_id: MessageId,
+        parent: Option<ToolId>,
     ) -> Result<(), Gone> {
         let text = part["text"].as_str().unwrap_or_default();
         let part_id = part["id"].as_str().unwrap_or_default().to_owned();
@@ -946,7 +1016,7 @@ impl Drive {
             return Ok(());
         };
         state.emitted = text.len();
-        self.emit_text(kind, message_id, delta).await
+        self.emit_text(kind, message_id, delta, parent).await
     }
 
     async fn emit_text(
@@ -954,16 +1024,24 @@ impl Drive {
         kind: PartKind,
         message_id: MessageId,
         text: String,
+        parent: Option<ToolId>,
     ) -> Result<(), Gone> {
         let kind = match kind {
             PartKind::Text => EventKind::TextDelta { message_id, text },
             PartKind::Reasoning => EventKind::ReasoningDelta { message_id, text },
         };
-        self.emit_kind(kind).await
+        self.emit(DriverEvent::Event {
+            kind,
+            parent_tool_id: parent,
+            extensions: Extensions::new(),
+        })
+        .await
     }
 
-    /// The tool lifecycle from a `tool` part's state.
-    async fn on_tool(&mut self, part: &Value) -> Result<(), Gone> {
+    /// The tool lifecycle from a `tool` part's state. A child's tools ride
+    /// its task tool; own task tools register spawn order for child binding
+    /// (a grandchild binds through its parent, never through this list).
+    async fn on_tool(&mut self, part: &Value, parent: Option<ToolId>) -> Result<(), Gone> {
         let call_id = part["callID"].as_str().unwrap_or_default().to_owned();
         let name = part["tool"].as_str().unwrap_or_default();
         let state = &part["state"];
@@ -973,20 +1051,37 @@ impl Drive {
             .unwrap_or_else(|| fresh_tool(&call_id, name));
         apply_state(&mut tool, name, state);
         let done = matches!(tool.status, ToolStatus::Completed | ToolStatus::Failed);
+        if parent.is_none()
+            && tool.kind == ToolKind::Subagent
+            && !done
+            && !self.spawn_order.contains(&call_id)
+        {
+            self.spawn_order.push(call_id.clone());
+        }
         if !done {
             self.tools.insert(call_id, tool.clone());
         }
-        self.emit_kind(EventKind::ToolUpdated(tool)).await
+        self.emit(DriverEvent::Event {
+            kind: EventKind::ToolUpdated(tool),
+            parent_tool_id: parent,
+            extensions: Extensions::new(),
+        })
+        .await
     }
 
     /// The agent's task list is a plan, not a tool call: one snapshot per
-    /// finished write.
-    async fn on_plan(&mut self, part: &Value) -> Result<(), Gone> {
+    /// finished write. A child's plan rides its task tool, never the
+    /// parent's plan chip.
+    async fn on_plan(&mut self, part: &Value, parent: Option<ToolId>) -> Result<(), Gone> {
         if part["state"]["status"].as_str() != Some("completed") {
             return Ok(());
         }
-        self.emit_kind(EventKind::PlanUpdated {
-            entries: plan_entries(&part["state"]["input"]["todos"]),
+        self.emit(DriverEvent::Event {
+            kind: EventKind::PlanUpdated {
+                entries: plan_entries(&part["state"]["input"]["todos"]),
+            },
+            parent_tool_id: parent,
+            extensions: Extensions::new(),
         })
         .await
     }
@@ -1152,7 +1247,8 @@ impl Drive {
             })
         };
         // An aborted message never completes; close whatever is still open,
-        // in time order.
+        // in time order — a straggler from a bound child closes under its
+        // task tool.
         let mut open: Vec<_> = self
             .messages
             .iter()
@@ -1161,15 +1257,20 @@ impl Drive {
             .collect();
         open.sort();
         for (oc_id, message_id) in open {
-            self.end_message(oc_id, message_id).await?;
+            let parent = self.child_messages.get(&oc_id).cloned();
+            self.end_message(oc_id, message_id, parent).await?;
         }
         // A settled turn leaves nothing more for its parts, tools, children,
-        // or an unanswered dialog (the engine already closed the request).
+        // child bindings, or an unanswered dialog (the engine already closed
+        // the request).
         self.parts.clear();
         self.tools.clear();
         self.messages.clear();
         self.ended.clear();
         self.children.clear();
+        self.child_of.clear();
+        self.spawn_order.clear();
+        self.child_messages.clear();
         self.requests.clear();
         self.emit(DriverEvent::TurnEnded(stop)).await
     }
@@ -1359,6 +1460,26 @@ async fn admission(deadline: Option<tokio::time::Instant>) {
 /// opencode's own client reconciles the same way.
 fn busy_status(status: &Value) -> bool {
     matches!(status["type"].as_str(), Some("busy") | Some("retry"))
+}
+
+/// The spawn a newborn direct child binds to: oldest still-running spawn
+/// without a child of its own. `None` leaves the child unbound (silent).
+fn select_spawn(
+    spawn_order: &[String],
+    tools: &HashMap<String, ToolUpdate>,
+    child_of: &HashMap<String, ToolId>,
+) -> Option<ToolId> {
+    let taken: HashSet<&str> = child_of.values().map(ToolId::as_str).collect();
+    spawn_order
+        .iter()
+        .filter(|call| !taken.contains(call.as_str()))
+        .filter_map(|call| tools.get(call.as_str()))
+        .filter(|tool| {
+            tool.kind == ToolKind::Subagent
+                && matches!(tool.status, ToolStatus::Pending | ToolStatus::Running)
+        })
+        .map(|tool| tool.id.clone())
+        .next()
 }
 
 /// A session title that is not the server's dated placeholder.
@@ -2072,6 +2193,46 @@ mod tests {
         assert!(busy_status(&json!({ "type": "retry" })));
         assert!(!busy_status(&json!({ "type": "idle" })));
         assert!(!busy_status(&json!(null)));
+    }
+
+    /// A task tool plus the selection inputs around it.
+    fn spawn(call: &str, status: ToolStatus) -> (String, ToolUpdate) {
+        let mut tool = fresh_tool(call, "task");
+        tool.status = status;
+        (call.to_owned(), tool)
+    }
+
+    #[test]
+    fn select_spawn_prefers_the_oldest_running_unbound_spawn() {
+        let mut tools = HashMap::new();
+        let (a, tool_a) = spawn("call_a", ToolStatus::Running);
+        let (b, tool_b) = spawn("call_b", ToolStatus::Running);
+        tools.insert(a.clone(), tool_a);
+        tools.insert(b.clone(), tool_b);
+        let order = vec![a.clone(), b.clone()];
+        // Nothing bound: oldest wins.
+        assert_eq!(
+            select_spawn(&order, &tools, &HashMap::new()).as_ref(),
+            Some(&ToolId::new(a.clone()))
+        );
+        // First bound elsewhere: second wins.
+        let bound = HashMap::from([("ses_child".to_owned(), ToolId::new(a.clone()))]);
+        assert_eq!(
+            select_spawn(&order, &tools, &bound).as_ref(),
+            Some(&ToolId::new(b.clone()))
+        );
+    }
+
+    #[test]
+    fn select_spawn_skips_settled_and_non_task_tools() {
+        let mut tools = HashMap::new();
+        let (done, tool_done) = spawn("call_done", ToolStatus::Completed);
+        tools.insert(done, tool_done);
+        let mut read = fresh_tool("call_read", "read");
+        read.status = ToolStatus::Running;
+        tools.insert("call_read".into(), read);
+        let order = vec!["call_done".to_owned(), "call_read".to_owned()];
+        assert_eq!(select_spawn(&order, &tools, &HashMap::new()), None);
     }
 
     #[test]

@@ -241,6 +241,12 @@ fn option_args(options: &crate::agent::SessionOptions) -> Result<Vec<String>, Ag
                 args.push("--effort".into());
                 args.push(effort.clone());
             }
+            // Fast mode is a settings flag; passing it is also the SDK opt-in
+            // (without it the wire reports `sdk_opt_in_required`).
+            ("fastMode", ConfigValue::Bool(fast)) => {
+                args.push("--settings".into());
+                args.push(json!({ "fastMode": fast }).to_string());
+            }
             _ => {
                 return Err(AgentError::InvalidConfiguration(format!(
                     "`{id}` is not a creation-time option of this agent"
@@ -444,6 +450,24 @@ fn driver_info(init: &Value, version: Option<String>, request: &ConnectRequest) 
     // `/effort` command runs as its own synthetic turn (probed 2026-08-24).
     // A live change is a reopen with the resume token.
     let effort_option = effort_option(&init["models"], &model, creation_option(request, "effort"));
+    // Fast mode is creation-only too (a `--settings` flag, no live toggle on
+    // this wire). Offered when the catalog supports it; `fast_mode_state`
+    // reports the outcome — the account or org can still keep it off.
+    let fast_option = init["models"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|m| m["supportsFastMode"].as_bool() == Some(true))
+        .then(|| ConfigOption {
+            id: ConfigId::new("fastMode"),
+            name: "Fast mode".into(),
+            category: Some("service_tier".into()),
+            kind: ConfigKind::Boolean,
+            current: Some(ConfigValue::Bool(
+                init["fast_mode_state"].as_str() == Some("on"),
+            )),
+            live: false,
+        });
     let mut configuration = SessionConfiguration::default();
     configuration
         .options
@@ -455,6 +479,11 @@ fn driver_info(init: &Value, version: Option<String>, request: &ConnectRequest) 
         configuration
             .options
             .insert(ConfigId::new("effort"), current);
+    }
+    if let Some(current) = fast_option.as_ref().and_then(|o| o.current.clone()) {
+        configuration
+            .options
+            .insert(ConfigId::new("fastMode"), current);
     }
     DriverInfo {
         details: AgentDetails {
@@ -480,10 +509,15 @@ fn driver_info(init: &Value, version: Option<String>, request: &ConnectRequest) 
                     vec![McpTransport::Stdio, McpTransport::Http, McpTransport::Sse];
                 capabilities
             },
-            config_options: [Some(mode_option), Some(model_option), effort_option]
-                .into_iter()
-                .flatten()
-                .collect(),
+            config_options: [
+                Some(mode_option),
+                Some(model_option),
+                effort_option,
+                fast_option,
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
             commands,
         },
         configuration,

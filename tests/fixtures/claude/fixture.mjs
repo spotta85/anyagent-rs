@@ -56,10 +56,14 @@ function onControl(m) {
     case 'initialize': {
       // `--permission-mode` at launch decides the starting mode, like the CLI.
       const pm = process.argv.indexOf('--permission-mode');
+      // Fast mode turns on only via the `--settings` flag, like the real CLI.
+      const si = process.argv.indexOf('--settings');
+      const fast = si > -1 && JSON.parse(process.argv[si + 1]).fastMode === true;
       return reply({
+        fast_mode_state: fast ? 'on' : 'off',
         commands: [{ name: 'compact', description: 'Compact context', argumentHint: '' }],
         models: [
-          { value: 'default', displayName: 'Default (recommended)', description: 'Opus 5 with 1M context', supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'] },
+          { value: 'default', displayName: 'Default (recommended)', description: 'Opus 5 with 1M context', supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'], supportsFastMode: true },
           { value: 'sonnet', displayName: 'Sonnet', description: 'Fast for everyday tasks', supportedEffortLevels: ['low', 'high'] },
         ],
         // Logged out, the real CLI still sends an account object — it just

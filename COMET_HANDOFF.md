@@ -154,3 +154,114 @@ ANYAGENT_LIVE=opencode cargo test --test live -- --ignored --test-threads=1
 23 tests, free model (`opencode/big-pickle`), no API key needed. The
 question test can flake if the model skips its question tool — rerun it.
 Comet-side: bridge unit tests plus the seven manual runs above.
+
+---
+
+# Comet port: native codex adapter
+
+Handoff for switching Comet from its own codex driver
+(`crates/harness/src/codex/`) to anyagent's native adapter
+(`src/adapter/codex.rs`). The three port blockers plus one found in a
+method-by-method diff were probed live against codex 0.152.0 (2026-09-03)
+and fixed in anyagent. Routing is automatic, same as opencode:
+`AgentInstallation::at("codex", exe)` reaches the native adapter — picking
+up the anyagent commit is the port.
+
+```
+Comet ──> anyagent Session ──> codex adapter ──stdio JSONL──> codex app-server
+```
+
+## What changed in anyagent (all live-verified)
+
+- **Reasoning summaries stream.** Every `turn/start` now carries
+  `summary: "auto"`. Probed: without it codex emits ZERO reasoning events
+  (silent thinking, Comet's 45s staleness gate would flip Working off);
+  with it `item/reasoning/summaryTextDelta` flows and the adapter already
+  translates it to `ReasoningDelta`.
+- **Service tier is a config option.** `serviceTier`: a live select built
+  from `model/list`'s `serviceTiers` (deduped across models) plus a
+  "default" (Standard) choice. Rides every `turn/start`; "default" is
+  omitted from the wire. Settable at creation
+  (`SessionOptions::configure("serviceTier", ...)`) and switchable live.
+  **Careful: the live tier id is `"priority"` (label "Fast"), not the
+  `"fast"` in Comet's catalog snapshot** — and the wire silently accepts
+  any string, so the adapter's local validation is the only guard. Use the
+  ids the option advertises.
+- **Defensive turn ends.** 0.152.0 ends every turn with `turn/completed`
+  (status `completed`/`interrupted`/`failed` — probed, including a bogus
+  model). The adapter now also maps `turn/failed` → Failed and
+  `turn/aborted` → Cancelled, on parent and subagent-child paths, so a
+  wire that emits them can never hang a turn.
+
+## What needed no change (probed, not assumed)
+
+- **Per-turn policy is unnecessary.** Comet sends
+  `approvalPolicy`/`sandboxPolicy` on every turn; anyagent binds them at
+  `thread/start` only. Probed: a read-only thread blocks a write on a turn
+  with no turn-level policy (thread-level IS honored; turn-level merely
+  overrides it). Sending it once is enough.
+- **Approvals.** Comet's `approvalPolicy: "never"` maps to the existing
+  creation-time `mode` option: `configure("mode", "never")` at open.
+  Leave it unset for Ask-mode (approvals surface as permission requests
+  with command/path detail).
+- **Multi-agent v2.** Child app-server threads route onto the parent's
+  subagent tool; child turn ends settle that tool and can never settle the
+  parent turn. Same guarantees as Comet's `route_child_notification` table.
+- **The rest of Comet's driver features** — usage/rate limits, resume with
+  fresh-thread fallback, interrupt, steering (a real `turn/steer`, which
+  Comet's driver lacks), plans, questions — were already covered.
+
+## Fast mode (codex AND claude)
+
+Both harnesses now expose their speed knob as a config option under the
+`service_tier` category:
+
+- **codex**: the `serviceTier` select above — live, rides every turn.
+- **claude**: a `fastMode` Boolean, creation-only (it maps to the
+  `--settings '{"fastMode":true}'` launch flag, which is also the SDK
+  opt-in — without it the wire refuses with `sdk_opt_in_required`; there
+  is no live toggle on the stream-json wire, confirmed against the 2.1.259
+  binary: no `set_fast_mode` control request). Offered only when the
+  model catalog reports `supportsFastMode`; `current` reflects the wire's
+  `fast_mode_state`. The account/org can still keep it off — the flag is a
+  request, the state is the truth.
+
+Comet's per-model `fastMode` toggle maps to
+`configure("fastMode", true)` at open. Changing it mid-chat means reopen
+with the resume token (same rule as claude's `effort`).
+
+**Verified live (2026-09-03):** the flag clears the SDK gate — probed
+reasons walked `sdk_opt_in_required` → `extra_usage_disabled`, which is
+an account billing setting (fast mode draws on extra usage), not a wire
+issue. On an account with extra usage enabled the same flag yields
+`fast_mode_state: "on"`; the adapter reports whatever the wire says.
+
+## Porting checklist
+
+1. **Delete the codex driver, keep the bridge.** `crates/harness/src/codex/`
+   goes; the bridge maps Comet's request the same way it does for opencode:
+   `model` → `configure("model", ...)`, reasoning → `configure("effort", ...)`
+   using the advertised effort choices (they are the wire's own ids —
+   Comet's `to_effort` clamp table is no longer needed for advertised
+   values), `serviceTier` model option → `configure("serviceTier", ...)`
+   with the ids from the adapter's option (not the snapshot's "fast"),
+   sandbox → `configure("sandbox", ...)` (kebab-case ids), unattended runs →
+   `configure("mode", "never")`.
+2. **Resume**: pass the stored thread id as `SessionOptions::resume`; the
+   adapter calls `thread/resume`. Comet's fallback-to-fresh on a foreign
+   rollout stays a bridge concern (anyagent surfaces the resume failure
+   typed).
+3. **Turn end**: `deterministic_turn_end` is true — same watchdog treatment
+   as the opencode section above (narrow disarm, keep the stall bound).
+4. **Steering**: codex advertises `Capability::Steer`; Comet can move it
+   off `TurnBoundary` if it wants true mid-turn steering.
+
+## Verifying
+
+```bash
+cargo test --test codex                 # contract tests (fixture, free)
+ANYAGENT_LIVE=codex cargo test --test live -- --ignored --test-threads=1
+```
+
+Live matrix needs a logged-in `codex` CLI and burns real tokens.
+Handshake + turn re-verified green on codex 0.152.0 with these changes.

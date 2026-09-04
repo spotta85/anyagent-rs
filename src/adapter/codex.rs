@@ -250,6 +250,7 @@ fn parse_skill_commands(response: &Value) -> Vec<SlashCommand> {
 struct StartConfig {
     model: Option<String>,
     effort: Option<String>,
+    tier: Option<String>,
     mode: Option<String>,
     sandbox: Option<String>,
 }
@@ -265,6 +266,10 @@ fn start_config(request: &ConnectRequest, models: &Value) -> Result<StartConfig,
         let (slot, valid) = match id.as_str() {
             "model" => (&mut config.model, model_entry(models, text).is_some()),
             "effort" => (&mut config.effort, true), // checked against the model below
+            "serviceTier" => (
+                &mut config.tier,
+                tier_choices(models).iter().any(|c| &c.value == text),
+            ),
             "mode" => (&mut config.mode, MODES.contains(&text.as_str())),
             "sandbox" => (&mut config.sandbox, SANDBOXES.contains(&text.as_str())),
             _ => {
@@ -384,8 +389,9 @@ fn driver_info(
         .or_else(|| model.as_deref().and_then(|m| default_effort(models, m)));
     let mode = thread["approvalPolicy"].as_str().unwrap_or("on-request");
     let sandbox = sandbox_name(&thread["sandbox"]);
-    // model and effort are per-turn `turn/start` parameters, so both switch
-    // live with no wire call; mode and sandbox are thread-creation settings.
+    // model, effort and serviceTier are per-turn `turn/start` parameters, so
+    // they switch live with no wire call; mode and sandbox are thread-creation
+    // settings.
     let model_option = ConfigOption {
         id: ConfigId::new("model"),
         name: "Model".into(),
@@ -406,6 +412,18 @@ fn driver_info(
             current: effort.clone().map(ConfigValue::Text),
             live: true,
         })
+    });
+    let tier = config.tier.clone().unwrap_or_else(|| "default".into());
+    let tier_choices = tier_choices(models);
+    let tier_option = (tier_choices.len() > 1).then(|| ConfigOption {
+        id: ConfigId::new("serviceTier"),
+        name: "Service tier".into(),
+        category: Some("service_tier".into()),
+        kind: ConfigKind::Select {
+            choices: tier_choices,
+        },
+        current: Some(ConfigValue::Text(tier.clone())),
+        live: true,
     });
     let select = |values: &[&str], current: &str| ConfigKind::Select {
         choices: values
@@ -438,6 +456,7 @@ fn driver_info(
     for (id, value) in [
         ("model", model),
         ("effort", effort),
+        ("serviceTier", tier_option.is_some().then_some(tier)),
         ("mode", Some(mode.to_owned())),
         ("sandbox", Some(sandbox)),
     ] {
@@ -469,6 +488,7 @@ fn driver_info(
             config_options: [
                 Some(model_option),
                 effort_option,
+                tier_option,
                 Some(mode_option),
                 Some(sandbox_option),
             ]
@@ -583,15 +603,19 @@ impl Drive {
             DriverCommand::StartTurn { input } => {
                 self.emit(DriverEvent::TurnAck).await?;
                 let text = self.input_text(&input).await?;
-                // model and effort ride on every turn (per-turn parameters).
+                // model, effort and serviceTier ride on every turn (per-turn
+                // parameters). `summary` opts into reasoning summaries: without
+                // it no reasoning deltas stream at all (probed 2026-09-03).
                 let mut params = json!({
                     "threadId": self.thread_id,
                     "clientUserMessageId": self.mint(),
                     "input": [{ "type": "text", "text": text }],
+                    "summary": "auto",
                 });
-                for key in ["model", "effort"] {
+                for key in ["model", "effort", "serviceTier"] {
                     if let Some(ConfigValue::Text(value)) =
                         self.info.configuration.options.get(&ConfigId::new(key))
+                        && (key != "serviceTier" || value != "default")
                     {
                         params[key] = json!(value);
                     }
@@ -628,10 +652,10 @@ impl Drive {
                 }
             }
             DriverCommand::Configure(id, value) => {
-                // model and effort are per-turn parameters: apply locally,
-                // the next `turn/start` carries them. mode and sandbox are
-                // creation-only, so the engine never forwards them.
-                if matches!(id.as_str(), "model" | "effort")
+                // model, effort and serviceTier are per-turn parameters: apply
+                // locally, the next `turn/start` carries them. mode and sandbox
+                // are creation-only, so the engine never forwards them.
+                if matches!(id.as_str(), "model" | "effort" | "serviceTier")
                     && crate::adapter::apply_selection(&mut self.info, &id, &value)
                 {
                     if let ("model", ConfigValue::Text(model)) = (id.as_str(), &value) {
@@ -735,7 +759,9 @@ impl Drive {
         tool: ToolId,
     ) -> Result<(), Gone> {
         match method {
-            "turn/completed" => self.settle_subagent(tool, &params["turn"]).await,
+            "turn/completed" | "turn/failed" | "turn/aborted" => {
+                self.settle_subagent(tool, &params["turn"]).await
+            }
             // Consumed: the child's plan is a whole-list replacement and its
             // usage is its own context window, so neither may reach the
             // parent's, and its turn frames must not move the parent's turn.
@@ -782,7 +808,12 @@ impl Drive {
                 }
                 Ok(())
             }
-            "turn/completed" => self.on_turn_completed(params).await,
+            // 0.152.0 ends every turn with `turn/completed` (status carries
+            // the outcome — probed 2026-09-03); failed/aborted are defensive
+            // so a wire that emits them can never hang the turn.
+            "turn/completed" | "turn/failed" | "turn/aborted" => {
+                self.on_turn_completed(params).await
+            }
             "item/started" | "item/updated" => self.on_item(params, false).await,
             "item/completed" => self.on_item(params, true).await,
             "item/agentMessage/delta" => {
@@ -981,7 +1012,7 @@ impl Drive {
             "completed" => StopReason::Completed {
                 source: CompletionSource::Protocol,
             },
-            "interrupted" => StopReason::Cancelled,
+            "interrupted" | "aborted" => StopReason::Cancelled,
             _ => StopReason::Failed {
                 message: turn["error"]["message"]
                     .as_str()
@@ -1502,6 +1533,36 @@ fn effort_choices(models: &Value, model: &str) -> Vec<ConfigChoice> {
             })
         })
         .collect()
+}
+
+/// "Standard" plus every service tier any model reports (`serviceTiers` in
+/// `model/list`); "default" is never sent on the wire. Tiers are identical
+/// across the models that have them, so one static option serves all.
+fn tier_choices(models: &Value) -> Vec<ConfigChoice> {
+    let mut choices = vec![ConfigChoice {
+        value: "default".into(),
+        label: "Standard".into(),
+        description: None,
+    }];
+    for tier in models
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m["serviceTiers"].as_array())
+        .flatten()
+    {
+        let Some(id) = tier["id"].as_str() else {
+            continue;
+        };
+        if choices.iter().all(|c| c.value != id) {
+            choices.push(ConfigChoice {
+                value: id.to_owned(),
+                label: tier["name"].as_str().unwrap_or(id).to_owned(),
+                description: tier["description"].as_str().map(str::to_owned),
+            });
+        }
+    }
+    choices
 }
 
 /// Effort choices follow the selected model; a current level the new model

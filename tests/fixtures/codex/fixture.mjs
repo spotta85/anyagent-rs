@@ -6,7 +6,8 @@
 // "write-file" (a fileChange escalates past the sandbox -> approval),
 // "sleep" (a command that only an interrupt ends), "die" (exit mid-turn),
 // "subagent" (a child thread runs a whole turn before the parent's ends,
-// "subagent-fails" for a child turn that fails).
+// "subagent-fails" for a child turn that fails), "end-failed"/"end-aborted"
+// (the turn ends via turn/failed / turn/aborted instead of turn/completed).
 import { createInterface } from 'node:readline';
 
 const flag = (name) => process.argv.includes(name);
@@ -20,7 +21,7 @@ let turn = null; // { id, started, interrupted, steered: [] }
 const waiters = {}; // server request id -> resolver
 
 const MODELS = [
-  { id: 'gpt-6', model: 'gpt-6', displayName: 'GPT-6', description: 'Frontier model.', hidden: false, isDefault: true, defaultReasoningEffort: 'medium', supportedReasoningEfforts: [{ reasoningEffort: 'low', description: 'Fast' }, { reasoningEffort: 'medium', description: 'Balanced' }, { reasoningEffort: 'high', description: 'Deep' }] },
+  { id: 'gpt-6', model: 'gpt-6', displayName: 'GPT-6', description: 'Frontier model.', hidden: false, isDefault: true, defaultReasoningEffort: 'medium', supportedReasoningEfforts: [{ reasoningEffort: 'low', description: 'Fast' }, { reasoningEffort: 'medium', description: 'Balanced' }, { reasoningEffort: 'high', description: 'Deep' }], serviceTiers: [{ id: 'priority', name: 'Fast', description: '1.5x speed' }], defaultServiceTier: 'priority' },
   { id: 'gpt-6-mini', model: 'gpt-6-mini', displayName: 'GPT-6 Mini', description: 'Small model.', hidden: false, isDefault: false, defaultReasoningEffort: 'low', supportedReasoningEfforts: [{ reasoningEffort: 'low', description: 'Fast' }, { reasoningEffort: 'medium', description: 'Balanced' }] },
   { id: 'gpt-secret', model: 'gpt-secret', displayName: 'Secret', description: null, hidden: true, isDefault: false, defaultReasoningEffort: 'low', supportedReasoningEfforts: [] },
 ];
@@ -148,6 +149,9 @@ async function runTurn(params) {
     return endTurn('failed', { message: 'unexpected status 401 Unauthorized' });
   }
   if (prompt.includes('die')) { process.stderr.write('boom: fixture died\n'); process.exit(3); }
+  // Some wires end a turn with these instead of turn/completed.
+  if (prompt.includes('end-failed')) return endTurn('failed', { message: 'wire failed' }, 'turn/failed');
+  if (prompt.includes('end-aborted')) return endTurn('aborted', null, 'turn/aborted');
 
   if (prompt.includes('sleep')) {
     const exec = item({ type: 'commandExecution', command: '/bin/zsh -lc "sleep 45"', cwd: process.cwd(), status: 'inProgress', aggregatedOutput: null, exitCode: null });
@@ -164,7 +168,7 @@ async function runTurn(params) {
   const msg = item({ type: 'agentMessage', text: '', phase: 'final_answer' });
   itemStarted(msg);
   delta(msg.id, 'Hello ');
-  delta(msg.id, `model=${params.model ?? 'unset'} effort=${params.effort ?? 'unset'} `);
+  delta(msg.id, `model=${params.model ?? 'unset'} effort=${params.effort ?? 'unset'} tier=${params.serviceTier ?? 'unset'} summary=${params.summary ?? 'unset'} `);
   if (flag('--echo-config-home')) delta(msg.id, `cfg=${process.env.CODEX_HOME ?? 'unset'} `);
   if (THREAD.forkPoint !== undefined) delta(msg.id, `fork=${THREAD.forkPoint} `);
   if (prompt.includes('Attached files:')) delta(msg.id, 'ref=1 ');
@@ -205,8 +209,8 @@ async function runTurn(params) {
   endTurn('completed');
 }
 
-function endTurn(status, error = null) {
-  notify('turn/completed', { threadId: THREAD.id, turn: { id: turn.id, status, error, items: [] } });
+function endTurn(status, error = null, method = 'turn/completed') {
+  notify(method, { threadId: THREAD.id, turn: { id: turn.id, status, error, items: [] } });
   turn = null;
 }
 

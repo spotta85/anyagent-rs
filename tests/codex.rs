@@ -372,6 +372,73 @@ async fn model_and_effort_ride_every_turn_and_switch_live() {
 }
 
 #[tokio::test]
+async fn service_tier_rides_turns_and_default_is_omitted() {
+    // Configured at creation like Comet does; every turn also opts into
+    // reasoning summaries (`summary: "auto"`).
+    let (session, mut events) = open_with(
+        "tier",
+        "",
+        SessionOptions::in_dir(std::env::temp_dir()).configure("serviceTier", "priority"),
+    )
+    .await
+    .unwrap();
+    let info = session.info();
+    let tier = info
+        .details
+        .config_options
+        .iter()
+        .find(|o| o.id.as_str() == "serviceTier")
+        .unwrap();
+    assert!(tier.live);
+    let ConfigKind::Select { choices } = &tier.kind else {
+        panic!("serviceTier is a select");
+    };
+    assert_eq!(
+        choices.iter().map(|c| c.value.as_str()).collect::<Vec<_>>(),
+        vec!["default", "priority"]
+    );
+    session.prompt("hi").await.unwrap();
+    let text = complete_turn(&session, &mut events, PermissionChoice::AllowOnce).await;
+    assert!(text.contains("tier=priority summary=auto"), "{text}");
+
+    // Back to Standard: "default" never reaches the wire.
+    session.configure("serviceTier", "default").await.unwrap();
+    loop {
+        if let EventKind::SessionUpdated(info) = next(&mut events).await.kind {
+            assert_eq!(text_option(&info, "serviceTier").as_deref(), Some("default"));
+            break;
+        }
+    }
+    session.prompt("again").await.unwrap();
+    let text = complete_turn(&session, &mut events, PermissionChoice::AllowOnce).await;
+    assert!(text.contains("tier=unset"), "{text}");
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_and_aborted_turn_notifications_still_end_the_turn() {
+    let (session, mut events) = open("turn-ends", "").await;
+    for (prompt, expected) in [
+        (
+            "end-failed",
+            StopReason::Failed {
+                message: "wire failed".into(),
+            },
+        ),
+        ("end-aborted", StopReason::Cancelled),
+    ] {
+        session.prompt(prompt).await.unwrap();
+        loop {
+            if let EventKind::TurnEnded { stop, .. } = next(&mut events).await.kind {
+                assert_eq!(stop, expected);
+                break;
+            }
+        }
+    }
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn effort_falls_back_when_the_new_model_lacks_it() {
     let (session, mut events) = open_with(
         "effort-fallback",
