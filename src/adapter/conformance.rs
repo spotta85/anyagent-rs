@@ -371,6 +371,20 @@ async fn status_flips_working_needs_input_and_back_and_never_flashes_idle() {
 }
 
 #[tokio::test]
+async fn a_close_with_a_queued_prompt_reads_idle_not_working() {
+    use crate::SessionStatus;
+
+    // Close mid-turn with a prompt still queued: the queue can never promote
+    // past Closing, so the final snapshot must not stay Working.
+    let script = Script::default().turn(vec![Step::Emit(text("m1", "one"))]); // never ends
+    let (session, _events) = open(MockAdapter::new(script), None).await;
+    session.prompt("first").await.unwrap();
+    session.prompt("queued").await.unwrap();
+    session.close().await.unwrap();
+    assert_eq!(session.status(), SessionStatus::Idle);
+}
+
+#[tokio::test]
 async fn trailing_events_do_not_flash_idle_past_a_queued_prompt() {
     use crate::SessionStatus;
 

@@ -456,6 +456,9 @@ impl Engine {
                 SessionStatus::NeedsInput
             }
             TurnState::Running { .. } => SessionStatus::Working,
+            // Queued prompts never promote past a close; they must not keep
+            // the final snapshot on Working.
+            TurnState::Closing => SessionStatus::Idle,
             // A queued prompt promotes on the next pass (trailing driver
             // events can defer it); the gap must not flash Idle.
             _ if !self.queue.is_empty() => SessionStatus::Working,
