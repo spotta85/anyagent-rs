@@ -35,41 +35,63 @@ Comet ──> anyagent Session ──> codex adapter ──stdio JSONL──> co
 - **`turn/failed` / `turn/aborted` can't hang a turn.** 0.152.0 only
   ever emits `turn/completed` (probed, including a forced failure), but
   both are mapped defensively on parent and subagent paths.
-- **Everything else the old driver did** — multi-agent v2 child threads,
+- **Everything else the old driver did** — multi-agent v2 child threads
+  (one narrower registration path: children register from parent-thread
+  `subAgentActivity` only, not also child `thread/started` + spawn-source),
   usage/rate limits, resume, interrupt, plans, questions — was already
-  covered, plus a real `turn/steer` the old driver never had.
+  covered. Steering is at parity with the old driver's `StepBoundary`
+  steering (mid-turn `turn/steer` in both); the win is deleting the
+  driver's steering mailbox and queued-steers fallback, since the engine
+  owns the queue.
 
 ### Bridge checklist (all in `crates/harness/src/bridge.rs`)
 
-1. **Delete `crates/harness/src/codex/`** and route `HarnessId::Codex`
-   through the bridge. `installation()`'s catch-all
-   (`id => AgentInstallation::at(id, exe)`) already picks the native
-   adapter once codex resolves an executable. Do NOT pass `acp(...)`.
-2. **`options()`**: add a codex branch next to the claude one —
-   - `model` → `configure("model", ...)` (ids from the adapter's model
-     option, sourced live from `model/list`).
-   - reasoning → `configure("effort", ...)`. The advertised effort
-     choices are the wire's own ids, so the old `to_effort` clamp table
-     is only needed for levels codex doesn't list.
+1. **Route `HarnessId::Codex` through the bridge** — `AnyagentHarness::codex()`
+   in the registry slot (descriptor unchanged: "Codex", StepBoundary, full
+   ladder — the stability test passes unmodified). `installation()` resolves
+   the `codex` CLI via `CODEX_EXECUTABLE` + `codex_paths()` (the same
+   locations the old driver searched). Do NOT pass `acp(...)`. Old driver
+   (`crates/harness/src/codex/`, the now-unused `jsonrpc.rs`, its
+   integration tests + fixtures) deleted.
+2. **`options()`**: a codex branch next to the claude one — creation-only
+   `mode`/`sandbox` here, live `model`/`effort`/tier post-open:
    - unattended runs → `configure("mode", "never")` (the old driver's
      pinned `approvalPolicy: "never"`). Leave unset for Ask-mode:
      approvals then surface as permission requests with command/path
-     detail.
+     detail — and leave `permission_mode` at its `Ask` default in that
+     case (every other harness stays `AutoApprove`).
    - sandbox → `configure("sandbox", ...)` (kebab-case:
-     `read-only` / `workspace-write` / `danger-full-access`).
-   - service tier → see Part 2.
-3. **`models()`**: replace `catalog.rs`'s snapshot with
-   `probe_models()` (the opencode pattern) — the adapter advertises the
-   live catalog, effort ladders included.
-4. **Resume**: pass the stored thread id as `SessionOptions::resume`.
-   Keep Comet's fallback-to-fresh on a foreign rollout in the bridge
-   (anyagent surfaces the resume failure typed).
-5. **Turn end / watchdog**: `deterministic_turn_end` is true — same
-   treatment as the opencode checklist (narrow disarm, keep the stall
-   bound).
-6. **Steering (optional)**: codex advertises `Capability::Steer`, so
-   `steering_mode()` can move off `TurnBoundary` for codex if Comet
-   wants true mid-turn steering.
+     `read-only` / `workspace-write` / `danger-full-access`), always.
+   - `model`, reasoning → `effort`, and service tier → post-open in
+     `apply_agent_config` (renamed from `apply_acp_config`), each applied
+     only when the session advertises the id — unadvertised ids skip and
+     the agent default wins. That skip IS the effort fallback (no
+     `to_effort` clamp table to maintain) and the stale-tier guard (a
+     `"fast"` pick from an old snapshot skips to Standard instead of
+     riding the wire). Re-read `session.info()` after the model
+     configure: codex effort ladders are per-model.
+   - service tier value rides the wire verbatim — see Part 2.
+3. **`models()`**: codex joins the `probe_models()` routing (the opencode
+   pattern) — live model ids from the `model` option, plus the
+   `service_tier` option attached to each model as the tier picker. No
+   per-model reasoning ladders (same as opencode/kiro: the descriptor
+   ladder drives the picker, above-ladder picks skip to the agent
+   default in `apply_agent_config`).
+4. **Resume**: the stored thread id already rides `SessionOptions::resume`
+   via the shared path; `run()` matches `anyagent::AgentError::ResumeFailed`
+   (codex-scoped) and retries without it — the old driver's
+   fallback-to-fresh, kept in the bridge.
+5. **Turn end / watchdog**: `deterministic_turn_end` was already true for
+   all bridge harnesses (no change). codex gets its own 60s silence bound
+   (`CODEX_STALL`): codex fails turns loudly, so total silence means a
+   wedged process or hung handshake — the disarm set is the shared
+   turn-content one.
+6. **Steering**: codex advertises `Capability::Steer`, at parity with the
+   old driver's `StepBoundary` steering — `steering_mode()` gains a codex
+   arm returning `StepBoundary` (keeps the registry descriptor stable).
+   The deleted part is the driver's steering mailbox and queued-steers
+   fallback: the engine re-queues a refused steer at the head of its own
+   queue, and the bridge mailbox only tracks steers for `Steered` events.
 
 ## Part 2: the speed options
 
