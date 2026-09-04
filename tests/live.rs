@@ -8,7 +8,7 @@
 //! ```
 //!
 //! Rules the suite enforces itself: the ANTHROPIC_* env hijack is stripped
-//! in-process, opencode auto-skips without OPENROUTER_API_KEY, capability
+//! in-process, pi auto-skips without OPENROUTER_API_KEY, capability
 //! gates print SKIP (which is a pass), and every event wait names the step
 //! it hung at. Model-output flakes (wrong word from a weak model) are the
 //! operator's judgment call; structural failures fail hard.
@@ -439,13 +439,13 @@ async fn a_question_round_trips() {
         // codex runs as a probe: `item/tool/requestUserInput` is
         // schema-confirmed but has never fired live (ticket 10) — the
         // translation is exercised if it ever does, without failing the run.
-        if h != "claude" && h != "codex" {
-            println!("SKIP {h}: questions (claude only)");
+        if h != "claude" && h != "codex" && h != "opencode" {
+            println!("SKIP {h}: questions (claude, codex, opencode)");
             continue;
         }
         let (session, mut events, _dir) = open(h).await;
         session
-            .prompt("Ask me whether I prefer red or blue using your question tool (claude: AskUserQuestion; codex: request_user_input), then answer with just my choice.")
+            .prompt("Ask me whether I prefer red or blue using your question tool (claude: AskUserQuestion; codex: request_user_input; opencode: question), then answer with just my choice.")
             .await
             .unwrap();
         let mut text = String::new();

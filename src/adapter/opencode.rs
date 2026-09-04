@@ -12,7 +12,7 @@
 //! too; the engine queues prompts instead. All routes and event names live in
 //! this file so a future v2 swap is contained.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -41,6 +41,8 @@ use crate::event::{
 use crate::process::{self, Spawn};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a taken prompt may sit without the server going busy.
+const ADMIT_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOSE_GRACE: Duration = Duration::from_secs(2);
 const HEALTH_POLL: Duration = Duration::from_millis(100);
 const FRAME_BUFFER: usize = 64;
@@ -76,11 +78,13 @@ impl Adapter for OpencodeAdapter {
                 windows: launched.windows,
                 login: login_methods(&request.installation),
                 messages: HashMap::new(),
+                ended: HashSet::new(),
                 parts: HashMap::new(),
                 tools: HashMap::new(),
                 requests: HashMap::new(),
                 cost: 0.0,
                 turn: Turn::Idle,
+                admit_deadline: None,
                 aborting: false,
                 turn_error: None,
                 next_message: 0,
@@ -260,7 +264,10 @@ async fn bind_session(http: &Http, request: &ConnectRequest) -> Result<Value, Ag
     match &request.options.start {
         SessionStart::New => http.post("/session", json!({})).await,
         // Re-adopting the id IS the resume: opencode scopes history by it.
-        SessionStart::Resume(token) => http.get(&format!("/session/{}", token.as_str())).await,
+        SessionStart::Resume(token) => http
+            .get(&format!("/session/{}", token.as_str()))
+            .await
+            .map_err(|e| AgentError::ResumeFailed(e.to_string())),
         SessionStart::Fork { from, at } => {
             let body = match at {
                 None => json!({}),
@@ -369,7 +376,8 @@ fn driver_info(
         },
         configuration,
         resume_token: None,
-        title: session["title"].as_str().map(str::to_owned),
+        // A fresh session's title is a dated placeholder, not a title.
+        title: real_title(&session["title"]),
         // `session.idle` ends every prompted turn.
         deterministic_turn_end: true,
         // No agent-originated turns on opencode; the same signal covers it.
@@ -514,6 +522,9 @@ struct Drive {
     /// messages are minted, so membership gates what streams (the user
     /// message carries a replay of our own prompt).
     messages: HashMap<String, MessageId>,
+    /// Messages already closed by a completed `message.updated` (the
+    /// completed snapshot republishes, so each closes once).
+    ended: HashSet<String>,
     /// `prt_…` id → (kind, bytes already emitted), for delta/snapshot dedup.
     parts: HashMap<String, PartState>,
     /// Tool snapshots by `callID`, for the permission that references one.
@@ -522,6 +533,9 @@ struct Drive {
     /// Session cost so far, summed over step-finishes.
     cost: f64,
     turn: Turn,
+    /// When a taken prompt must have gone busy by; a dropped one fails
+    /// loudly instead of hanging the deterministic turn forever.
+    admit_deadline: Option<tokio::time::Instant>,
     /// A cancel is in flight, so the next idle is a cancellation.
     aborting: bool,
     /// The running turn's failure, from an assistant message error.
@@ -575,6 +589,11 @@ impl Drive {
                         break;
                     }
                 },
+                _ = admission(self.admit_deadline), if self.turn == Turn::Sent => {
+                    if self.check_admission().await.is_err() {
+                        break;
+                    }
+                }
             }
         }
         self.server.shutdown(CLOSE_GRACE).await;
@@ -613,38 +632,40 @@ impl Drive {
         Ok(())
     }
 
-    /// Sends the prompt, or routes a `/command` to its own endpoint. A wire
-    /// rejection fails the turn the engine already started.
+    /// Sends the prompt, or routes an advertised `/command` to its own
+    /// endpoint; other `/…` text is plain text. A wire rejection fails the
+    /// turn the engine already started.
     async fn start_turn(&mut self, input: &Input) -> Result<(), Gone> {
         let loaded = attach::load(&input.attachments).await;
         for problem in loaded.iter().filter_map(|l| l.problem.clone()) {
             self.diagnostic(DiagnosticLevel::Warning, problem).await?;
         }
         let text = attach::with_refs(input.as_text(), &loaded);
-        let (path, body) = match slash_command(&text) {
-            Some((command, arguments)) => (
-                format!("/session/{}/command", self.session_id),
-                json!({ "command": command, "arguments": arguments }),
-            ),
-            None => {
-                let mut parts = vec![json!({ "type": "text", "text": text })];
-                for image in loaded.iter().filter_map(|l| l.image.as_ref()) {
-                    parts.push(json!({
-                        "type": "file",
-                        "mime": image.mime,
-                        "url": format!("data:{};base64,{}", image.mime, image.base64),
-                    }));
-                }
-                let mut body = json!({ "parts": parts });
-                if let Some(model) = self.model_body() {
-                    body["model"] = model;
-                }
-                (format!("/session/{}/prompt_async", self.session_id), body)
-            }
-        };
+        if let Some((command, arguments)) =
+            slash_command(&text).filter(|(name, _)| self.has_command(name))
+        {
+            return self.start_command(command, arguments);
+        }
+        let mut parts = vec![json!({ "type": "text", "text": text })];
+        for image in loaded.iter().filter_map(|l| l.image.as_ref()) {
+            parts.push(json!({
+                "type": "file",
+                "mime": image.mime,
+                "url": format!("data:{};base64,{}", image.mime, image.base64),
+            }));
+        }
+        let mut body = json!({ "parts": parts });
+        if let Some(model) = self.model_body() {
+            body["model"] = model;
+        }
+        let path = format!("/session/{}/prompt_async", self.session_id);
         match self.http.post(&path, body).await {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                self.admit_deadline = Some(tokio::time::Instant::now() + ADMIT_TIMEOUT);
+                Ok(())
+            }
             Err(e) => {
+                self.turn = Turn::Idle;
                 self.emit(DriverEvent::TurnEnded(StopReason::Failed {
                     message: e.to_string(),
                 }))
@@ -653,8 +674,45 @@ impl Drive {
         }
     }
 
+    /// Runs a `/command` turn. The endpoint is synchronous (it answers with
+    /// the finished message), so the POST runs off the loop with its body
+    /// dropped: the bus streams the same turn and its idle ends it, while a
+    /// rejection surfaces as a diagnostic and the admission check fails the
+    /// turn.
+    fn start_command(&mut self, command: String, arguments: String) -> Result<(), Gone> {
+        let mut body = json!({ "command": command, "arguments": arguments });
+        if let Some(model) = current_model(&self.info) {
+            body["model"] = Value::from(model);
+        }
+        let http = self.http.clone();
+        let path = format!("/session/{}/command", self.session_id);
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            if let Err(e) = http.post(&path, body).await {
+                let kind = EventKind::Diagnostic(Diagnostic {
+                    level: DiagnosticLevel::Warning,
+                    message: format!("command rejected: {e}"),
+                });
+                events.send(DriverEvent::event(kind)).await.ok();
+            }
+        });
+        self.admit_deadline = Some(tokio::time::Instant::now() + ADMIT_TIMEOUT);
+        Ok(())
+    }
+
+    /// Whether `/name` is one of the server's advertised commands.
+    fn has_command(&self, name: &str) -> bool {
+        self.info.details.commands.iter().any(|c| c.name == name)
+    }
+
     /// Routes one SSE frame by type, ignoring frames for other sessions.
     async fn handle_frame(&mut self, frame: &Value) -> Result<(), Gone> {
+        // Insurance against the envelope drift that broke T3 (#2691): a
+        // future server may wrap events as `{payload: {type, properties}}`.
+        let frame = frame
+            .get("payload")
+            .filter(|p| p.is_object())
+            .unwrap_or(frame);
         let props = &frame["properties"];
         let kind = frame["type"].as_str().unwrap_or_default();
         // Global frames (`server.connected`, installation notices) have no
@@ -664,14 +722,19 @@ impl Drive {
         {
             return Ok(());
         }
-        // Bookkeeping trails every idle (title, diff, re-published messages)
-        // and an abort emits a second idle, so only a prompted turn's frames
-        // are decoded, and only a busy turn's idle ends it.
+        // The generated title lands as post-idle bookkeeping, so it is read
+        // before the turn gate.
+        if kind == "session.updated" {
+            return self.on_session_updated(&props["info"]).await;
+        }
+        // Bookkeeping trails every idle (diff, re-published messages) and an
+        // abort emits a second idle, so only a prompted turn's frames are
+        // decoded, and only a busy turn's idle ends it.
         if self.turn == Turn::Idle && kind != "session.error" {
             return Ok(());
         }
         match kind {
-            "session.status" if props["status"]["type"].as_str() == Some("busy") => {
+            "session.status" if busy_status(&props["status"]) => {
                 if self.turn == Turn::Sent {
                     self.turn = Turn::Busy;
                 }
@@ -698,8 +761,9 @@ impl Drive {
         }
     }
 
-    /// An assistant message: mint its streaming id and record any error. The
-    /// user-role echo of our own prompt is dropped.
+    /// An assistant message: mint its streaming id, record any error, and
+    /// close it once the server marks it completed (a turn can hold several
+    /// assistant messages). The user-role echo of our own prompt is dropped.
     async fn on_message(&mut self, props: &Value) -> Result<(), Gone> {
         let info = &props["info"];
         if info["role"].as_str() != Some("assistant") {
@@ -708,11 +772,43 @@ impl Drive {
         let Some(oc_id) = info["id"].as_str() else {
             return Ok(());
         };
-        self.message_id(oc_id);
+        let message_id = self.message_id(oc_id);
         if let Some(error) = info.get("error").filter(|e| !e.is_null()) {
             self.turn_error = Some(message_error(error));
         }
-        Ok(())
+        if info["time"]["completed"].is_null() || !self.ended.insert(oc_id.to_owned()) {
+            return Ok(());
+        }
+        self.end_message(oc_id.to_owned(), message_id).await
+    }
+
+    /// `MessageEnded`, carrying the message's own id as the fork anchor:
+    /// opencode can fork at any message boundary, and ids sort by time.
+    async fn end_message(&mut self, oc_id: String, message_id: MessageId) -> Result<(), Gone> {
+        let mut extensions = Extensions::new();
+        extensions.insert("opencode/fork_point".into(), Value::from(oc_id));
+        self.emit(DriverEvent::Event {
+            kind: EventKind::MessageEnded { message_id },
+            parent_tool_id: None,
+            extensions,
+        })
+        .await
+    }
+
+    /// Post-turn bookkeeping renames the session; a real (non-placeholder)
+    /// title is advertised.
+    async fn on_session_updated(&mut self, info: &Value) -> Result<(), Gone> {
+        if info["id"].as_str() != Some(self.session_id.as_str()) {
+            return Ok(());
+        }
+        let Some(title) = real_title(&info["title"]) else {
+            return Ok(());
+        };
+        if self.info.title.as_ref() == Some(&title) {
+            return Ok(());
+        }
+        self.info.title = Some(title);
+        self.emit(DriverEvent::InfoChanged(self.info.clone())).await
     }
 
     /// One part snapshot: stream text and reasoning, track tools. Parts of the
@@ -729,6 +825,8 @@ impl Drive {
                     .await
             }
             "tool" if part["tool"].as_str() == Some("todowrite") => self.on_plan(part).await,
+            // Questions surface as requests (`question.asked`), not tools.
+            "tool" if part["tool"].as_str() == Some("question") => Ok(()),
             "tool" => self.on_tool(part).await,
             "step-finish" => self.on_step_finish(part).await,
             _ => Ok(()),
@@ -858,7 +956,7 @@ impl Drive {
                     PermissionChoice::AllowAlways,
                     PermissionChoice::DenyOnce,
                 ],
-                detail: props["metadata"]["filepath"].as_str().map(str::to_owned),
+                detail: permission_detail(props),
             },
         )))
         .await
@@ -939,23 +1037,25 @@ impl Drive {
                 source: CompletionSource::Protocol,
             })
         };
-        // The turn's last assistant message anchors `fork_from(_, at)`;
-        // opencode ids sort by time. Its `MessageEnded` carries the anchor.
-        let last = self.messages.iter().max_by(|a, b| a.0.cmp(b.0));
-        if let Some((oc_id, message_id)) = last.map(|(o, m)| (o.clone(), m.clone())) {
-            let mut extensions = Extensions::new();
-            extensions.insert("opencode/fork_point".into(), Value::from(oc_id));
-            self.emit(DriverEvent::Event {
-                kind: EventKind::MessageEnded { message_id },
-                parent_tool_id: None,
-                extensions,
-            })
-            .await?;
+        // An aborted message never completes; close whatever is still open,
+        // in time order.
+        let mut open: Vec<_> = self
+            .messages
+            .iter()
+            .filter(|(oc_id, _)| !self.ended.contains(*oc_id))
+            .map(|(o, m)| (o.clone(), m.clone()))
+            .collect();
+        open.sort();
+        for (oc_id, message_id) in open {
+            self.end_message(oc_id, message_id).await?;
         }
-        // A settled turn leaves nothing more for its parts or tools.
+        // A settled turn leaves nothing more for its parts, tools, or an
+        // unanswered dialog (the engine already closed the request).
         self.parts.clear();
         self.tools.clear();
         self.messages.clear();
+        self.ended.clear();
+        self.requests.clear();
         self.emit(DriverEvent::TurnEnded(stop)).await
     }
 
@@ -974,15 +1074,21 @@ impl Drive {
             Some("MessageAbortedError") => Ok(()),
             _ if self.turn == Turn::Idle => Ok(()),
             _ => {
+                // The turn is failing; the idle that follows reports it.
                 let message = error["data"]["message"]
                     .as_str()
                     .unwrap_or("the agent reported an error");
-                self.diagnostic(DiagnosticLevel::Error, message).await
+                self.turn_error = Some(StopReason::Failed {
+                    message: message.to_owned(),
+                });
+                Ok(())
             }
         }
     }
 
     /// Drops the rolled-back turns; opencode restores conversation, not files.
+    /// Note `GET /message` still lists reverted messages afterward: the revert
+    /// trims the model's context, not the listing.
     async fn rollback(&mut self, turns: u32) -> Result<(), Gone> {
         let messages = self
             .http
@@ -1046,9 +1152,23 @@ impl Drive {
     /// server counts as idle: it is dying, and the bus closing follows.
     async fn server_busy(&self) -> bool {
         match self.http.get("/session/status").await {
-            Ok(status) => status[&self.session_id]["type"].as_str() == Some("busy"),
+            Ok(status) => busy_status(&status[&self.session_id]),
             Err(_) => false,
         }
+    }
+
+    /// The admission deadline passed without the server going busy: adopt a
+    /// busy whose frame was missed, or fail the turn rather than hang.
+    async fn check_admission(&mut self) -> Result<(), Gone> {
+        if self.server_busy().await {
+            self.turn = Turn::Busy;
+            return Ok(());
+        }
+        self.turn = Turn::Idle;
+        let stop = self.turn_error.take().unwrap_or(StopReason::Failed {
+            message: "opencode took the prompt but never started on it".into(),
+        });
+        self.emit(DriverEvent::TurnEnded(stop)).await
     }
 
     /// Mints the next request id.
@@ -1098,6 +1218,27 @@ impl Drive {
 /// The engine or the server is gone; the drive task unwinds.
 struct Gone;
 
+/// Sleeps until the admission deadline; pends forever without one.
+async fn admission(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Busy or retrying (a provider hiccup being retried) both mean running;
+/// opencode's own client reconciles the same way.
+fn busy_status(status: &Value) -> bool {
+    matches!(status["type"].as_str(), Some("busy") | Some("retry"))
+}
+
+/// A session title that is not the server's dated placeholder.
+fn real_title(title: &Value) -> Option<String> {
+    let title = title.as_str().filter(|t| !t.is_empty())?;
+    let placeholder = title.starts_with("New session - ") || title.starts_with("Child session - ");
+    (!placeholder).then(|| title.to_owned())
+}
+
 // ---------------------------------------------------------------------------
 // Frame decoding
 // ---------------------------------------------------------------------------
@@ -1136,6 +1277,7 @@ fn tool_kind(name: &str) -> ToolKind {
         "edit" | "write" | "patch" => ToolKind::Edit,
         "grep" | "glob" => ToolKind::Search,
         "webfetch" => ToolKind::Fetch,
+        "task" => ToolKind::Subagent,
         _ => ToolKind::Other,
     }
 }
@@ -1209,14 +1351,34 @@ fn tool_title(name: &str, input: &ToolInput) -> String {
     }
 }
 
-/// A stub tool for a permission that names no tracked call.
+/// A stub tool for a permission that names no tracked call, so the approval
+/// card still shows what it approves.
 fn permission_tool(props: &Value) -> ToolUpdate {
     let name = props["permission"].as_str().unwrap_or("tool");
     let mut tool = fresh_tool(props["tool"]["callID"].as_str().unwrap_or_default(), name);
-    if let Some(path) = props["metadata"]["filepath"].as_str() {
+    if let Some(command) = props["metadata"]["command"].as_str() {
+        set_input(
+            &mut tool,
+            name,
+            ToolInput::Command {
+                command: command.to_owned(),
+                cwd: None,
+            },
+        );
+    } else if let Some(path) = props["metadata"]["filepath"].as_str() {
         set_input(&mut tool, name, ToolInput::Path(path.into()));
     }
     tool
+}
+
+/// The most telling detail of a permission: the command or file it covers,
+/// else its first pattern.
+fn permission_detail(props: &Value) -> Option<String> {
+    props["metadata"]["command"]
+        .as_str()
+        .or_else(|| props["metadata"]["filepath"].as_str())
+        .or_else(|| props["patterns"][0].as_str())
+        .map(str::to_owned)
 }
 
 /// One assistant-message error as a stop reason.
@@ -1520,11 +1682,13 @@ impl SseDecoder {
         let mut frames = Vec::new();
         while let Some(end) = self.body.windows(2).position(|w| w == b"\n\n") {
             let frame: Vec<u8> = self.body.drain(..end + 2).collect();
-            let data: String = String::from_utf8_lossy(&frame)
+            // Multiple `data:` lines are one payload joined by `\n` (SSE spec).
+            let data = String::from_utf8_lossy(&frame)
                 .lines()
                 .filter_map(|line| line.strip_prefix("data:"))
                 .map(|line| line.strip_prefix(' ').unwrap_or(line))
-                .collect();
+                .collect::<Vec<_>>()
+                .join("\n");
             if !data.is_empty() {
                 frames.push(data);
             }
@@ -1705,6 +1869,80 @@ mod tests {
         assert_eq!(choices.len(), 1);
         assert_eq!(choices[0].value, "opencode/big-pickle");
         assert_eq!(choices[0].label, "Big Pickle");
+    }
+
+    #[test]
+    fn sse_decoder_joins_multi_data_lines_with_newline() {
+        let mut sse = SseDecoder::new(false);
+        let frames = sse.feed(b"data: {\"a\":\ndata: 1}\n\n");
+        assert_eq!(frames, vec!["{\"a\":\n1}"]);
+    }
+
+    #[test]
+    fn real_title_drops_the_dated_placeholders() {
+        assert_eq!(
+            real_title(&json!("New session - 2026-09-04T00:56:28.393Z")),
+            None
+        );
+        assert_eq!(real_title(&json!("Child session - 2026-09-04")), None);
+        assert_eq!(real_title(&json!("")), None);
+        assert_eq!(real_title(&json!(null)), None);
+        assert_eq!(
+            real_title(&json!("Fix the adapter")),
+            Some("Fix the adapter".into())
+        );
+    }
+
+    #[test]
+    fn busy_status_counts_retry_as_busy() {
+        assert!(busy_status(&json!({ "type": "busy" })));
+        assert!(busy_status(&json!({ "type": "retry" })));
+        assert!(!busy_status(&json!({ "type": "idle" })));
+        assert!(!busy_status(&json!(null)));
+    }
+
+    #[test]
+    fn permission_carries_the_command_it_covers() {
+        // The live `permission.asked` shape for bash (captured 2026-09-03).
+        let props = json!({
+            "id": "per_1", "permission": "bash",
+            "patterns": ["echo hi"], "metadata": { "command": "echo hi" },
+            "tool": { "messageID": "msg_1", "callID": "call_1" },
+        });
+        assert_eq!(permission_detail(&props).as_deref(), Some("echo hi"));
+        let tool = permission_tool(&props);
+        assert_eq!(tool.title, "bash echo hi");
+        assert!(
+            matches!(tool.input, ToolInput::Command { ref command, .. } if command == "echo hi")
+        );
+    }
+
+    #[test]
+    fn user_anchor_counts_user_turns_from_the_tip() {
+        let messages = json!([
+            { "info": { "id": "msg_1", "role": "user" } },
+            { "info": { "id": "msg_2", "role": "assistant" } },
+            { "info": { "id": "msg_3", "role": "user" } },
+            { "info": { "id": "msg_4", "role": "assistant" } },
+        ]);
+        assert_eq!(user_anchor(&messages, 1), Some("msg_3".into()));
+        assert_eq!(user_anchor(&messages, 2), Some("msg_1".into()));
+        assert_eq!(user_anchor(&messages, 3), None);
+    }
+
+    #[test]
+    fn question_answers_flatten_choices_and_text() {
+        let answers = vec![
+            QuestionAnswer::Choices(vec![ChoiceId::new("Red"), ChoiceId::new("Blue")]),
+            QuestionAnswer::Text("free form".into()),
+        ];
+        assert_eq!(
+            question_answers(&answers),
+            vec![
+                vec!["Red".to_owned(), "Blue".to_owned()],
+                vec!["free form".to_owned()]
+            ]
+        );
     }
 
     #[test]
