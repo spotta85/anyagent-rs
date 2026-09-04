@@ -371,6 +371,66 @@ async fn status_flips_working_needs_input_and_back_and_never_flashes_idle() {
 }
 
 #[tokio::test]
+async fn trailing_events_do_not_flash_idle_past_a_queued_prompt() {
+    use crate::SessionStatus;
+
+    // The turn ends with bookkeeping right behind it in the channel, so
+    // promotion of the queued prompt is deferred one pass; the status must
+    // read Working across that gap, not flash Idle.
+    let script = Script::default()
+        .turn(vec![
+            Step::Emit(tool("bg", ToolStatus::Running)),
+            Step::Emit(permission("r1")),
+            Step::AwaitAnswer,
+            Step::End(completed()),
+            Step::Emit(tool("bg", ToolStatus::Completed)),
+        ])
+        .turn(vec![Step::Emit(text("m2", "two")), Step::End(completed())]);
+    let (session, mut events) = open(MockAdapter::new(script), None).await;
+    session.prompt("first").await.unwrap();
+
+    let mut statuses = Vec::new();
+    let mut queued = false;
+    let mut turn_ends = 0;
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), events.next())
+            .await
+            .expect("timed out")
+            .expect("stream ended")
+            .expect("stream error");
+        match event.kind {
+            EventKind::StatusChanged(status) => {
+                statuses.push(status);
+                if status == SessionStatus::Idle {
+                    break;
+                }
+            }
+            // Queue the second prompt while the turn is parked, then let it
+            // finish into its trailing bookkeeping.
+            EventKind::RequestOpened(request) => {
+                session.prompt("second").await.unwrap();
+                queued = true;
+                session.answer(request.id(), allow()).await.unwrap();
+            }
+            EventKind::TurnEnded { .. } => turn_ends += 1,
+            _ => {}
+        }
+    }
+    assert!(queued, "the second prompt never queued");
+    // The one Idle comes after BOTH turns; an Idle between them is the flash.
+    assert_eq!(turn_ends, 2, "Idle flashed before the queued turn ran");
+    assert_eq!(
+        statuses,
+        vec![
+            SessionStatus::Working,
+            SessionStatus::NeedsInput,
+            SessionStatus::Working,
+            SessionStatus::Idle,
+        ]
+    );
+}
+
+#[tokio::test]
 async fn a_stalled_consumer_is_disconnected_instead_of_growing_memory() {
     // More events than the consumer buffer (1024) holds, never drained.
     let mut steps: Vec<Step> = (0..1300)

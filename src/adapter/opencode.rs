@@ -79,6 +79,7 @@ impl Adapter for OpencodeAdapter {
                 login: login_methods(&request.installation),
                 messages: HashMap::new(),
                 ended: HashSet::new(),
+                tide: String::new(),
                 parts: HashMap::new(),
                 tools: HashMap::new(),
                 children: HashSet::new(),
@@ -544,6 +545,10 @@ struct Drive {
     /// Messages already closed by a completed `message.updated` (the
     /// completed snapshot republishes, so each closes once).
     ended: HashSet<String>,
+    /// Highest assistant `msg_…` id ever minted. Ids sort by creation time,
+    /// so an unknown id at or below it is a bookkeeping republish of a
+    /// settled turn (an abort replays its message), never new content.
+    tide: String,
     /// `prt_…` id → (kind, bytes already emitted), for delta/snapshot dedup.
     parts: HashMap<String, PartState>,
     /// Tool snapshots by `callID`, for the permission that references one.
@@ -824,6 +829,11 @@ impl Drive {
         let Some(oc_id) = info["id"].as_str() else {
             return Ok(());
         };
+        // A republished message of a settled turn must not re-mint: its
+        // part snapshots would stream into the next turn.
+        if !self.messages.contains_key(oc_id) && oc_id <= self.tide.as_str() {
+            return Ok(());
+        }
         let message_id = self.message_id(oc_id);
         if let Some(error) = info.get("error").filter(|e| !e.is_null()) {
             self.turn_error = Some(message_error(error));
@@ -1280,6 +1290,9 @@ impl Drive {
     fn message_id(&mut self, oc_id: &str) -> MessageId {
         if let Some(id) = self.messages.get(oc_id) {
             return id.clone();
+        }
+        if oc_id > self.tide.as_str() {
+            self.tide = oc_id.to_owned();
         }
         self.next_message += 1;
         let id = MessageId::new(format!("m{}", self.next_message));
