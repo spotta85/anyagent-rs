@@ -642,8 +642,10 @@ impl Drive {
                 }
             }
             DriverCommand::Rollback(..) => {
-                // Not advertised: `thread/rollback` is deprecated upstream
-                // and rollback on codex is deferred (tickets 07/09).
+                // Not advertised: deferred (tickets 07/09). Note 0.152.0
+                // still ships `thread/rollback` and `thread/revert` (and T3
+                // calls the former), so this is implementable natively —
+                // probe the params before picking it up.
                 self.diagnostic(
                     DiagnosticLevel::Warning,
                     "rollback is not supported on codex",
@@ -674,9 +676,12 @@ impl Drive {
         };
         let error = frame["error"]["message"].as_str();
         match pending {
-            // A wire rejection of the turn is a failed turn.
+            // A wire rejection of the turn is a failed turn. A cancel that
+            // raced this start has nothing left to interrupt — a stale flag
+            // would cancel the next turn at its start.
             Pending::StartTurn => match error {
                 Some(message) => {
+                    self.cancel_pending = false;
                     self.emit(DriverEvent::TurnEnded(StopReason::Failed {
                         message: message.to_owned(),
                     }))
@@ -1395,14 +1400,21 @@ fn notice_text(params: &Value) -> String {
 
 /// `account/rateLimits` → quota windows; `primary` and `secondary` are the
 /// plan's two windows (300 min and 10080 min observed), and `planType` names
-/// the plan.
+/// the plan. `windowDurationMins` is sometimes absent; T3 falls back to the
+/// plan's known pair (5h/weekly, the secondary monthly on free/go plans).
 fn plan_usage(rate_limits: &Value) -> Option<PlanUsage> {
-    let windows: Vec<UsageWindow> = ["primary", "secondary"]
+    let plan = rate_limits["planType"].as_str().map(str::to_owned);
+    let monthly = matches!(plan.as_deref(), Some("free" | "go"));
+    let secondary_default = if monthly { 43200 } else { 10080 };
+    let windows: Vec<UsageWindow> = [("primary", 300), ("secondary", secondary_default)]
         .iter()
-        .filter_map(|key| {
+        .filter_map(|(key, default_mins)| {
             let window = &rate_limits[*key];
+            let mins = window["windowDurationMins"]
+                .as_u64()
+                .unwrap_or(*default_mins);
             Some(UsageWindow {
-                label: window_label(window["windowDurationMins"].as_u64()?),
+                label: window_label(mins),
                 used_percent: window["usedPercent"].as_f64()?.round().clamp(0.0, 100.0) as u8,
                 resets_at: window["resetsAt"]
                     .as_u64()
@@ -1411,17 +1423,19 @@ fn plan_usage(rate_limits: &Value) -> Option<PlanUsage> {
         })
         .collect();
     (!windows.is_empty()).then(|| PlanUsage {
-        plan: rate_limits["planType"].as_str().map(str::to_owned),
+        plan,
         windows,
         fetched_at: SystemTime::now(),
     })
 }
 
-/// "Session" for the short window, "Week" for the 7-day one, hours otherwise.
+/// "Session" for the short window, "Week" for the 7-day one, "Month" for a
+/// 28–31-day one, hours otherwise.
 fn window_label(mins: u64) -> String {
     match mins {
         0..=720 => "Session".into(),
         10080 => "Week".into(),
+        40320..=44640 => "Month".into(),
         m => format!("{}h", m / 60),
     }
 }
@@ -1638,5 +1652,41 @@ impl WireError {
             WireError::Closed => AgentError::ProtocolFailed("agent closed the wire".into()),
             WireError::Rpc(message) => AgentError::ProtocolFailed(message),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_usage_falls_back_when_durations_are_absent() {
+        // The observed shape carries durations; older frames may not.
+        let usage = plan_usage(&json!({
+            "planType": "plus",
+            "primary": { "usedPercent": 12.4 },
+            "secondary": { "usedPercent": 55.6 },
+        }))
+        .unwrap();
+        let labels: Vec<&str> = usage.windows.iter().map(|w| w.label.as_str()).collect();
+        assert_eq!(labels, vec!["Session", "Week"]);
+        assert_eq!(usage.windows[0].used_percent, 12);
+
+        // free/go plans meter the secondary window monthly.
+        let usage = plan_usage(&json!({
+            "planType": "free",
+            "primary": { "usedPercent": 1.0 },
+            "secondary": { "usedPercent": 2.0 },
+        }))
+        .unwrap();
+        assert_eq!(usage.windows[1].label, "Month");
+    }
+
+    #[test]
+    fn window_label_names_the_known_windows() {
+        assert_eq!(window_label(300), "Session");
+        assert_eq!(window_label(10080), "Week");
+        assert_eq!(window_label(43200), "Month");
+        assert_eq!(window_label(20160), "336h");
     }
 }

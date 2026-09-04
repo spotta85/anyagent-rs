@@ -22,8 +22,8 @@ use futures::StreamExt;
 
 use anyagent::{
     AgentError, Answer, AuthStatus, Capability, ConfigKind, DeliveryKind, Event, EventKind, Events,
-    MessageId, PermissionChoice, QuestionAnswer, Request, RequestId, RollbackScope, Runtime,
-    Session, SessionOptions, StopReason, ToolStatus, TurnOrigin,
+    MessageId, PermissionChoice, QuestionAnswer, Request, RequestId, ResumeToken, RollbackScope,
+    Runtime, Session, SessionOptions, StopReason, ToolStatus, TurnOrigin,
 };
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -1187,6 +1187,26 @@ async fn errors_are_typed() {
             matches!(session.prompt("hi").await, Err(AgentError::SessionClosed)),
             "{h}: prompt after close should be SessionClosed"
         );
+        // (d) a resume token that names no conversation refuses typed, so
+        // apps can tell a dead token from a broken protocol (native wires;
+        // probed: claude "No conversation found", codex "no rollout found",
+        // opencode a session-fetch rejection).
+        if matches!(h, "claude" | "codex" | "opencode") {
+            let runtime = Runtime::new();
+            let report = runtime.discover().await;
+            let agent = report.require(h).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let bogus = ResumeToken::new("3b1c9f2e-5a6d-4e7f-8a9b-0c1d2e3f4a5b");
+            let mut options = SessionOptions::in_dir(dir.path()).resume(bogus);
+            if h == "opencode" {
+                options = options.configure("model", OPENCODE_MODEL);
+            }
+            match runtime.open(agent, options).await {
+                Err(AgentError::ResumeFailed(_)) => {}
+                Err(other) => panic!("{h}: bogus resume errored untyped: {other}"),
+                Ok(_) => panic!("{h}: bogus resume opened a session"),
+            }
+        }
         pass(h, "errors are typed");
     }
 }
