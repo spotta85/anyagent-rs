@@ -320,6 +320,7 @@ mod tests {
         exe
     }
 
+    /// search_dirs follows PATH > LoginShellPath > VersionManager > KnownLocation > extra_paths order.
     #[test]
     fn search_follows_the_resolution_order() {
         let home = Path::new("/h");
@@ -346,6 +347,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// Resolves newest version-manager install (v20.1.0 over v9.9.9).
     #[test]
     fn resolves_the_newest_version_manager_install() {
         let home = tempfile::tempdir().unwrap();
@@ -364,6 +366,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// Auth markers decide logged-in (file present) vs logged-out (no marker) with terminal + EnvVar methods.
     #[tokio::test]
     async fn auth_markers_decide_logged_in_or_out() {
         let home = tempfile::tempdir().unwrap();

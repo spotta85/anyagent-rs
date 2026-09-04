@@ -82,6 +82,7 @@ fn text_of(kinds: &[EventKind]) -> String {
         .collect()
 }
 
+/// Handshake advertises version, auth, capabilities (!Permissions/Rollback), model/thinking selects and commands.
 #[tokio::test]
 async fn handshake_advertises_state_models_levels_and_commands() {
     let (session, _events) = open("handshake", "").await;
@@ -164,6 +165,7 @@ async fn handshake_advertises_state_models_levels_and_commands() {
     );
 }
 
+/// Turn streams text [m1], reasoning, tool Pending->Completed with incremental output, and usage before settling.
 #[tokio::test]
 async fn a_turn_streams_text_reasoning_tools_and_usage_then_settles() {
     let (session, mut events) = open("turn", "").await;
@@ -244,6 +246,7 @@ async fn a_turn_streams_text_reasoning_tools_and_usage_then_settles() {
     session.close().await.unwrap();
 }
 
+/// Mid-turn prompt steers running turn; cancel drops steer from pi queue so m2 never runs.
 #[tokio::test]
 async fn a_mid_turn_prompt_steers_the_running_turn() {
     let (session, mut events) = open("steer", "").await;
@@ -278,6 +281,7 @@ async fn a_mid_turn_prompt_steers_the_running_turn() {
     );
 }
 
+/// Cancel (pi abort error) maps to TurnEnded Cancelled.
 #[tokio::test]
 async fn cancel_ends_the_turn_as_cancelled() {
     let (session, mut events) = open("cancel", "").await;
@@ -298,6 +302,7 @@ async fn cancel_ends_the_turn_as_cancelled() {
     assert_eq!(stop, StopReason::Cancelled);
 }
 
+/// Extension dialog surfaces as Question and answer returns via diagnostic picked Green.
 #[tokio::test]
 async fn an_extension_dialog_becomes_a_question_and_the_answer_goes_back() {
     let (session, mut events) = open("dialog", "").await;
@@ -340,6 +345,7 @@ async fn an_extension_dialog_becomes_a_question_and_the_answer_goes_back() {
     );
 }
 
+/// Confirm dialog round-trips Yes/No boolean confirmed with 5000ms timeout extension.
 #[tokio::test]
 async fn a_confirm_dialog_round_trips_both_verdicts_and_carries_its_timeout() {
     for (choice, echo) in [(0, "confirmed true"), (1, "confirmed false")] {
@@ -391,6 +397,7 @@ async fn a_confirm_dialog_round_trips_both_verdicts_and_carries_its_timeout() {
     }
 }
 
+/// Model change applies and re-reads new model's thinking levels; stale level cleared.
 #[tokio::test]
 async fn a_model_change_applies_and_re_reads_the_new_model_levels() {
     let (session, mut events) = open("configure", "").await;
@@ -436,6 +443,7 @@ async fn a_model_change_applies_and_re_reads_the_new_model_levels() {
     assert_eq!(info.configuration.options.get(&"thinking".into()), None);
 }
 
+/// Failed model turn ends as Failed with provider refused message.
 #[tokio::test]
 async fn a_failed_model_turn_ends_the_turn_as_failed() {
     let (session, mut events) = open("fail", "").await;
@@ -452,6 +460,7 @@ async fn a_failed_model_turn_ends_the_turn_as_failed() {
     );
 }
 
+/// Refused prompt while processing fails as Failed already processing.
 #[tokio::test]
 async fn a_refused_prompt_fails_the_turn_the_engine_already_started() {
     let (session, mut events) = open("refused", "--reject-prompt").await;
@@ -469,6 +478,7 @@ async fn a_refused_prompt_fails_the_turn_the_engine_already_started() {
     );
 }
 
+/// Logged-out reported via pi readiness check with EnvVar OPENROUTER_API_KEY login method.
 #[tokio::test]
 async fn logged_out_is_reported_from_pi_s_own_readiness_check() {
     let runtime = Runtime::new();
@@ -486,6 +496,7 @@ async fn logged_out_is_reported_from_pi_s_own_readiness_check() {
     );
 }
 
+/// Api-key login reported as Authenticated ApiKey.
 #[tokio::test]
 async fn an_api_key_login_is_reported_as_one() {
     let runtime = Runtime::new();
@@ -499,6 +510,7 @@ async fn an_api_key_login_is_reported_as_one() {
     );
 }
 
+/// Resume binds session file token; config_home sets PI_CODING_AGENT_DIR session path.
 #[tokio::test]
 async fn resume_binds_the_session_file_and_config_home_reaches_the_child() {
     let token = ResumeToken::new("/tmp/anyagent-pi-resume/s9.jsonl");
@@ -517,6 +529,7 @@ async fn resume_binds_the_session_file_and_config_home_reaches_the_child() {
     );
 }
 
+/// Fork/MCP unsupported -> UnsupportedFeature; bad sandbox/model -> InvalidConfiguration.
 #[tokio::test]
 async fn unsupported_starts_and_declarations_are_refused_typed() {
     let options = SessionOptions::in_dir(std::env::temp_dir())

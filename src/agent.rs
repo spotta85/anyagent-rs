@@ -516,6 +516,7 @@ impl From<String> for Input {
 mod tests {
     use super::*;
 
+    /// SessionOptions::in_dir absolutizes relative cwd so agents rejecting relative paths work.
     #[test]
     fn in_dir_makes_cwd_absolute() {
         // Agents such as grok reject a relative cwd at `session/new`.
