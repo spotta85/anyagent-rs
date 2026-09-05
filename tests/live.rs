@@ -31,6 +31,10 @@ const OPENCODE_MODEL: &str = "opencode/big-pickle";
 /// pi's model values are `provider/modelId`.
 const PI_MODEL: &str = "openrouter/nvidia/nemotron-3-super-120b-a12b:free";
 const COUNT: &str = "Count from 1 to 400, one number per line. No other text. No tools.";
+const TITLE: &str = "Title this conversation in at most six words: the user asked how to rename \
+a git branch. Reply with only the title. No tools.";
+/// `generate` pins claude to Opus 4.8 so the one-shot path is checked on a real model choice.
+const CLAUDE_GENERATE_MODEL: &str = "claude-opus-4-8";
 
 // -- gate -------------------------------------------------------------------
 
@@ -233,6 +237,34 @@ async fn probe_reports_details_without_a_session() {
                 details.commands.len()
             ),
         );
+    }
+}
+
+/// `generate` is prompt in, text out, with no session to manage; claude runs it on Opus 4.8.
+#[tokio::test]
+#[ignore = "live: talks to real agents"]
+async fn generate_returns_text_without_a_session() {
+    for h in enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new();
+        let report = runtime.discover().await;
+        let agent = report
+            .require(h)
+            .unwrap_or_else(|_| panic!("{h}: not discovered"));
+        let mut opts = options(h, dir.path());
+        if h == "claude" {
+            opts = opts.configure("model", CLAUDE_GENERATE_MODEL);
+        }
+        let text = runtime
+            .generate(agent, opts, TITLE)
+            .await
+            .unwrap_or_else(|e| panic!("{h}: generate failed: {e}"));
+        assert!(text.to_lowercase().contains("branch"), "{h}: got {text:?}");
+        assert!(
+            text.split_whitespace().count() <= 8,
+            "{h}: not a title: {text:?}"
+        );
+        pass(h, &format!("generate returned {text:?}"));
     }
 }
 
@@ -1137,7 +1169,17 @@ async fn open(harness: &str) -> (Session, Events, tempfile::TempDir) {
     let agent = report
         .require(harness)
         .unwrap_or_else(|_| panic!("{harness}: not discovered"));
-    let mut options = SessionOptions::in_dir(dir.path());
+    let (session, events) = runtime
+        .open(agent, options(harness, dir.path()))
+        .await
+        .unwrap_or_else(|e| panic!("{harness}: open failed: {e}"));
+    (session, events, dir)
+}
+
+/// The per-harness options every live session opens with: pinned models
+/// and deterministic approvals.
+fn options(harness: &str, dir: &std::path::Path) -> SessionOptions {
+    let mut options = SessionOptions::in_dir(dir);
     if harness == "opencode" {
         options = options.configure("model", OPENCODE_MODEL);
     }
@@ -1151,11 +1193,7 @@ async fn open(harness: &str) -> (Session, Events, tempfile::TempDir) {
             .configure("sandbox", "read-only")
             .configure("mode", "on-request");
     }
-    let (session, events) = runtime
-        .open(agent, options)
-        .await
-        .unwrap_or_else(|e| panic!("{harness}: open failed: {e}"));
-    (session, events, dir)
+    options
 }
 
 /// Next event within the timeout; a hang fails naming the step.

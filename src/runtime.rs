@@ -10,10 +10,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::adapter::{Adapter, ConnectRequest};
 use crate::agent::{
-    AgentDetails, AgentId, AgentInstallation, AuthStatus, Capabilities, SessionOptions,
+    AgentDetails, AgentId, AgentInstallation, AuthStatus, Capabilities, Input, SessionOptions,
 };
 use crate::error::AgentError;
-use crate::event::{Diagnostic, PlanUsage};
+use crate::event::{
+    Answer, Diagnostic, EventKind, PermissionChoice, PlanUsage, QuestionAnswer, Request, StopReason,
+};
 use crate::session::{self, Events, Session};
 
 const USAGE_CACHE_TTL: Duration = Duration::from_secs(60);
@@ -135,6 +137,22 @@ impl Runtime {
             .await?;
         Ok(session::start(agent.clone(), connection, &options))
     }
+    /// One-shot generation: prompt in, the agent's reply text out. Opens a
+    /// throwaway session, denies every tool permission, gathers the text
+    /// until the turn ends, and closes. For titles, commit messages, and
+    /// anything else that needs a string, not a conversation.
+    pub async fn generate(
+        &self,
+        agent: &AgentInstallation,
+        options: SessionOptions,
+        prompt: impl Into<Input>,
+    ) -> Result<String, AgentError> {
+        let (session, mut events) = self.open(agent, options).await?;
+        let reply = collect_reply(&session, &mut events, prompt.into()).await;
+        session.close().await.ok();
+        reply
+    }
+
     // spawn agent in temp dir, wait for handshake, read details, close.
     pub async fn probe(&self, agent: &AgentInstallation) -> Result<AgentDetails, AgentError> {
         let opened = self
@@ -220,6 +238,54 @@ impl Runtime {
     }
 }
 
+/// Sends the prompt and gathers the agent's own text (not subagents') until
+/// the turn ends. Requests are declined so the agent stays hands-off.
+async fn collect_reply(
+    session: &Session,
+    events: &mut Events,
+    prompt: Input,
+) -> Result<String, AgentError> {
+    session.prompt(prompt).await?;
+    let mut text = String::new();
+    while let Some(event) = events.next().await {
+        let event = event?;
+        let nested = event
+            .turn_info
+            .as_ref()
+            .is_some_and(|t| t.parent_tool_id.is_some());
+        match event.kind {
+            EventKind::TextDelta { text: delta, .. } if !nested => text.push_str(&delta),
+            EventKind::RequestOpened(request) => {
+                session.answer(request.id(), decline(&request)).await?;
+            }
+            EventKind::TurnEnded {
+                stop: StopReason::Completed { .. },
+                ..
+            } => return Ok(text),
+            EventKind::TurnEnded { stop, .. } => {
+                return Err(AgentError::ProtocolFailed(format!(
+                    "generate: turn ended with {stop:?}"
+                )));
+            }
+            _ => {}
+        }
+    }
+    Err(AgentError::SessionClosed)
+}
+
+/// Denies a permission; leaves a question blank.
+fn decline(request: &Request) -> Answer {
+    match request {
+        Request::Permission(_) => Answer::Permission(PermissionChoice::DenyOnce),
+        Request::Question(q) => Answer::Question(
+            q.questions
+                .iter()
+                .map(|_| QuestionAnswer::Text(String::new()))
+                .collect(),
+        ),
+    }
+}
+
 /// One row of a usage page: the agent and its quota, or why it has none.
 #[derive(Debug)]
 pub struct AgentPlanUsage {
@@ -272,6 +338,21 @@ mod tests {
         std::fs::write(&exe, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
         exe
+    }
+
+    /// `generate` returns the turn's text and declines the permission
+    /// request on the way, leaving nothing open.
+    #[tokio::test]
+    async fn generate_collects_text_and_declines_requests() {
+        use crate::adapter::mock::MockAdapter;
+        let runtime = Runtime::with_test_adapter(MockAdapter::permission_flow());
+        let agent = runtime.discover().await.require("mock").unwrap().clone();
+        let dir = tempfile::tempdir().unwrap();
+        let text = runtime
+            .generate(&agent, SessionOptions::in_dir(dir.path()), "title this")
+            .await
+            .unwrap();
+        assert_eq!(text, "Let me check. Done.");
     }
 
     #[tokio::test]
