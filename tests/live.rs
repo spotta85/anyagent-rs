@@ -8,7 +8,7 @@
 //! ```
 //!
 //! Rules the suite enforces itself: the ANTHROPIC_* env hijack is stripped
-//! in-process, opencode auto-skips without OPENROUTER_API_KEY, capability
+//! in-process, pi auto-skips without OPENROUTER_API_KEY, capability
 //! gates print SKIP (which is a pass), and every event wait names the step
 //! it hung at. Model-output flakes (wrong word from a weak model) are the
 //! operator's judgment call; structural failures fail hard.
@@ -23,7 +23,8 @@ use futures::StreamExt;
 use anyagent::{
     AgentError, Answer, AuthStatus, Capability, ConfigKind, ConfigValue, DeliveryKind, Event,
     EventKind, Events, MessageId, PermissionChoice, PromptId, QuestionAnswer, Request, RequestId,
-    RollbackScope, Runtime, Session, SessionOptions, StopReason, ToolStatus, TurnOrigin,
+    ResumeToken, RollbackScope, Runtime, Session, SessionOptions, StopReason, ToolStatus,
+    TurnOrigin,
 };
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -133,6 +134,14 @@ async fn open_reports_token_capabilities_and_options() {
         let info = session.info();
         assert!(info.resume_token.is_some(), "{h}: no resume token at open");
         assert!(info.details.version.is_some(), "{h}: no version");
+        // A fresh session has no real title yet; a dated placeholder must
+        // not be advertised as one (opencode: "New session - <date>").
+        if let Some(title) = &info.title {
+            assert!(
+                !title.starts_with("New session") && !title.starts_with("Child session"),
+                "{h}: placeholder title advertised: {title:?}"
+            );
+        }
         let caps = &info.details.capabilities;
         let has_option = |id: &str| {
             info.details
@@ -409,6 +418,7 @@ async fn turn_events_are_bracketed_ordered_and_quiet_after_end() {
         let mut last_seq = 0;
         let mut saw_in_turn = false;
         let mut open_messages = std::collections::BTreeSet::new();
+        let mut ended_messages = std::collections::BTreeSet::new();
         let mut text = String::new();
         loop {
             let event = next(&mut events, &format!("{h}: turn contract")).await;
@@ -443,6 +453,13 @@ async fn turn_events_are_bracketed_ordered_and_quiet_after_end() {
                 }
                 EventKind::MessageEnded { message_id } => {
                     open_messages.remove(&message_id);
+                    // A republished completion snapshot must not close the
+                    // same message twice (a message with no streamed content,
+                    // e.g. tool-only, may still end once).
+                    assert!(
+                        ended_messages.insert(message_id.clone()),
+                        "{h}: {message_id:?} ended twice"
+                    );
                 }
                 EventKind::Diagnostic(d) => {
                     assert!(
@@ -598,6 +615,64 @@ async fn permissions_gate_the_write_and_deny_holds() {
     }
 }
 
+/// A `/word` that is not an advertised command must ride as plain text — an
+/// over-eager slash router would fail the turn on it (opencode routed every
+/// `/…` to its command endpoint before the fix).
+#[tokio::test]
+#[ignore = "live: talks to real agents"]
+async fn an_unknown_slash_prompt_is_plain_text() {
+    for h in enabled() {
+        let (session, mut events, _dir) = open(h).await;
+        session
+            .prompt("/definitely-not-a-command Reply with only the word KUMQUAT.")
+            .await
+            .unwrap();
+        let text = drain_to_turn_end(&session, &mut events, &format!("{h}: slash text")).await;
+        assert!(text.contains("KUMQUAT"), "{h}: text was {text:?}");
+        session.close().await.unwrap();
+        pass(h, "unknown slash text stayed plain text");
+    }
+}
+
+/// opencode's task tool runs in a child session whose permissions ask on the
+/// child's own session id; they must still reach the caller or the subagent
+/// stalls parked forever.
+#[tokio::test]
+#[ignore = "live: talks to real agents"]
+async fn opencode_child_session_permissions_reach_the_caller() {
+    if !enabled().contains(&"opencode") {
+        println!("SKIP: opencode not enabled");
+        return;
+    }
+    let (session, mut events, _dir) = open("opencode").await;
+    session
+        .prompt(
+            "Use your task tool to spawn a subagent whose prompt is: run the bash \
+             command `echo child-probe`. You must use the task tool.",
+        )
+        .await
+        .unwrap();
+    let mut approved = 0;
+    loop {
+        let event = next(&mut events, "opencode: child permission").await;
+        match event.kind {
+            EventKind::RequestOpened(Request::Permission(request)) => {
+                approved += 1;
+                session.answer(request.id, allow()).await.unwrap();
+            }
+            EventKind::TurnEnded { .. } => break,
+            _ => {}
+        }
+    }
+    // The task tool asks on the root, its bash on the child.
+    assert!(
+        approved >= 2,
+        "expected the task and child bash permissions, saw {approved}"
+    );
+    session.close().await.unwrap();
+    pass("opencode", "child session permissions reached the caller");
+}
+
 /// Question request round-trips: choices presented, answer selected, and response echoed (claude/codex only; codex unverified).
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
@@ -606,13 +681,13 @@ async fn a_question_round_trips() {
         // codex runs as a probe: `item/tool/requestUserInput` is
         // schema-confirmed but has never fired live (ticket 10) — the
         // translation is exercised if it ever does, without failing the run.
-        if h != "claude" && h != "codex" {
-            println!("SKIP {h}: questions (claude only)");
+        if h != "claude" && h != "codex" && h != "opencode" {
+            println!("SKIP {h}: questions (claude, codex, opencode)");
             continue;
         }
         let (session, mut events, _dir) = open(h).await;
         session
-            .prompt("Ask me whether I prefer red or blue using your question tool (claude: AskUserQuestion; codex: request_user_input), then answer with just my choice.")
+            .prompt("Ask me whether I prefer red or blue using your question tool (claude: AskUserQuestion; codex: request_user_input; opencode: question), then answer with just my choice.")
             .await
             .unwrap();
         let mut text = String::new();
@@ -640,6 +715,15 @@ async fn a_question_round_trips() {
                         .unwrap();
                 }
                 EventKind::TextDelta { text: t, .. } => text.push_str(&t),
+                // The question must surface only as a request, never also as
+                // a tool call (claude: AskUserQuestion; opencode: question).
+                EventKind::ToolUpdated(tool) => {
+                    assert!(
+                        !tool.title.to_lowercase().contains("question"),
+                        "{h}: question surfaced as a tool: {}",
+                        tool.title
+                    );
+                }
                 EventKind::TurnEnded { stop, .. } => {
                     assert!(matches!(stop, StopReason::Completed { .. }), "{stop:?}");
                     break;
@@ -1337,6 +1421,26 @@ async fn errors_are_typed() {
             matches!(session.prompt("hi").await, Err(AgentError::SessionClosed)),
             "{h}: prompt after close should be SessionClosed"
         );
+        // (d) a resume token that names no conversation refuses typed, so
+        // apps can tell a dead token from a broken protocol (native wires;
+        // probed: claude "No conversation found", codex "no rollout found",
+        // opencode a session-fetch rejection).
+        if matches!(h, "claude" | "codex" | "opencode") {
+            let runtime = Runtime::new();
+            let report = runtime.discover().await;
+            let agent = report.require(h).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let bogus = ResumeToken::new("3b1c9f2e-5a6d-4e7f-8a9b-0c1d2e3f4a5b");
+            let mut options = SessionOptions::in_dir(dir.path()).resume(bogus);
+            if h == "opencode" {
+                options = options.configure("model", OPENCODE_MODEL);
+            }
+            match runtime.open(agent, options).await {
+                Err(AgentError::ResumeFailed(_)) => {}
+                Err(other) => panic!("{h}: bogus resume errored untyped: {other}"),
+                Ok(_) => panic!("{h}: bogus resume opened a session"),
+            }
+        }
         pass(h, "errors are typed");
     }
 }

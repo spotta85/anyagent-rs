@@ -59,7 +59,11 @@ function onControl(m) {
       if (flag('--resume-fails') && flag('--resume')) return send({ type: 'control_response', response: { subtype: 'error', request_id: m.request_id, error: 'resume refused' } });
       // `--permission-mode` at launch decides the starting mode, like the CLI.
       const pm = process.argv.indexOf('--permission-mode');
+      // Fast mode turns on only via the `--settings` flag, like the real CLI.
+      const si = process.argv.indexOf('--settings');
+      const fast = si > -1 && JSON.parse(process.argv[si + 1]).fastMode === true;
       return reply({
+        fast_mode_state: fast ? 'on' : 'off',
         commands: [{ name: 'compact', description: 'Compact context', argumentHint: '' }],
         models: [
           { value: 'default', displayName: 'Default (recommended)', description: 'Opus 5 with 1M context', supportsFastMode: !flag('--no-fast-metadata'), supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'] },

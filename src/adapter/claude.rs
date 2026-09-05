@@ -191,12 +191,23 @@ async fn launch(
         Ok(Err(e)) => {
             let e = with_stderr(e, &child);
             child.shutdown(CLOSE_GRACE).await;
-            Err(e)
+            Err(map_resume(start, e))
         }
         Err(_) => {
             child.shutdown(CLOSE_GRACE).await;
             Err(AgentError::HandshakeTimeout)
         }
+    }
+}
+
+/// A dead `--resume` token makes the CLI exit with "No conversation found"
+/// (probed 2026-09-04): a bad token, not a broken protocol.
+fn map_resume(start: &SessionStart, e: AgentError) -> AgentError {
+    let resuming = matches!(start, SessionStart::Resume(_) | SessionStart::Fork { .. });
+    if resuming && e.to_string().contains("No conversation found") {
+        AgentError::ResumeFailed(e.to_string())
+    } else {
+        e
     }
 }
 

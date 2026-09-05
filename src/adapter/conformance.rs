@@ -311,68 +311,6 @@ async fn bookkeeping_after_turn_end_is_not_a_turn_and_late_stops_are_diagnostics
     assert!(matches!(late_stop.kind, EventKind::Diagnostic(_)));
 }
 
-/// Stalled consumer (>1024 buffered events) is disconnected rather than growing memory unbounded.
-#[tokio::test]
-async fn a_stalled_consumer_is_disconnected_instead_of_growing_memory() {
-    // More events than the consumer buffer (1024) holds, never drained.
-    let mut steps: Vec<Step> = (0..1300)
-        .map(|i| Step::Emit(text("m1", &format!("{i} "))))
-        .collect();
-    steps.push(Step::End(completed()));
-    let (session, mut events) = open(MockAdapter::new(Script::default().turn(steps)), None).await;
-    session.prompt("go").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    // The engine treats a consumer this far behind as gone: the stream
-    // delivers what the buffer held, then ends — it never grows unbounded.
-    let mut delivered = 0;
-    while tokio::time::timeout(Duration::from_secs(5), events.next())
-        .await
-        .expect("the stream should end after the disconnect")
-        .is_some()
-    {
-        delivered += 1;
-    }
-    assert!(
-        delivered <= 1024,
-        "buffer overflowed: {delivered} delivered"
-    );
-}
-
-/// Frames losing promotion race (stale_before_ack) are dropped, not reattributed to next turn.
-#[tokio::test]
-async fn frames_losing_the_promotion_race_are_dropped_not_reattributed() {
-    // A frame from an ended turn that arrives after the engine promoted the
-    // next prompt used to land in the new turn. Adapters now ack `StartTurn`;
-    // the engine drops anything delivered before the ack.
-    let script = Script {
-        stale_before_ack: Some(text("m-old", "stale tail")),
-        ..Script::default()
-    }
-    .turn(vec![
-        Step::Emit(text("m1", "first")),
-        Step::End(completed()),
-    ])
-    .turn(vec![
-        Step::Emit(text("m2", "second")),
-        Step::End(completed()),
-    ]);
-    let (session, mut events) = open(MockAdapter::new(script), None).await;
-    session.prompt("go").await.unwrap();
-    session.prompt("then").await.unwrap();
-
-    let mut texts = Vec::new();
-    let mut ended = 0;
-    while ended < 2 {
-        match next(&mut events).await.kind {
-            EventKind::TextDelta { text, .. } => texts.push(text),
-            EventKind::TurnEnded { .. } => ended += 1,
-            _ => {}
-        }
-    }
-    assert_eq!(texts, vec!["first", "second"], "stale frames must not land");
-}
-
 /// Slow consumer with 1000 deltas (<1024) loses nothing and preserves sequence order.
 #[tokio::test]
 async fn status_flips_working_needs_input_and_back_and_never_flashes_idle() {
@@ -439,6 +377,142 @@ async fn status_flips_working_needs_input_and_back_and_never_flashes_idle() {
         }
     }
     assert_eq!(statuses, vec![SessionStatus::Working, SessionStatus::Idle]);
+}
+
+#[tokio::test]
+async fn a_close_with_a_queued_prompt_reads_idle_not_working() {
+    use crate::SessionStatus;
+
+    // Close mid-turn with a prompt still queued: the queue can never promote
+    // past Closing, so the final snapshot must not stay Working.
+    let script = Script::default().turn(vec![Step::Emit(text("m1", "one"))]); // never ends
+    let (session, _events) = open(MockAdapter::new(script), None).await;
+    session.prompt("first").await.unwrap();
+    session.prompt("queued").await.unwrap();
+    session.close().await.unwrap();
+    assert_eq!(session.status(), SessionStatus::Idle);
+}
+
+#[tokio::test]
+async fn trailing_events_do_not_flash_idle_past_a_queued_prompt() {
+    use crate::SessionStatus;
+
+    // The turn ends with bookkeeping right behind it in the channel, so
+    // promotion of the queued prompt is deferred one pass; the status must
+    // read Working across that gap, not flash Idle.
+    let script = Script::default()
+        .turn(vec![
+            Step::Emit(tool("bg", ToolStatus::Running)),
+            Step::Emit(permission("r1")),
+            Step::AwaitAnswer,
+            Step::End(completed()),
+            Step::Emit(tool("bg", ToolStatus::Completed)),
+        ])
+        .turn(vec![Step::Emit(text("m2", "two")), Step::End(completed())]);
+    let (session, mut events) = open(MockAdapter::new(script), None).await;
+    session.prompt("first").await.unwrap();
+
+    let mut statuses = Vec::new();
+    let mut queued = false;
+    let mut turn_ends = 0;
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), events.next())
+            .await
+            .expect("timed out")
+            .expect("stream ended")
+            .expect("stream error");
+        match event.kind {
+            EventKind::StatusChanged(status) => {
+                statuses.push(status);
+                if status == SessionStatus::Idle {
+                    break;
+                }
+            }
+            // Queue the second prompt while the turn is parked, then let it
+            // finish into its trailing bookkeeping.
+            EventKind::RequestOpened(request) => {
+                session.prompt("second").await.unwrap();
+                queued = true;
+                session.answer(request.id(), allow()).await.unwrap();
+            }
+            EventKind::TurnEnded { .. } => turn_ends += 1,
+            _ => {}
+        }
+    }
+    assert!(queued, "the second prompt never queued");
+    // The one Idle comes after BOTH turns; an Idle between them is the flash.
+    assert_eq!(turn_ends, 2, "Idle flashed before the queued turn ran");
+    assert_eq!(
+        statuses,
+        vec![
+            SessionStatus::Working,
+            SessionStatus::NeedsInput,
+            SessionStatus::Working,
+            SessionStatus::Idle,
+        ]
+    );
+}
+
+/// Stalled consumer (>1024 buffered events) is disconnected rather than growing memory unbounded.
+#[tokio::test]
+async fn a_stalled_consumer_is_disconnected_instead_of_growing_memory() {
+    // More events than the consumer buffer (1024) holds, never drained.
+    let mut steps: Vec<Step> = (0..1300)
+        .map(|i| Step::Emit(text("m1", &format!("{i} "))))
+        .collect();
+    steps.push(Step::End(completed()));
+    let (session, mut events) = open(MockAdapter::new(Script::default().turn(steps)), None).await;
+    session.prompt("go").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The engine treats a consumer this far behind as gone: the stream
+    // delivers what the buffer held, then ends — it never grows unbounded.
+    let mut delivered = 0;
+    while tokio::time::timeout(Duration::from_secs(5), events.next())
+        .await
+        .expect("the stream should end after the disconnect")
+        .is_some()
+    {
+        delivered += 1;
+    }
+    assert!(
+        delivered <= 1024,
+        "buffer overflowed: {delivered} delivered"
+    );
+}
+
+/// Frames losing promotion race (stale_before_ack) are dropped, not reattributed to next turn.
+#[tokio::test]
+async fn frames_losing_the_promotion_race_are_dropped_not_reattributed() {
+    // A frame from an ended turn that arrives after the engine promoted the
+    // next prompt used to land in the new turn. Adapters now ack `StartTurn`;
+    // the engine drops anything delivered before the ack.
+    let script = Script {
+        stale_before_ack: Some(text("m-old", "stale tail")),
+        ..Script::default()
+    }
+    .turn(vec![
+        Step::Emit(text("m1", "first")),
+        Step::End(completed()),
+    ])
+    .turn(vec![
+        Step::Emit(text("m2", "second")),
+        Step::End(completed()),
+    ]);
+    let (session, mut events) = open(MockAdapter::new(script), None).await;
+    session.prompt("go").await.unwrap();
+    session.prompt("then").await.unwrap();
+
+    let mut texts = Vec::new();
+    let mut ended = 0;
+    while ended < 2 {
+        match next(&mut events).await.kind {
+            EventKind::TextDelta { text, .. } => texts.push(text),
+            EventKind::TurnEnded { .. } => ended += 1,
+            _ => {}
+        }
+    }
+    assert_eq!(texts, vec!["first", "second"], "stale frames must not land");
 }
 
 #[tokio::test]

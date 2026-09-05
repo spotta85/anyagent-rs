@@ -12,7 +12,7 @@
 //! too; the engine queues prompts instead. All routes and event names live in
 //! this file so a future v2 swap is contained.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -41,6 +41,8 @@ use crate::event::{
 use crate::process::{self, Spawn};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a taken prompt may sit without the server going busy.
+const ADMIT_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOSE_GRACE: Duration = Duration::from_secs(2);
 const HEALTH_POLL: Duration = Duration::from_millis(100);
 const FRAME_BUFFER: usize = 64;
@@ -77,11 +79,18 @@ impl Adapter for OpencodeAdapter {
                 variants: launched.variants,
                 login: login_methods(&request.installation),
                 messages: HashMap::new(),
+                ended: HashSet::new(),
+                tide: String::new(),
                 parts: HashMap::new(),
                 tools: HashMap::new(),
+                children: HashSet::new(),
+                child_of: HashMap::new(),
+                spawn_order: Vec::new(),
+                child_messages: HashMap::new(),
                 requests: HashMap::new(),
                 cost: 0.0,
                 turn: Turn::Idle,
+                admit_deadline: None,
                 aborting: false,
                 turn_error: None,
                 next_message: 0,
@@ -135,6 +144,7 @@ async fn launch(
             "Basic {}",
             attach::base64(format!("opencode:{secret}").as_bytes())
         ),
+        recorder: recorder.clone(),
     };
     // The piped stdout must be drained or the server blocks on a full pipe.
     drain(server.stdout.take());
@@ -283,7 +293,10 @@ async fn bind_session(http: &Http, request: &ConnectRequest) -> Result<Value, Ag
     match &request.options.start {
         SessionStart::New => http.post("/session", json!({})).await,
         // Re-adopting the id IS the resume: opencode scopes history by it.
-        SessionStart::Resume(token) => http.get(&format!("/session/{}", token.as_str())).await,
+        SessionStart::Resume(token) => http
+            .get(&format!("/session/{}", token.as_str()))
+            .await
+            .map_err(|e| AgentError::ResumeFailed(e.to_string())),
         SessionStart::Fork { from, at } => {
             let body = match at {
                 None => json!({}),
@@ -301,18 +314,22 @@ async fn bind_session(http: &Http, request: &ConnectRequest) -> Result<Value, Ag
 }
 
 /// opencode reports login only as which providers are connected; an empty
-/// list is the one honest "logged out" (probed 2026-09-03).
+/// list is the one honest "logged out" (probed 2026-09-03). A connected
+/// provider proves a working credential, not its kind — the offline
+/// marker's kind stands where discovery read one.
 fn auth_status(request: &ConnectRequest, connected: &Value) -> AuthStatus {
     let any = connected.as_array().is_some_and(|c| !c.is_empty());
-    if any {
-        AuthStatus::Authenticated {
-            kind: AuthKind::Subscription,
-            account: None,
-        }
-    } else {
-        AuthStatus::Unauthenticated {
+    if !any {
+        return AuthStatus::Unauthenticated {
             login: login_methods(&request.installation),
-        }
+        };
+    }
+    match &request.installation.auth {
+        Some(auth @ AuthStatus::Authenticated { .. }) => auth.clone(),
+        _ => AuthStatus::Authenticated {
+            kind: AuthKind::Other("connected provider".into()),
+            account: None,
+        },
     }
 }
 
@@ -393,7 +410,8 @@ fn driver_info(
         },
         configuration,
         resume_token: None,
-        title: session["title"].as_str().map(str::to_owned),
+        // A fresh session's title is a dated placeholder, not a title.
+        title: real_title(&session["title"]),
         // `session.idle` ends every prompted turn.
         deterministic_turn_end: true,
         // No agent-originated turns on opencode; the same signal covers it.
@@ -590,10 +608,23 @@ fn offers(info: &DriverInfo, id: &str, value: &ConfigValue) -> bool {
 // Drive task: engine commands out (HTTP), SSE frames in
 // ---------------------------------------------------------------------------
 
-/// One open request awaiting the caller's answer.
-enum PendingRequest {
-    Permission { permission_id: String },
-    Question { question_id: String },
+/// One open request awaiting the caller's answer. The payload is kept so a
+/// refused reply can reopen the request for a retry.
+struct Pending {
+    reply: Reply,
+    request: Request,
+}
+
+/// How the answer reaches the server. Permissions reply on their owning
+/// session: a task-tool child asks on its own session id.
+enum Reply {
+    Permission {
+        permission_id: String,
+        session_id: String,
+    },
+    Question {
+        question_id: String,
+    },
 }
 
 struct Drive {
@@ -615,14 +646,38 @@ struct Drive {
     /// messages are minted, so membership gates what streams (the user
     /// message carries a replay of our own prompt).
     messages: HashMap<String, MessageId>,
+    /// Messages already closed by a completed `message.updated` (the
+    /// completed snapshot republishes, so each closes once).
+    ended: HashSet<String>,
+    /// Highest assistant `msg_…` id ever minted. Ids sort by creation time,
+    /// so an unknown id at or below it is a bookkeeping republish of a
+    /// settled turn (an abort replays its message), never new content.
+    tide: String,
     /// `prt_…` id → (kind, bytes already emitted), for delta/snapshot dedup.
     parts: HashMap<String, PartState>,
     /// Tool snapshots by `callID`, for the permission that references one.
     tools: HashMap<String, ToolUpdate>,
-    requests: HashMap<RequestId, PendingRequest>,
+    /// Task-tool child sessions of this turn; their permission and question
+    /// asks reach the caller, and bound children's turn content streams
+    /// under their spawning tool call.
+    children: HashSet<String>,
+    /// Child session id → spawning task-tool call, for transcript nesting.
+    /// Bound at `session.created`; cleared with `children` at turn end.
+    child_of: HashMap<String, ToolId>,
+    /// Own task-tool `callID`s in first-seen order, for oldest-unbound
+    /// binding. A child's own task tools stay out: grandchildren bind
+    /// through their parent, never through this list.
+    spawn_order: Vec<String>,
+    /// Child assistant `msg_…` id → spawning task-tool call, so the turn-end
+    /// sweep closes stragglers under the right parent.
+    child_messages: HashMap<String, ToolId>,
+    requests: HashMap<RequestId, Pending>,
     /// Session cost so far, summed over step-finishes.
     cost: f64,
     turn: Turn,
+    /// When a taken prompt must have gone busy by; a dropped one fails
+    /// loudly instead of hanging the deterministic turn forever.
+    admit_deadline: Option<tokio::time::Instant>,
     /// A cancel is in flight, so the next idle is a cancellation.
     aborting: bool,
     /// The running turn's failure, from an assistant message error.
@@ -676,6 +731,11 @@ impl Drive {
                         break;
                     }
                 },
+                _ = admission(self.admit_deadline), if self.turn == Turn::Sent => {
+                    if self.check_admission().await.is_err() {
+                        break;
+                    }
+                }
             }
         }
         self.server.shutdown(CLOSE_GRACE).await;
@@ -717,46 +777,55 @@ impl Drive {
         Ok(())
     }
 
-    /// Sends the prompt, or routes a `/command` to its own endpoint. A wire
-    /// rejection fails the turn the engine already started.
+    /// Sends the prompt, or routes an advertised `/command` to its own
+    /// endpoint; other `/…` text is plain text. A wire rejection fails the
+    /// turn the engine already started.
     async fn start_turn(&mut self, input: &Input) -> Result<(), Gone> {
         let loaded = attach::load(&input.attachments).await;
         for problem in loaded.iter().filter_map(|l| l.problem.clone()) {
             self.diagnostic(DiagnosticLevel::Warning, problem).await?;
         }
         let text = attach::with_refs(input.as_text(), &loaded);
-        let (path, body) = match slash_command(&text) {
-            Some((command, arguments)) => (
-                format!("/session/{}/command", self.session_id),
-                json!({ "command": command, "arguments": arguments }),
-            ),
-            None => {
-                let mut parts = vec![json!({ "type": "text", "text": text })];
-                for image in loaded.iter().filter_map(|l| l.image.as_ref()) {
-                    parts.push(json!({
-                        "type": "file",
-                        "mime": image.mime,
-                        "url": format!("data:{};base64,{}", image.mime, image.base64),
-                    }));
-                }
-                let mut body = json!({ "parts": parts });
-                if let Some(model) = self.model_body() {
-                    body["model"] = model;
-                }
-                if let Some(ConfigValue::Text(effort)) = self
-                    .info
-                    .configuration
-                    .options
-                    .get(&ConfigId::new("effort"))
-                {
-                    body["variant"] = json!(effort);
-                }
-                (format!("/session/{}/prompt_async", self.session_id), body)
+        if let Some((command, arguments)) =
+            slash_command(&text).filter(|(name, _)| self.has_command(name))
+        {
+            if loaded.iter().any(|l| l.image.is_some()) {
+                self.diagnostic(
+                    DiagnosticLevel::Warning,
+                    "images do not ride slash commands and were dropped",
+                )
+                .await?;
             }
-        };
+            return self.start_command(command, arguments);
+        }
+        let mut parts = vec![json!({ "type": "text", "text": text })];
+        for image in loaded.iter().filter_map(|l| l.image.as_ref()) {
+            parts.push(json!({
+                "type": "file",
+                "mime": image.mime,
+                "url": format!("data:{};base64,{}", image.mime, image.base64),
+            }));
+        }
+        let mut body = json!({ "parts": parts });
+        if let Some(model) = self.model_body() {
+            body["model"] = model;
+        }
+        if let Some(ConfigValue::Text(effort)) = self
+            .info
+            .configuration
+            .options
+            .get(&ConfigId::new("effort"))
+        {
+            body["variant"] = json!(effort);
+        }
+        let path = format!("/session/{}/prompt_async", self.session_id);
         match self.http.post(&path, body).await {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                self.admit_deadline = Some(tokio::time::Instant::now() + ADMIT_TIMEOUT);
+                Ok(())
+            }
             Err(e) => {
+                self.turn = Turn::Idle;
                 self.emit(DriverEvent::TurnEnded(StopReason::Failed {
                     message: e.to_string(),
                 }))
@@ -765,27 +834,101 @@ impl Drive {
         }
     }
 
+    /// Runs a `/command` turn. The endpoint is synchronous (it answers with
+    /// the finished message), so the POST runs off the loop with its body
+    /// dropped: the bus streams the same turn and its idle ends it, while a
+    /// rejection surfaces as a diagnostic and the admission check fails the
+    /// turn.
+    fn start_command(&mut self, command: String, arguments: String) -> Result<(), Gone> {
+        let mut body = json!({ "command": command, "arguments": arguments });
+        if let Some(model) = current_model(&self.info) {
+            body["model"] = Value::from(model);
+        }
+        let http = self.http.clone();
+        let path = format!("/session/{}/command", self.session_id);
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            if let Err(e) = http.post_unbounded(&path, body).await {
+                let kind = EventKind::Diagnostic(Diagnostic {
+                    level: DiagnosticLevel::Warning,
+                    message: format!("command rejected: {e}"),
+                });
+                events.send(DriverEvent::event(kind)).await.ok();
+            }
+        });
+        self.admit_deadline = Some(tokio::time::Instant::now() + ADMIT_TIMEOUT);
+        Ok(())
+    }
+
+    /// Whether `/name` is one of the server's advertised commands.
+    fn has_command(&self, name: &str) -> bool {
+        self.info.details.commands.iter().any(|c| c.name == name)
+    }
+
     /// Routes one SSE frame by type, ignoring frames for other sessions.
     async fn handle_frame(&mut self, frame: &Value) -> Result<(), Gone> {
+        // Insurance against the envelope drift that broke T3 (#2691): a
+        // future server may wrap events as `{payload: {type, properties}}`.
+        let frame = frame
+            .get("payload")
+            .filter(|p| p.is_object())
+            .unwrap_or(frame);
         let props = &frame["properties"];
         let kind = frame["type"].as_str().unwrap_or_default();
         // Global frames (`server.connected`, installation notices) have no
         // session; session frames not ours are other sessions on the bus.
+        // A task-tool child's input requests reach the caller (it stalls
+        // parked otherwise), and a bound child's turn content streams under
+        // its spawning tool call. Turn state (busy/idle/admission) never
+        // listens to child frames, and an abort of the root cascades to
+        // children server-side (probed 2026-09-04).
         if let Some(session) = props["sessionID"].as_str()
             && session != self.session_id
         {
-            return Ok(());
+            // `session.created` frames carry the newborn's own id; one whose
+            // parent is ours registers a child.
+            if kind == "session.created" {
+                self.on_session_created(&props["info"]);
+                return Ok(());
+            }
+            if !self.children.contains(session) {
+                return Ok(());
+            }
+            // An unbound child's content is dropped: no transcript beats a
+            // misattributed one.
+            let parent = self.child_of.get(session).cloned();
+            return match kind {
+                "permission.asked" => self.on_permission(props).await,
+                "question.asked" => self.on_question(props).await,
+                "message.updated" if parent.is_some() => self.on_message(props, parent).await,
+                "message.part.updated" if parent.is_some() => {
+                    self.on_part(&props["part"], parent).await
+                }
+                "message.part.delta" if parent.is_some() => self.on_delta(props, parent).await,
+                _ => Ok(()),
+            };
         }
-        // Bookkeeping trails every idle (title, diff, re-published messages)
-        // and an abort emits a second idle, so only a prompted turn's frames
-        // are decoded, and only a busy turn's idle ends it.
+        // The generated title lands as post-idle bookkeeping, so it is read
+        // before the turn gate.
+        if kind == "session.updated" {
+            return self.on_session_updated(&props["info"]).await;
+        }
+        // Bookkeeping trails every idle (diff, re-published messages) and an
+        // abort emits a second idle, so only a prompted turn's frames are
+        // decoded, and only a busy turn's idle ends it.
         if self.turn == Turn::Idle && kind != "session.error" {
             return Ok(());
         }
         match kind {
-            "session.status" if props["status"]["type"].as_str() == Some("busy") => {
+            "session.status" if busy_status(&props["status"]) => {
                 if self.turn == Turn::Sent {
                     self.turn = Turn::Busy;
+                }
+                if props["status"]["type"].as_str() == Some("retry") {
+                    let message = props["status"]["message"]
+                        .as_str()
+                        .unwrap_or("the provider is retrying");
+                    return self.diagnostic(DiagnosticLevel::Info, message).await;
                 }
                 Ok(())
             }
@@ -799,9 +942,9 @@ impl Drive {
                     self.on_idle().await
                 }
             }
-            "message.updated" => self.on_message(props).await,
-            "message.part.updated" => self.on_part(&props["part"]).await,
-            "message.part.delta" => self.on_delta(props).await,
+            "message.updated" => self.on_message(props, None).await,
+            "message.part.updated" => self.on_part(&props["part"], None).await,
+            "message.part.delta" => self.on_delta(props, None).await,
             "permission.asked" => self.on_permission(props).await,
             "question.asked" => self.on_question(props).await,
             "session.compacted" => self.emit_kind(EventKind::ContextCompacted).await,
@@ -811,9 +954,13 @@ impl Drive {
         }
     }
 
-    /// An assistant message: mint its streaming id and record any error. The
-    /// user-role echo of our own prompt is dropped.
-    async fn on_message(&mut self, props: &Value) -> Result<(), Gone> {
+    /// An assistant message: mint its streaming id, record any error, and
+    /// close it once the server marks it completed (a turn can hold several
+    /// assistant messages). The user-role echo of our own prompt is dropped.
+    /// A bound child's message streams under its task tool (`parent`): no
+    /// tide gate (that guards our own settled-turn republishes) and no turn
+    /// failure capture — the child's failure surfaces through its task tool.
+    async fn on_message(&mut self, props: &Value, parent: Option<ToolId>) -> Result<(), Gone> {
         let info = &props["info"];
         if info["role"].as_str() != Some("assistant") {
             return Ok(());
@@ -821,35 +968,114 @@ impl Drive {
         let Some(oc_id) = info["id"].as_str() else {
             return Ok(());
         };
-        self.message_id(oc_id);
-        if let Some(error) = info.get("error").filter(|e| !e.is_null()) {
+        // A republished message of a settled turn must not re-mint: its
+        // part snapshots would stream into the next turn.
+        if parent.is_none() && !self.messages.contains_key(oc_id) && oc_id <= self.tide.as_str() {
+            return Ok(());
+        }
+        let message_id = self.message_id(oc_id);
+        if let Some(parent) = &parent {
+            self.child_messages.insert(oc_id.to_owned(), parent.clone());
+        } else if let Some(error) = info.get("error").filter(|e| !e.is_null()) {
             self.turn_error = Some(message_error(error));
         }
-        Ok(())
+        if info["time"]["completed"].is_null() || !self.ended.insert(oc_id.to_owned()) {
+            return Ok(());
+        }
+        self.end_message(oc_id.to_owned(), message_id, parent).await
+    }
+
+    /// `MessageEnded`, carrying the message's own id as the fork anchor:
+    /// opencode can fork at any message boundary, and ids sort by time.
+    /// A child's close rides its task tool and carries no fork anchor.
+    async fn end_message(
+        &mut self,
+        oc_id: String,
+        message_id: MessageId,
+        parent: Option<ToolId>,
+    ) -> Result<(), Gone> {
+        let mut extensions = Extensions::new();
+        if parent.is_none() {
+            extensions.insert("opencode/fork_point".into(), Value::from(oc_id));
+        }
+        self.emit(DriverEvent::Event {
+            kind: EventKind::MessageEnded { message_id },
+            parent_tool_id: parent,
+            extensions,
+        })
+        .await
+    }
+
+    /// Registers a task-tool child: a newborn session whose parent is us or
+    /// one of ours. A direct child binds to its spawning task tool (oldest
+    /// still-running spawn without a child of its own); a grandchild binds
+    /// through its parent. Parallel same-parent tasks can misattribute —
+    /// documented, accepted: nesting under a sibling beats silence, and an
+    /// unbound child stays silent rather than guessing.
+    fn on_session_created(&mut self, info: &Value) {
+        let (Some(id), Some(parent)) = (info["id"].as_str(), info["parentID"].as_str()) else {
+            return;
+        };
+        if parent == self.session_id {
+            self.children.insert(id.to_owned());
+            if let Some(spawn) = select_spawn(&self.spawn_order, &self.tools, &self.child_of) {
+                self.child_of.insert(id.to_owned(), spawn);
+            }
+        } else if self.children.contains(parent) {
+            self.children.insert(id.to_owned());
+            if let Some(spawn) = self.child_of.get(parent).cloned() {
+                self.child_of.insert(id.to_owned(), spawn);
+            }
+        }
+    }
+
+    /// Post-turn bookkeeping renames the session; a real (non-placeholder)
+    /// title is advertised.
+    async fn on_session_updated(&mut self, info: &Value) -> Result<(), Gone> {
+        if info["id"].as_str() != Some(self.session_id.as_str()) {
+            return Ok(());
+        }
+        let Some(title) = real_title(&info["title"]) else {
+            return Ok(());
+        };
+        if self.info.title.as_ref() == Some(&title) {
+            return Ok(());
+        }
+        self.info.title = Some(title);
+        self.emit(DriverEvent::InfoChanged(self.info.clone())).await
     }
 
     /// One part snapshot: stream text and reasoning, track tools. Parts of the
-    /// user message (our own prompt) are ignored.
-    async fn on_part(&mut self, part: &Value) -> Result<(), Gone> {
+    /// user message (our own prompt) are ignored. A bound child's parts ride
+    /// its task tool (`parent`); its step finishes stay out — usage
+    /// attribution across models is murky, so fail silent, not wrong.
+    async fn on_part(&mut self, part: &Value, parent: Option<ToolId>) -> Result<(), Gone> {
         let oc_id = part["messageID"].as_str().unwrap_or_default();
         let Some(message_id) = self.messages.get(oc_id).cloned() else {
             return Ok(());
         };
         match part["type"].as_str().unwrap_or_default() {
-            "text" => self.stream_part(part, PartKind::Text, message_id).await,
-            "reasoning" => {
-                self.stream_part(part, PartKind::Reasoning, message_id)
+            "text" => {
+                self.stream_part(part, PartKind::Text, message_id, parent)
                     .await
             }
-            "tool" if part["tool"].as_str() == Some("todowrite") => self.on_plan(part).await,
-            "tool" => self.on_tool(part).await,
-            "step-finish" => self.on_step_finish(part).await,
+            "reasoning" => {
+                self.stream_part(part, PartKind::Reasoning, message_id, parent)
+                    .await
+            }
+            "tool" if part["tool"].as_str() == Some("todowrite") => {
+                self.on_plan(part, parent).await
+            }
+            // Questions surface as requests (`question.asked`), not tools.
+            "tool" if part["tool"].as_str() == Some("question") => Ok(()),
+            "tool" => self.on_tool(part, parent).await,
+            "step-finish" if parent.is_none() => self.on_step_finish(part).await,
             _ => Ok(()),
         }
     }
 
     /// A token-level delta for a known text or reasoning part.
-    async fn on_delta(&mut self, props: &Value) -> Result<(), Gone> {
+    async fn on_delta(&mut self, props: &Value, parent: Option<ToolId>) -> Result<(), Gone> {
         if props["field"].as_str() != Some("text") {
             return Ok(());
         }
@@ -862,8 +1088,12 @@ impl Drive {
         let kind = state.kind;
         let delta = props["delta"].as_str().unwrap_or_default().to_owned();
         state.emitted += delta.len();
-        let message_id = self.message_id(props["messageID"].as_str().unwrap_or_default());
-        self.emit_text(kind, message_id, delta).await
+        let oc_id = props["messageID"].as_str().unwrap_or_default();
+        let message_id = self.message_id(oc_id);
+        if let Some(parent) = &parent {
+            self.child_messages.insert(oc_id.to_owned(), parent.clone());
+        }
+        self.emit_text(kind, message_id, delta, parent).await
     }
 
     /// Emits whatever of a part's full snapshot has not been streamed yet.
@@ -872,6 +1102,7 @@ impl Drive {
         part: &Value,
         kind: PartKind,
         message_id: MessageId,
+        parent: Option<ToolId>,
     ) -> Result<(), Gone> {
         let text = part["text"].as_str().unwrap_or_default();
         let part_id = part["id"].as_str().unwrap_or_default().to_owned();
@@ -882,9 +1113,14 @@ impl Drive {
         if text.len() <= state.emitted {
             return Ok(());
         }
-        let delta = text[state.emitted..].to_owned();
+        // A revised snapshot (not prefixed by the streamed deltas) can put
+        // the cut inside a multi-byte character; dropping it is safe — the
+        // deltas carry the live content and the next snapshot retries.
+        let Some(delta) = text.get(state.emitted..).map(str::to_owned) else {
+            return Ok(());
+        };
         state.emitted = text.len();
-        self.emit_text(kind, message_id, delta).await
+        self.emit_text(kind, message_id, delta, parent).await
     }
 
     async fn emit_text(
@@ -892,16 +1128,24 @@ impl Drive {
         kind: PartKind,
         message_id: MessageId,
         text: String,
+        parent: Option<ToolId>,
     ) -> Result<(), Gone> {
         let kind = match kind {
             PartKind::Text => EventKind::TextDelta { message_id, text },
             PartKind::Reasoning => EventKind::ReasoningDelta { message_id, text },
         };
-        self.emit_kind(kind).await
+        self.emit(DriverEvent::Event {
+            kind,
+            parent_tool_id: parent,
+            extensions: Extensions::new(),
+        })
+        .await
     }
 
-    /// The tool lifecycle from a `tool` part's state.
-    async fn on_tool(&mut self, part: &Value) -> Result<(), Gone> {
+    /// The tool lifecycle from a `tool` part's state. A child's tools ride
+    /// its task tool; own task tools register spawn order for child binding
+    /// (a grandchild binds through its parent, never through this list).
+    async fn on_tool(&mut self, part: &Value, parent: Option<ToolId>) -> Result<(), Gone> {
         let call_id = part["callID"].as_str().unwrap_or_default().to_owned();
         let name = part["tool"].as_str().unwrap_or_default();
         let state = &part["state"];
@@ -911,20 +1155,37 @@ impl Drive {
             .unwrap_or_else(|| fresh_tool(&call_id, name));
         apply_state(&mut tool, name, state);
         let done = matches!(tool.status, ToolStatus::Completed | ToolStatus::Failed);
+        if parent.is_none()
+            && tool.kind == ToolKind::Subagent
+            && !done
+            && !self.spawn_order.contains(&call_id)
+        {
+            self.spawn_order.push(call_id.clone());
+        }
         if !done {
             self.tools.insert(call_id, tool.clone());
         }
-        self.emit_kind(EventKind::ToolUpdated(tool)).await
+        self.emit(DriverEvent::Event {
+            kind: EventKind::ToolUpdated(tool),
+            parent_tool_id: parent,
+            extensions: Extensions::new(),
+        })
+        .await
     }
 
     /// The agent's task list is a plan, not a tool call: one snapshot per
-    /// finished write.
-    async fn on_plan(&mut self, part: &Value) -> Result<(), Gone> {
+    /// finished write. A child's plan rides its task tool, never the
+    /// parent's plan chip.
+    async fn on_plan(&mut self, part: &Value, parent: Option<ToolId>) -> Result<(), Gone> {
         if part["state"]["status"].as_str() != Some("completed") {
             return Ok(());
         }
-        self.emit_kind(EventKind::PlanUpdated {
-            entries: plan_entries(&part["state"]["input"]["todos"]),
+        self.emit(DriverEvent::Event {
+            kind: EventKind::PlanUpdated {
+                entries: plan_entries(&part["state"]["input"]["todos"]),
+            },
+            parent_tool_id: parent,
+            extensions: Extensions::new(),
         })
         .await
     }
@@ -933,9 +1194,21 @@ impl Drive {
     async fn on_step_finish(&mut self, part: &Value) -> Result<(), Gone> {
         let tokens = &part["tokens"];
         self.cost += part["cost"].as_f64().unwrap_or_default();
-        let Some(used) = tokens["total"].as_u64().filter(|t| *t > 0) else {
+        // Other step-finish shapes carry the components without a `total`.
+        let sum = |v: &Value| v.as_u64().unwrap_or_default();
+        let used = tokens["total"]
+            .as_u64()
+            .filter(|t| *t > 0)
+            .unwrap_or_else(|| {
+                sum(&tokens["input"])
+                    + sum(&tokens["output"])
+                    + sum(&tokens["reasoning"])
+                    + sum(&tokens["cache"]["read"])
+                    + sum(&tokens["cache"]["write"])
+            });
+        if used == 0 {
             return Ok(());
-        };
+        }
         self.emit_kind(EventKind::ContextUsage {
             used_tokens: used,
             window_tokens: current_model(&self.info).and_then(|m| self.windows.get(&m).copied()),
@@ -956,25 +1229,31 @@ impl Drive {
             .get(call_id)
             .cloned()
             .unwrap_or_else(|| permission_tool(props));
+        let request = Request::Permission(PermissionRequest {
+            id: id.clone(),
+            tool,
+            options: vec![
+                PermissionChoice::AllowOnce,
+                PermissionChoice::AllowAlways,
+                PermissionChoice::DenyOnce,
+            ],
+            detail: permission_detail(props),
+        });
+        let session_id = props["sessionID"]
+            .as_str()
+            .unwrap_or(&self.session_id)
+            .to_owned();
         self.requests.insert(
-            id.clone(),
-            PendingRequest::Permission {
-                permission_id: permission_id.to_owned(),
+            id,
+            Pending {
+                reply: Reply::Permission {
+                    permission_id: permission_id.to_owned(),
+                    session_id,
+                },
+                request: request.clone(),
             },
         );
-        self.emit_kind(EventKind::RequestOpened(Request::Permission(
-            PermissionRequest {
-                id,
-                tool,
-                options: vec![
-                    PermissionChoice::AllowOnce,
-                    PermissionChoice::AllowAlways,
-                    PermissionChoice::DenyOnce,
-                ],
-                detail: props["metadata"]["filepath"].as_str().map(str::to_owned),
-            },
-        )))
-        .await
+        self.emit_kind(EventKind::RequestOpened(request)).await
     }
 
     /// The question tool becomes a question request.
@@ -990,16 +1269,20 @@ impl Drive {
             .enumerate()
             .map(|(i, q)| question(&id, i, q))
             .collect();
+        let request = Request::Question(QuestionRequest {
+            id: id.clone(),
+            questions,
+        });
         self.requests.insert(
-            id.clone(),
-            PendingRequest::Question {
-                question_id: question_id.to_owned(),
+            id,
+            Pending {
+                reply: Reply::Question {
+                    question_id: question_id.to_owned(),
+                },
+                request: request.clone(),
             },
         );
-        self.emit_kind(EventKind::RequestOpened(Request::Question(
-            QuestionRequest { id, questions },
-        )))
-        .await
+        self.emit_kind(EventKind::RequestOpened(request)).await
     }
 
     /// Replies to one open request in the shape opencode expects.
@@ -1007,8 +1290,14 @@ impl Drive {
         let Some(pending) = self.requests.remove(&request) else {
             return Ok(());
         };
-        let sent = match (pending, answer) {
-            (PendingRequest::Permission { permission_id }, Answer::Permission(choice)) => {
+        let sent = match (&pending.reply, &answer) {
+            (
+                Reply::Permission {
+                    permission_id,
+                    session_id,
+                },
+                Answer::Permission(choice),
+            ) => {
                 let response = match choice {
                     PermissionChoice::AllowOnce => "once",
                     PermissionChoice::AllowAlways => "always",
@@ -1016,28 +1305,37 @@ impl Drive {
                 };
                 self.http
                     .post(
-                        &format!("/session/{}/permissions/{permission_id}", self.session_id),
+                        &format!("/session/{session_id}/permissions/{permission_id}"),
                         json!({ "response": response }),
                     )
                     .await
             }
-            (PendingRequest::Question { question_id }, Answer::Question(answers)) => {
+            (Reply::Question { question_id }, Answer::Question(answers)) => {
                 self.http
                     .post(
                         &format!("/question/{question_id}/reply"),
-                        json!({ "answers": question_answers(&answers) }),
+                        json!({ "answers": question_answers(answers) }),
                     )
                     .await
             }
-            _ => return Ok(()),
+            // Unreachable past engine shape validation; reopen rather than
+            // leave the agent parked on a silently dropped request.
+            _ => {
+                let reopened = pending.request.clone();
+                self.requests.insert(request, pending);
+                return self.emit_kind(EventKind::RequestOpened(reopened)).await;
+            }
         };
-        // The engine has already closed the request; a refusal is reported,
-        // and the agent stays parked on it until its turn is cancelled.
         match sent {
             Ok(_) => Ok(()),
+            // The agent is still parked on it: report the refusal and reopen
+            // the request under the same id so the caller can answer again.
             Err(e) => {
                 self.diagnostic(DiagnosticLevel::Warning, format!("answer not taken: {e}"))
-                    .await
+                    .await?;
+                let reopened = pending.request.clone();
+                self.requests.insert(request, pending);
+                self.emit_kind(EventKind::RequestOpened(reopened)).await
             }
         }
     }
@@ -1052,23 +1350,32 @@ impl Drive {
                 source: CompletionSource::Protocol,
             })
         };
-        // The turn's last assistant message anchors `fork_from(_, at)`;
-        // opencode ids sort by time. Its `MessageEnded` carries the anchor.
-        let last = self.messages.iter().max_by(|a, b| a.0.cmp(b.0));
-        if let Some((oc_id, message_id)) = last.map(|(o, m)| (o.clone(), m.clone())) {
-            let mut extensions = Extensions::new();
-            extensions.insert("opencode/fork_point".into(), Value::from(oc_id));
-            self.emit(DriverEvent::Event {
-                kind: EventKind::MessageEnded { message_id },
-                parent_tool_id: None,
-                extensions,
-            })
-            .await?;
+        // An aborted message never completes; close whatever is still open,
+        // in time order — a straggler from a bound child closes under its
+        // task tool.
+        let mut open: Vec<_> = self
+            .messages
+            .iter()
+            .filter(|(oc_id, _)| !self.ended.contains(*oc_id))
+            .map(|(o, m)| (o.clone(), m.clone()))
+            .collect();
+        open.sort();
+        for (oc_id, message_id) in open {
+            let parent = self.child_messages.get(&oc_id).cloned();
+            self.end_message(oc_id, message_id, parent).await?;
         }
-        // A settled turn leaves nothing more for its parts or tools.
+        // A settled turn leaves nothing more for its parts, tools, children,
+        // child bindings, or an unanswered dialog (the engine already closed
+        // the request).
         self.parts.clear();
         self.tools.clear();
         self.messages.clear();
+        self.ended.clear();
+        self.children.clear();
+        self.child_of.clear();
+        self.spawn_order.clear();
+        self.child_messages.clear();
+        self.requests.clear();
         self.emit(DriverEvent::TurnEnded(stop)).await
     }
 
@@ -1087,10 +1394,19 @@ impl Drive {
             Some("MessageAbortedError") => Ok(()),
             _ if self.turn == Turn::Idle => Ok(()),
             _ => {
+                // The turn is failing; idle normally follows and reports it.
+                // A turn that died outright is already idle server-side and
+                // sends nothing more, so settle now.
                 let message = error["data"]["message"]
                     .as_str()
                     .unwrap_or("the agent reported an error");
-                self.diagnostic(DiagnosticLevel::Error, message).await
+                self.turn_error = Some(StopReason::Failed {
+                    message: message.to_owned(),
+                });
+                if self.turn == Turn::Busy && !self.server_busy().await {
+                    return self.on_idle().await;
+                }
+                Ok(())
             }
         }
     }
@@ -1118,6 +1434,8 @@ impl Drive {
     }
 
     /// Drops the rolled-back turns; opencode restores conversation, not files.
+    /// Note `GET /message` still lists reverted messages afterward: the revert
+    /// trims the model's context, not the listing.
     async fn rollback(&mut self, turns: u32) -> Result<(), Gone> {
         let messages = self
             .http
@@ -1184,12 +1502,32 @@ impl Drive {
     }
 
     /// Whether the server still reports this session busy. An unreachable
-    /// server counts as idle: it is dying, and the bus closing follows.
+    /// server counts as idle: it is dying, and the bus closing follows. The
+    /// short timeout keeps a wedged handler from stalling the drive loop.
     async fn server_busy(&self) -> bool {
-        match self.http.get("/session/status").await {
-            Ok(status) => status[&self.session_id]["type"].as_str() == Some("busy"),
+        match self.http.get_quick("/session/status").await {
+            Ok(status) => busy_status(&status[&self.session_id]),
             Err(_) => false,
         }
+    }
+
+    /// The admission deadline passed without the server going busy: adopt a
+    /// busy whose frame was missed, or end the turn rather than hang. A
+    /// cancel taken while the prompt sat unadmitted ends it as cancelled.
+    async fn check_admission(&mut self) -> Result<(), Gone> {
+        if self.server_busy().await {
+            self.turn = Turn::Busy;
+            return Ok(());
+        }
+        self.turn = Turn::Idle;
+        let stop = if std::mem::take(&mut self.aborting) {
+            StopReason::Cancelled
+        } else {
+            self.turn_error.take().unwrap_or(StopReason::Failed {
+                message: "opencode took the prompt but never started on it".into(),
+            })
+        };
+        self.emit(DriverEvent::TurnEnded(stop)).await
     }
 
     /// Mints the next request id.
@@ -1202,6 +1540,9 @@ impl Drive {
     fn message_id(&mut self, oc_id: &str) -> MessageId {
         if let Some(id) = self.messages.get(oc_id) {
             return id.clone();
+        }
+        if oc_id > self.tide.as_str() {
+            self.tide = oc_id.to_owned();
         }
         self.next_message += 1;
         let id = MessageId::new(format!("m{}", self.next_message));
@@ -1238,6 +1579,47 @@ impl Drive {
 
 /// The engine or the server is gone; the drive task unwinds.
 struct Gone;
+
+/// Sleeps until the admission deadline; pends forever without one.
+async fn admission(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Busy or retrying (a provider hiccup being retried) both mean running;
+/// opencode's own client reconciles the same way.
+fn busy_status(status: &Value) -> bool {
+    matches!(status["type"].as_str(), Some("busy") | Some("retry"))
+}
+
+/// The spawn a newborn direct child binds to: oldest still-running spawn
+/// without a child of its own. `None` leaves the child unbound (silent).
+fn select_spawn(
+    spawn_order: &[String],
+    tools: &HashMap<String, ToolUpdate>,
+    child_of: &HashMap<String, ToolId>,
+) -> Option<ToolId> {
+    let taken: HashSet<&str> = child_of.values().map(ToolId::as_str).collect();
+    spawn_order
+        .iter()
+        .filter(|call| !taken.contains(call.as_str()))
+        .filter_map(|call| tools.get(call.as_str()))
+        .filter(|tool| {
+            tool.kind == ToolKind::Subagent
+                && matches!(tool.status, ToolStatus::Pending | ToolStatus::Running)
+        })
+        .map(|tool| tool.id.clone())
+        .next()
+}
+
+/// A session title that is not the server's dated placeholder.
+fn real_title(title: &Value) -> Option<String> {
+    let title = title.as_str().filter(|t| !t.is_empty())?;
+    let placeholder = title.starts_with("New session - ") || title.starts_with("Child session - ");
+    (!placeholder).then(|| title.to_owned())
+}
 
 // ---------------------------------------------------------------------------
 // Frame decoding
@@ -1277,6 +1659,7 @@ fn tool_kind(name: &str) -> ToolKind {
         "edit" | "write" | "patch" => ToolKind::Edit,
         "grep" | "glob" => ToolKind::Search,
         "webfetch" => ToolKind::Fetch,
+        "task" => ToolKind::Subagent,
         _ => ToolKind::Other,
     }
 }
@@ -1350,14 +1733,34 @@ fn tool_title(name: &str, input: &ToolInput) -> String {
     }
 }
 
-/// A stub tool for a permission that names no tracked call.
+/// A stub tool for a permission that names no tracked call, so the approval
+/// card still shows what it approves.
 fn permission_tool(props: &Value) -> ToolUpdate {
     let name = props["permission"].as_str().unwrap_or("tool");
     let mut tool = fresh_tool(props["tool"]["callID"].as_str().unwrap_or_default(), name);
-    if let Some(path) = props["metadata"]["filepath"].as_str() {
+    if let Some(command) = props["metadata"]["command"].as_str() {
+        set_input(
+            &mut tool,
+            name,
+            ToolInput::Command {
+                command: command.to_owned(),
+                cwd: None,
+            },
+        );
+    } else if let Some(path) = props["metadata"]["filepath"].as_str() {
         set_input(&mut tool, name, ToolInput::Path(path.into()));
     }
     tool
+}
+
+/// The most telling detail of a permission: the command or file it covers,
+/// else its first pattern.
+fn permission_detail(props: &Value) -> Option<String> {
+    props["metadata"]["command"]
+        .as_str()
+        .or_else(|| props["metadata"]["filepath"].as_str())
+        .or_else(|| props["patterns"][0].as_str())
+        .map(str::to_owned)
 }
 
 /// One assistant-message error as a stop reason.
@@ -1457,19 +1860,63 @@ struct Http {
     directory: String,
     /// The `Authorization` header value.
     auth: String,
+    /// Tees outgoing requests when wire recording is on.
+    recorder: Option<WireRecorder>,
 }
+
+/// How long a request/response call may take; a wedged server must not
+/// block the drive loop (and with it cancel and close) forever.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Status reads reconcile turn ends inline in the drive loop, so they get
+/// a much shorter leash.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(3);
 
 impl Http {
     async fn get(&self, path: &str) -> Result<Value, AgentError> {
-        self.request("GET", path, None).await
+        self.request("GET", path, None, Some(HTTP_TIMEOUT)).await
+    }
+
+    /// A GET that must answer fast or not at all (status reconciles).
+    async fn get_quick(&self, path: &str) -> Result<Value, AgentError> {
+        self.request("GET", path, None, Some(STATUS_TIMEOUT)).await
     }
 
     async fn post(&self, path: &str, body: Value) -> Result<Value, AgentError> {
-        self.request("POST", path, Some(body)).await
+        self.request("POST", path, Some(body), Some(HTTP_TIMEOUT))
+            .await
+    }
+
+    /// A POST that legitimately runs as long as a turn (`/command` answers
+    /// with the finished message); callers run it off the drive loop.
+    async fn post_unbounded(&self, path: &str, body: Value) -> Result<Value, AgentError> {
+        self.request("POST", path, Some(body), None).await
     }
 
     /// Sends one request and returns the decoded JSON body (or `Null`).
     async fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        limit: Option<Duration>,
+    ) -> Result<Value, AgentError> {
+        if let Some(recorder) = &self.recorder {
+            recorder.record(
+                "out",
+                &json!({ "method": method, "path": path, "body": body }),
+            );
+        }
+        let io = self.exchange(method, path, body);
+        match limit {
+            Some(limit) => tokio::time::timeout(limit, io)
+                .await
+                .map_err(|_| AgentError::ProtocolFailed(format!("{method} {path} timed out")))?,
+            None => io.await,
+        }
+    }
+
+    /// One connection, one request, one length-framed response.
+    async fn exchange(
         &self,
         method: &str,
         path: &str,
@@ -1661,11 +2108,13 @@ impl SseDecoder {
         let mut frames = Vec::new();
         while let Some(end) = self.body.windows(2).position(|w| w == b"\n\n") {
             let frame: Vec<u8> = self.body.drain(..end + 2).collect();
-            let data: String = String::from_utf8_lossy(&frame)
+            // Multiple `data:` lines are one payload joined by `\n` (SSE spec).
+            let data = String::from_utf8_lossy(&frame)
                 .lines()
                 .filter_map(|line| line.strip_prefix("data:"))
                 .map(|line| line.strip_prefix(' ').unwrap_or(line))
-                .collect();
+                .collect::<Vec<_>>()
+                .join("\n");
             if !data.is_empty() {
                 frames.push(data);
             }
@@ -1888,6 +2337,120 @@ mod tests {
         assert_eq!(choices.len(), 1);
         assert_eq!(choices[0].value, "opencode/big-pickle");
         assert_eq!(choices[0].label, "Big Pickle");
+    }
+
+    #[test]
+    fn sse_decoder_joins_multi_data_lines_with_newline() {
+        let mut sse = SseDecoder::new(false);
+        let frames = sse.feed(b"data: {\"a\":\ndata: 1}\n\n");
+        assert_eq!(frames, vec!["{\"a\":\n1}"]);
+    }
+
+    #[test]
+    fn real_title_drops_the_dated_placeholders() {
+        assert_eq!(
+            real_title(&json!("New session - 2026-09-04T00:56:28.393Z")),
+            None
+        );
+        assert_eq!(real_title(&json!("Child session - 2026-09-04")), None);
+        assert_eq!(real_title(&json!("")), None);
+        assert_eq!(real_title(&json!(null)), None);
+        assert_eq!(
+            real_title(&json!("Fix the adapter")),
+            Some("Fix the adapter".into())
+        );
+    }
+
+    #[test]
+    fn busy_status_counts_retry_as_busy() {
+        assert!(busy_status(&json!({ "type": "busy" })));
+        assert!(busy_status(&json!({ "type": "retry" })));
+        assert!(!busy_status(&json!({ "type": "idle" })));
+        assert!(!busy_status(&json!(null)));
+    }
+
+    /// A task tool plus the selection inputs around it.
+    fn spawn(call: &str, status: ToolStatus) -> (String, ToolUpdate) {
+        let mut tool = fresh_tool(call, "task");
+        tool.status = status;
+        (call.to_owned(), tool)
+    }
+
+    #[test]
+    fn select_spawn_prefers_the_oldest_running_unbound_spawn() {
+        let mut tools = HashMap::new();
+        let (a, tool_a) = spawn("call_a", ToolStatus::Running);
+        let (b, tool_b) = spawn("call_b", ToolStatus::Running);
+        tools.insert(a.clone(), tool_a);
+        tools.insert(b.clone(), tool_b);
+        let order = vec![a.clone(), b.clone()];
+        // Nothing bound: oldest wins.
+        assert_eq!(
+            select_spawn(&order, &tools, &HashMap::new()).as_ref(),
+            Some(&ToolId::new(a.clone()))
+        );
+        // First bound elsewhere: second wins.
+        let bound = HashMap::from([("ses_child".to_owned(), ToolId::new(a.clone()))]);
+        assert_eq!(
+            select_spawn(&order, &tools, &bound).as_ref(),
+            Some(&ToolId::new(b.clone()))
+        );
+    }
+
+    #[test]
+    fn select_spawn_skips_settled_and_non_task_tools() {
+        let mut tools = HashMap::new();
+        let (done, tool_done) = spawn("call_done", ToolStatus::Completed);
+        tools.insert(done, tool_done);
+        let mut read = fresh_tool("call_read", "read");
+        read.status = ToolStatus::Running;
+        tools.insert("call_read".into(), read);
+        let order = vec!["call_done".to_owned(), "call_read".to_owned()];
+        assert_eq!(select_spawn(&order, &tools, &HashMap::new()), None);
+    }
+
+    #[test]
+    fn permission_carries_the_command_it_covers() {
+        // The live `permission.asked` shape for bash (captured 2026-09-03).
+        let props = json!({
+            "id": "per_1", "permission": "bash",
+            "patterns": ["echo hi"], "metadata": { "command": "echo hi" },
+            "tool": { "messageID": "msg_1", "callID": "call_1" },
+        });
+        assert_eq!(permission_detail(&props).as_deref(), Some("echo hi"));
+        let tool = permission_tool(&props);
+        assert_eq!(tool.title, "bash echo hi");
+        assert!(
+            matches!(tool.input, ToolInput::Command { ref command, .. } if command == "echo hi")
+        );
+    }
+
+    #[test]
+    fn user_anchor_counts_user_turns_from_the_tip() {
+        let messages = json!([
+            { "info": { "id": "msg_1", "role": "user" } },
+            { "info": { "id": "msg_2", "role": "assistant" } },
+            { "info": { "id": "msg_3", "role": "user" } },
+            { "info": { "id": "msg_4", "role": "assistant" } },
+        ]);
+        assert_eq!(user_anchor(&messages, 1), Some("msg_3".into()));
+        assert_eq!(user_anchor(&messages, 2), Some("msg_1".into()));
+        assert_eq!(user_anchor(&messages, 3), None);
+    }
+
+    #[test]
+    fn question_answers_flatten_choices_and_text() {
+        let answers = vec![
+            QuestionAnswer::Choices(vec![ChoiceId::new("Red"), ChoiceId::new("Blue")]),
+            QuestionAnswer::Text("free form".into()),
+        ];
+        assert_eq!(
+            question_answers(&answers),
+            vec![
+                vec!["Red".to_owned(), "Blue".to_owned()],
+                vec!["free form".to_owned()]
+            ]
+        );
     }
 
     #[test]

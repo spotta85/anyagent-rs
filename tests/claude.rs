@@ -466,6 +466,15 @@ async fn the_handshake_fills_details() {
     };
     let levels: Vec<&str> = choices.iter().map(|c| c.value.as_str()).collect();
     assert_eq!(levels, ["low", "medium", "high", "xhigh", "max"]);
+    // Fast mode: a live boolean, off until configured, only on supported models.
+    let fast = details
+        .config_options
+        .iter()
+        .find(|o| o.id.as_str() == "fast")
+        .unwrap();
+    assert!(fast.live);
+    assert_eq!(fast.kind, ConfigKind::Boolean);
+    assert_eq!(fast.current, Some(ConfigValue::Bool(false)));
     // The adapter mints the session id, so the token exists before any turn.
     assert!(session.info().resume_token.is_some());
     session.close().await.unwrap();
@@ -1021,8 +1030,9 @@ async fn creation_time_config_rides_the_launch_args_and_unknown_ids_are_refused(
             &agent,
             SessionOptions::in_dir(std::env::temp_dir())
                 .configure("mode", "plan")
-                .configure("model", "sonnet")
-                .configure("effort", "low"),
+                .configure("model", "default")
+                .configure("effort", "low")
+                .configure("fast", true),
         )
         .await
         .unwrap();
@@ -1035,11 +1045,16 @@ async fn creation_time_config_rides_the_launch_args_and_unknown_ids_are_refused(
     );
     assert_eq!(
         info.configuration.options.get(&ConfigId::new("model")),
-        Some(&ConfigValue::Text("sonnet".into()))
+        Some(&ConfigValue::Text("default".into()))
     );
     assert_eq!(
         info.configuration.options.get(&ConfigId::new("effort")),
         Some(&ConfigValue::Text("low".into()))
+    );
+    // The `--settings {"fastMode":true}` flag round-trips as state on.
+    assert_eq!(
+        info.configuration.options.get(&ConfigId::new("fast")),
+        Some(&ConfigValue::Bool(true))
     );
     assert!(info.resume_token.is_some());
     session.close().await.unwrap();
@@ -1259,23 +1274,33 @@ async fn fast_mode_toggle_relaunches_with_new_settings() {
         .unwrap();
     session.prompt("hi").await.unwrap();
     assert!(
-        complete_turn(&session, &mut events).await.contains("fast=false"),
+        complete_turn(&session, &mut events)
+            .await
+            .contains("fast=false"),
         "first turn should run without fast mode"
     );
     session.configure("fast", true).await.unwrap();
     assert_eq!(
-        session.info().configuration.options.get(&ConfigId::new("fast")),
+        session
+            .info()
+            .configuration
+            .options
+            .get(&ConfigId::new("fast")),
         Some(&ConfigValue::Bool(true))
     );
     session.prompt("hi again").await.unwrap();
     assert!(
-        complete_turn(&session, &mut events).await.contains("fast=true"),
+        complete_turn(&session, &mut events)
+            .await
+            .contains("fast=true"),
         "turn after enabling should relaunch with fast mode"
     );
     session.configure("fast", false).await.unwrap();
     session.prompt("once more").await.unwrap();
     assert!(
-        complete_turn(&session, &mut events).await.contains("fast=false"),
+        complete_turn(&session, &mut events)
+            .await
+            .contains("fast=false"),
         "turn after disabling should relaunch without fast mode"
     );
     session.close().await.unwrap();
