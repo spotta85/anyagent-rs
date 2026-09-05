@@ -28,6 +28,8 @@ use anyagent::{
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(120);
 const OPENCODE_MODEL: &str = "opencode/big-pickle";
+/// The host config's default (`gpt-6-astra`) needs a newer CLI; luna is cheap and available.
+const CODEX_MODEL: &str = "gpt-5.6-luna";
 /// pi's model values are `provider/modelId`.
 const PI_MODEL: &str = "openrouter/nvidia/nemotron-3-super-120b-a12b:free";
 const COUNT: &str = "Count from 1 to 400, one number per line. No other text. No tools.";
@@ -1190,6 +1192,7 @@ fn options(harness: &str, dir: &std::path::Path) -> SessionOptions {
         // Deterministic approvals regardless of the host config: a write
         // escalates past the read-only sandbox and asks.
         options = options
+            .configure("model", CODEX_MODEL)
             .configure("sandbox", "read-only")
             .configure("mode", "on-request");
     }
