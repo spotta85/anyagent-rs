@@ -53,6 +53,7 @@ pub(crate) struct Script {
     pub stale_before_ack: Option<EventKind>,
     /// Advertise compaction; `compact` then reports `ContextCompacted`.
     pub compact: bool,
+    pub permissions: bool,
 }
 
 impl Default for Script {
@@ -66,6 +67,7 @@ impl Default for Script {
             buffer: 64,
             stale_before_ack: None,
             compact: false,
+            permissions: true,
         }
     }
 }
@@ -215,7 +217,10 @@ async fn drive(
 }
 
 fn info(script: &Script) -> DriverInfo {
-    let mut caps = vec![Capability::Permissions, Capability::Questions];
+    let mut caps = vec![Capability::Questions];
+    if script.permissions {
+        caps.push(Capability::Permissions);
+    }
     if script.steer {
         caps.push(Capability::Steer);
     }

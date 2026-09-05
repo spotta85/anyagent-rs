@@ -839,7 +839,7 @@ async fn grok_questions_surface_typed_and_answers_return_labels() {
 /// Grok first-class models surface as live model select and switch via session/set_model.
 #[tokio::test]
 async fn grok_first_class_models_surface_as_the_model_option_and_switch_via_set_model() {
-    let (session, mut events) = open(&["--grok-models"]).await;
+    let (session, mut events) = open(&["--grok-models", "--config-slow=50"]).await;
     let details = session.info().details;
     let model = details
         .config_options
@@ -851,7 +851,7 @@ async fn grok_first_class_models_surface_as_the_model_option_and_switch_via_set_
     let anyagent::ConfigKind::Select { choices } = &model.kind else {
         panic!("expected select");
     };
-    assert_eq!(choices.len(), 2);
+    assert_eq!(choices.len(), 3);
     assert_eq!(choices[0].label, "Grok 4.5");
     assert_eq!(choices[0].description.as_deref(), Some("fast"));
 
@@ -886,6 +886,7 @@ async fn grok_first_class_models_surface_as_the_model_option_and_switch_via_set_
     // --grok-models, so this passing proves the session/set_model route.
     // The models/update that follows brings the new model's effort levels.
     session.configure("model", "grok-4.6").await.unwrap();
+    session.configure("effort", "high").await.unwrap();
     loop {
         let event = next(&mut events).await;
         if let EventKind::SessionUpdated(info) = event.kind
@@ -906,16 +907,52 @@ async fn grok_first_class_models_surface_as_the_model_option_and_switch_via_set_
     while levels(&session) != ["low", "high", "xhigh"] {
         next(&mut events).await;
     }
-    // The stale default in that models state does not undo the switch.
+    // The effort request sent before the model receipt must keep the new model.
+    while effort_option(&session).and_then(|o| o.current) != Some(ConfigValue::Text("high".into()))
+    {
+        next(&mut events).await;
+    }
     assert_eq!(
-        effort_option(&session).and_then(|o| o.current),
-        Some(ConfigValue::Text("low".into()))
+        session
+            .info()
+            .configuration
+            .options
+            .get(&ConfigId::new("model")),
+        Some(&ConfigValue::Text("grok-4.6".into()))
+    );
+    session.prompt("model-state").await.unwrap();
+    let mut actual = String::new();
+    loop {
+        match next(&mut events).await.kind {
+            EventKind::TextDelta { text, .. } => actual.push_str(&text),
+            EventKind::TurnEnded { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        actual, "grok-4.6:high",
+        "the effort request reverted the model"
     );
     session.configure("effort", "xhigh").await.unwrap();
     while effort_option(&session).and_then(|o| o.current) != Some(ConfigValue::Text("xhigh".into()))
     {
         next(&mut events).await;
     }
+    session.configure("model", "grok-basic").await.unwrap();
+    while effort_option(&session).is_some() {
+        next(&mut events).await;
+    }
+    assert!(
+        !session
+            .info()
+            .configuration
+            .options
+            .contains_key(&ConfigId::new("effort"))
+    );
+    assert!(matches!(
+        session.configure("effort", "low").await,
+        Err(AgentError::InvalidConfiguration(_))
+    ));
     session.close().await.unwrap();
 }
 
@@ -1005,7 +1042,7 @@ async fn compact_is_unsupported_on_acp() {
 /// Kiro effort: the shared levels for the model, none for models without effort, switched via a `/effort` prompt that queues behind a running turn, ack never leaks, settable at creation.
 #[tokio::test]
 async fn kiro_effort_is_a_live_option_backed_by_the_effort_prompt() {
-    let (session, mut events) = open(&["--kiro"]).await;
+    let (session, mut events) = open(&["--kiro", "--effort-slow=50"]).await;
     let effort = |session: &Session| {
         session
             .info()
@@ -1088,6 +1125,9 @@ async fn kiro_effort_is_a_live_option_backed_by_the_effort_prompt() {
 
     // A prompt sent while a switch runs waits for it, then runs.
     session.configure("effort", "high").await.unwrap();
+    // This unrelated receipt lands before the effort response and must not
+    // clear its ID or strand the held prompt.
+    session.configure("model", "opus").await.unwrap();
     session.prompt("hi").await.unwrap();
     let mut text = String::new();
     loop {

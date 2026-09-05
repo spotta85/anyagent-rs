@@ -443,9 +443,7 @@ fn sync_first_class_models(info: &mut DriverInfo, models: &Value) {
         choices,
         current_id.map(|c| ConfigValue::Text(c.to_owned())),
     );
-    if !efforts.is_empty() {
-        replace_select(info, "effort", efforts, effort);
-    }
+    replace_select(info, "effort", efforts, effort);
 }
 
 /// What `initialize` tells us, folded into the engine's vocabulary.
@@ -792,7 +790,18 @@ impl Drive {
                 }
                 let first_class = self
                     .first_class_model
-                    .then(|| selected(&self.info, "model"))
+                    .then(|| {
+                        // An effort change must target the latest requested model,
+                        // even when its receipt has not reached us yet.
+                        self.configs
+                            .iter()
+                            .rev()
+                            .find_map(|(_, id, value)| match (id.as_str(), value) {
+                                ("model", ConfigValue::Text(model)) => Some(model.clone()),
+                                _ => None,
+                            })
+                            .or_else(|| selected(&self.info, "model"))
+                    })
                     .flatten();
                 let (method, params) =
                     config_call(&self.session_id, &id, &value, first_class.as_deref());
@@ -1222,7 +1231,8 @@ impl Drive {
                 self.emit(DriverEvent::InfoChanged(self.info.clone()))
                     .await?;
             }
-            if Some(id) == self.effort_id.take() {
+            if Some(id) == self.effort_id {
+                self.effort_id = None;
                 return self.after_effort().await;
             }
         }

@@ -82,6 +82,41 @@ fn text_of(kinds: &[EventKind]) -> String {
         .collect()
 }
 
+#[tokio::test]
+async fn generate_disables_tools_and_session_persistence() {
+    let agent = AgentInstallation::at("pi", wrapper("generate-flags", ""));
+    let text = Runtime::new()
+        .generate(
+            &agent,
+            SessionOptions::in_dir(std::env::temp_dir()),
+            "use a tool; report launch-flags",
+        )
+        .await
+        .unwrap();
+    assert_eq!(text, "no-tools=true ephemeral=true ready [m1]");
+}
+
+#[tokio::test]
+async fn generate_cancels_extension_tools_and_choice_questions() {
+    for (name, flags, prompt) in [
+        ("generate-extension", "--ignore-no-tools", "tool"),
+        ("generate-question", "", "ask"),
+        ("generate-confirmation", "", "confirm"),
+    ] {
+        let agent = AgentInstallation::at("pi", wrapper(name, flags));
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            Runtime::new().generate(&agent, SessionOptions::in_dir(std::env::temp_dir()), prompt),
+        )
+        .await
+        .expect("generate did not settle");
+        assert!(
+            matches!(result, Err(AgentError::ProtocolFailed(_))),
+            "{result:?}"
+        );
+    }
+}
+
 /// Handshake advertises version, auth, capabilities (!Permissions/Rollback), model/thinking selects and commands.
 #[tokio::test]
 async fn handshake_advertises_state_models_levels_and_commands() {

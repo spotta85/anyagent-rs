@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::adapter::{Adapter, ConnectRequest};
 use crate::agent::{
-    AgentDetails, AgentId, AgentInstallation, AuthStatus, Capabilities, Input, PermissionMode,
-    SessionOptions,
+    AgentDetails, AgentId, AgentInstallation, AuthStatus, Capabilities, Capability, Input,
+    PermissionMode, SessionOptions, SessionStart,
 };
 use crate::error::AgentError;
 use crate::event::{
@@ -140,18 +140,40 @@ impl Runtime {
     }
     /// One-shot generation: prompt in, the agent's reply text out. Opens a
     /// throwaway session, denies every tool permission, gathers the text
-    /// until the turn ends, and closes. For titles, commit messages, and
-    /// anything else that needs a string, not a conversation.
+    /// until the turn ends, and closes. Requires a new session; a tool event
+    /// or a question requiring a choice cancels generation. Native Pi disables
+    /// tools and session persistence at launch. Include its context inline:
+    /// path attachments cannot be opened without tools.
     pub async fn generate(
         &self,
         agent: &AgentInstallation,
         options: SessionOptions,
         prompt: impl Into<Input>,
     ) -> Result<String, AgentError> {
+        if !matches!(options.start, SessionStart::New) {
+            return Err(AgentError::InvalidConfiguration(
+                "generate requires a new session".into(),
+            ));
+        }
         // Hands-off regardless of the caller's mode: AutoApprove would let
         // the agent run tools before any request reached this loop.
-        let options = options.permission_mode(PermissionMode::Ask);
+        let mut options = options.permission_mode(PermissionMode::Ask);
+        options.no_tools = true;
         let (session, mut events) = self.open(agent, options).await?;
+        // Only native Pi enforces no_tools at launch; an ACP override does not.
+        let native_pi = agent.id.as_str() == "pi" && agent.acp_args.is_none();
+        if !session
+            .info()
+            .details
+            .capabilities
+            .supports(Capability::Permissions)
+            && !native_pi
+        {
+            session.close().await.ok();
+            return Err(AgentError::UnsupportedFeature(
+                "generate requires tool permissions or launch-time tool disabling".into(),
+            ));
+        }
         let reply = collect_reply(&session, &mut events, prompt.into()).await;
         session.close().await.ok();
         reply
@@ -259,12 +281,19 @@ async fn collect_reply(
             .is_some_and(|t| t.parent_tool_id.is_some());
         match event.kind {
             EventKind::TextDelta { text: delta, .. } if !nested => text.push_str(&delta),
+            // Stop even on a proposed tool call; generation is text-only.
+            EventKind::ToolUpdated(_) => {
+                session.cancel(true).await?;
+                return Err(AgentError::ProtocolFailed(
+                    "generate: the agent attempted to use a tool".into(),
+                ));
+            }
             EventKind::RequestOpened(request) => match decline(&request) {
                 Some(answer) => session.answer(request.id(), answer).await?,
                 None => {
                     session.cancel(true).await?;
                     return Err(AgentError::ProtocolFailed(
-                        "generate: the agent offered no way to deny a permission".into(),
+                        "generate: the request cannot be declined without making a choice".into(),
                     ));
                 }
             },
@@ -283,27 +312,23 @@ async fn collect_reply(
     Err(AgentError::SessionClosed)
 }
 
-/// The least affirmative answer the request accepts: a deny the agent
-/// offers, blank text or the first choice per question. `None` when a
-/// permission offers no deny at all.
+/// Deny permissions and leave free-text answers blank. A request requiring
+/// a choice cannot be declined safely, so the caller cancels generation.
 fn decline(request: &Request) -> Option<Answer> {
     match request {
         Request::Permission(p) => [PermissionChoice::DenyOnce, PermissionChoice::DenyAlways]
             .into_iter()
             .find(|choice| p.options.contains(choice))
             .map(Answer::Permission),
-        Request::Question(q) => Some(Answer::Question(
-            q.questions
-                .iter()
-                .map(|question| {
-                    if question.allows_free_text {
-                        return QuestionAnswer::Text(String::new());
-                    }
-                    let first = question.choices.first().map(|c| c.id.clone());
-                    QuestionAnswer::Choices(first.into_iter().collect())
-                })
-                .collect(),
-        )),
+        Request::Question(q) if q.questions.iter().all(|q| q.allows_free_text) => {
+            Some(Answer::Question(
+                q.questions
+                    .iter()
+                    .map(|_| QuestionAnswer::Text(String::new()))
+                    .collect(),
+            ))
+        }
+        Request::Question(_) => None,
     }
 }
 
@@ -376,8 +401,8 @@ mod tests {
         assert_eq!(text, "Let me check. Done.");
     }
 
-    /// `generate` answers with what the request accepts: `DenyAlways` when
-    /// that is the only deny, the first choice of a choice-only question.
+    /// `generate` uses the offered deny and blank free text, but never picks
+    /// a choice or accepts a permission without a deny.
     #[tokio::test]
     async fn generate_declines_within_what_the_request_offers() {
         use crate::adapter::mock::{MockAdapter, Script, Step, completed, text, tool};
@@ -396,21 +421,23 @@ mod tests {
                 detail: None,
             }))
         };
-        let question = EventKind::RequestOpened(Request::Question(QuestionRequest {
-            id: RequestId::new("q1"),
-            questions: vec![Question {
-                id: QuestionId::new("q"),
-                text: "Which?".into(),
-                header: None,
-                choices: vec![Choice {
-                    id: ChoiceId::new("a"),
-                    label: "A".into(),
-                    description: None,
+        let question = |allows_free_text| {
+            EventKind::RequestOpened(Request::Question(QuestionRequest {
+                id: RequestId::new("q1"),
+                questions: vec![Question {
+                    id: QuestionId::new("q"),
+                    text: "Which?".into(),
+                    header: None,
+                    choices: vec![Choice {
+                        id: ChoiceId::new("a"),
+                        label: "A".into(),
+                        description: None,
+                    }],
+                    multi_select: false,
+                    allows_free_text,
                 }],
-                multi_select: false,
-                allows_free_text: false,
-            }],
-        }));
+            }))
+        };
         let script = Script::default().turn(vec![
             Step::Emit(text("m1", "one ")),
             Step::Emit(permission(vec![
@@ -418,7 +445,7 @@ mod tests {
                 PermissionChoice::DenyAlways,
             ])),
             Step::AwaitAnswer,
-            Step::Emit(question),
+            Step::Emit(question(true)),
             Step::AwaitAnswer,
             Step::Emit(text("m1", "two")),
             Step::End(completed()),
@@ -434,20 +461,88 @@ mod tests {
 
         // A permission with no deny at all cannot be declined: generate fails
         // instead of allowing it.
-        let script = Script::default().turn(vec![
-            Step::Emit(permission(vec![PermissionChoice::AllowOnce])),
-            Step::AwaitAnswer,
-            Step::End(completed()),
-        ]);
-        let runtime = Runtime::with_test_adapter(MockAdapter::new(script));
+        for request in [
+            permission(vec![PermissionChoice::AllowOnce]),
+            question(false),
+        ] {
+            let script = Script::default().turn(vec![
+                Step::Emit(request),
+                Step::AwaitAnswer,
+                Step::End(completed()),
+            ]);
+            let runtime = Runtime::with_test_adapter(MockAdapter::new(script));
+            let agent = runtime.discover().await.require("mock").unwrap().clone();
+            let refused = runtime
+                .generate(&agent, SessionOptions::in_dir(dir.path()), "go")
+                .await;
+            assert!(
+                matches!(refused, Err(AgentError::ProtocolFailed(_))),
+                "{refused:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn generate_rejects_existing_sessions_before_launch() {
+        let runtime = Runtime::new();
+        let agent = AgentInstallation::at("pi", "/nonexistent/pi");
+        for start in [
+            SessionStart::Resume(crate::agent::ResumeToken::new("existing")),
+            SessionStart::Fork {
+                from: crate::agent::ResumeToken::new("existing"),
+                at: None,
+            },
+        ] {
+            let mut options = SessionOptions::in_dir(std::env::temp_dir());
+            options.start = start;
+            assert!(matches!(
+                runtime.generate(&agent, options, "go").await,
+                Err(AgentError::InvalidConfiguration(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn generate_rejects_agents_without_tool_enforcement() {
+        use crate::adapter::mock::{MockAdapter, Script};
+        let adapter = MockAdapter::new(Script {
+            permissions: false,
+            ..Script::default()
+        });
+        let runtime = Runtime::with_test_adapter(adapter);
         let agent = runtime.discover().await.require("mock").unwrap().clone();
-        let refused = runtime
-            .generate(&agent, SessionOptions::in_dir(dir.path()), "go")
+        let result = runtime
+            .generate(&agent, SessionOptions::in_dir(std::env::temp_dir()), "go")
             .await;
         assert!(
-            matches!(refused, Err(AgentError::ProtocolFailed(_))),
-            "{refused:?}"
+            matches!(result, Err(AgentError::UnsupportedFeature(_))),
+            "{result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn generate_fails_on_tool_activity() {
+        use crate::adapter::mock::{MockAdapter, Script, Step, completed, tool};
+        use crate::event::ToolStatus;
+        for status in [
+            ToolStatus::Pending,
+            ToolStatus::Running,
+            ToolStatus::Completed,
+        ] {
+            let script = Script::default().turn(vec![
+                Step::Emit(tool("tool-1", status)),
+                Step::End(completed()),
+            ]);
+            let runtime = Runtime::with_test_adapter(MockAdapter::new(script));
+            let agent = runtime.discover().await.require("mock").unwrap().clone();
+            let result = runtime
+                .generate(&agent, SessionOptions::in_dir(std::env::temp_dir()), "go")
+                .await;
+            assert!(
+                matches!(result, Err(AgentError::ProtocolFailed(ref message)) if message.contains("tool")),
+                "{result:?}"
+            );
+        }
     }
 
     /// `generate` stays hands-off even when the caller asked for AutoApprove.

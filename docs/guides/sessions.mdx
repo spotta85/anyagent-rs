@@ -38,6 +38,19 @@ let (session, events) = runtime
 exactly what crossed the wire, unredacted (prompts, file contents, command
 output — possibly secrets), so treat the file as sensitive.
 
+## One-shot generation
+
+`runtime.generate(agent, options, prompt)` returns text and closes the session.
+It requires a new session; resume and fork options are rejected. Permission
+requests are denied, free-text questions receive a blank answer, and questions
+requiring a choice cancel generation. Any reported tool activity also cancels
+generation, including a proposed call that has not executed.
+
+For native Pi, generation launches with `--no-tools --no-session`. Tools are
+disabled and the session is not saved. Include context inline in the prompt;
+path attachments cannot be opened without tools. Other agents must expose
+permission requests to support generation.
+
 ## Prompting
 
 ```rust

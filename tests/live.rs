@@ -364,6 +364,38 @@ async fn generate_returns_text_without_a_session() {
     }
 }
 
+/// Even a prompt asking to read a file cannot enable Pi's tools during generation.
+#[tokio::test]
+#[ignore = "live: talks to real agents"]
+async fn pi_generate_stays_text_only() {
+    // Pi can authenticate through OAuth without OPENROUTER_API_KEY.
+    let selected = std::env::var("ANYAGENT_LIVE").unwrap_or_default();
+    if selected != "all" && !selected.split(',').any(|h| h.trim() == "pi") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("context.txt"), "tool-only context").unwrap();
+    let log = dir.path().join("wire.jsonl");
+    let runtime = Runtime::new();
+    let report = runtime.discover().await;
+    let agent = report.require("pi").expect("pi not discovered");
+    let text = tokio::time::timeout(EVENT_TIMEOUT, runtime.generate(
+        agent, options("pi", dir.path()).record_wire(&log),
+        "Read context.txt using a tool, then return a short summary. If no tools are available, say that briefly.",
+    )).await.expect("pi generation timed out").expect("pi generation failed");
+    assert!(!text.trim().is_empty());
+    let wire = std::fs::read_to_string(log).unwrap();
+    assert!(
+        !wire.contains("tool_execution_") && !wire.contains("toolcall_start"),
+        "Pi attempted a tool call"
+    );
+    assert!(
+        !wire.contains("\"sessionFile\":\""),
+        "Pi persisted its session"
+    );
+    pass("pi", &format!("tool-free generation returned {text:?}"));
+}
+
 /// Turn is bracketed by TurnStarted(Prompt)/TurnEnded(Completed), sequences strictly increase, and stays quiet after end.
 #[tokio::test]
 #[ignore = "live: talks to real agents"]

@@ -19,6 +19,7 @@ let grokModel = 'grok-4.5', grokEffort = 'high';
 const grokModels = () => ({ currentModelId: grokModel, availableModels: [
   { modelId: 'grok-4.5', name: 'Grok 4.5', description: 'fast', _meta: { reasoningEffort: 'high', reasoningEfforts: [{ value: 'low', label: 'Low Effort' }, { value: 'high', label: 'High Effort', description: 'default' }] } },
   { modelId: 'grok-4.6', name: 'Grok 4.6', _meta: { reasoningEffort: 'high', reasoningEfforts: [{ value: 'low', label: 'Low Effort' }, { value: 'high', label: 'High Effort' }, { value: 'xhigh', label: 'Extra High' }] } },
+  { modelId: 'grok-basic', name: 'Grok Basic' },
 ] });
 const kiroMetadata = (sessionId) => send({ jsonrpc: '2.0', method: '_kiro.dev/metadata', params: { sessionId, contextUsagePercentage: 0.5, effort } });
 
@@ -49,7 +50,7 @@ async function onRequest(m) {
         : [{ id: 'fixture-login', name: 'Log in', type: 'terminal', args: ['auth', 'login'] }];
       return reply({ protocolVersion: 1, agentCapabilities: { loadSession: !flag('--no-load'), promptCapabilities: { image: true }, mcpCapabilities: { http: true, sse: false }, _meta: { steering: { supported: true } } }, authMethods, agentInfo: { name: flag('--kiro') ? 'Kiro CLI Agent' : 'fixture', version: '0.0.1' }, _meta: { vendor: 'spike' } });
     }
-    case 'session/new':
+    case 'session/new': {
       if (flag('--auth-required')) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32000, message: flag('--capitalized-auth') ? 'Authentication required' : 'authentication required' } });
       // The hermes shape: a plain internal error whose data carries the words.
       if (flag('--auth-hint-error')) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32603, message: 'Internal error', data: { details: 'No LLM provider configured. Run `fixture login` first.' } } });
@@ -65,6 +66,7 @@ async function onRequest(m) {
       if (flag('--commands-on-open')) notify('sess-1', { sessionUpdate: 'available_commands_update', availableCommands: [{ name: 'compact', description: 'Compact context' }] });
       if (flag('--kiro')) kiroMetadata('sess-1');
       return;
+    }
     case 'session/load': return reply({ _meta: { loaded: m.params.sessionId } });
     case 'session/set_mode': {
       reply({});
@@ -78,7 +80,8 @@ async function onRequest(m) {
       return reply({});
     case 'session/set_model':
       if (!flag('--grok-models')) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32601, message: 'method not found' } });
-      if (!['grok-4.5', 'grok-4.6'].includes(m.params.modelId)) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32602, message: `unknown model ${m.params.modelId}` } });
+      if (!['grok-4.5', 'grok-4.6', 'grok-basic'].includes(m.params.modelId)) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32602, message: `unknown model ${m.params.modelId}` } });
+      if (num('--config-slow', 0)) await sleep(num('--config-slow', 0));
       grokModel = m.params.modelId;
       if (m.params._meta?.reasoningEffort) grokEffort = m.params._meta.reasoningEffort;
       reply({});
@@ -96,9 +99,15 @@ async function runTurn(m) {
   const sid = m.params.sessionId; turn = { cancelled: false };
   const done = (stopReason) => { send({ jsonrpc: '2.0', id: m.id, result: { stopReason, _meta: { usage: { inputTokens: 1 } } } }); turn = null; };
   const ptext = m.params.prompt.find(b => b.type === 'text')?.text ?? '';
+  if (flag('--grok-models') && ptext === 'model-state') {
+    notify(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `${grokModel}:${grokEffort}` } });
+    done('end_turn');
+    return;
+  }
   // Kiro's `/effort <level>`: an ack chunk, end_turn, and the level rides
   // every later metadata frame.
   if (flag('--kiro') && ptext.startsWith('/effort ')) {
+    if (num('--effort-slow', 0)) await sleep(num('--effort-slow', 0));
     effort = ptext.slice('/effort '.length);
     // An unrelated update lands mid-switch; only the ack chunk is internal.
     notify(sid, { sessionUpdate: 'usage_update', used: 7, size: 100 });

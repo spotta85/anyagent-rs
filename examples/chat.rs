@@ -48,6 +48,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "usage: /set <option> <value>".into(),
                     )),
                 },
+                None if line == "/set" => Err(anyagent::AgentError::InvalidConfiguration(
+                    "usage: /set <option> <value>".into(),
+                )),
                 None => prompter.prompt(line).await.map(|_| ()),
             };
             if let Err(e) = result {
