@@ -1,7 +1,9 @@
 // ACP v1 fixture agent: speaks JSON-RPC over stdio and emits the annoying cases.
 // Flags: --eof (die mid-turn), --flood=N (N chunks before the response),
 //        --late-ms=N (late noise delay), --auth-required (session/new fails),
-//        --commands-on-open (push availableCommands right after session/new).
+//        --commands-on-open (push availableCommands right after session/new),
+//        --kiro (the kiro shape: agentInfo name, effort in _kiro.dev/metadata,
+//        `/effort <level>` prompts answered with an ack chunk).
 import { createInterface } from 'node:readline';
 
 const flag = (name) => process.argv.includes(name);
@@ -9,7 +11,8 @@ const num = (name, dflt) => +(process.argv.find(a => a.startsWith(name + '='))?.
 const send = (m) => process.stdout.write(JSON.stringify(m) + '\n');
 const notify = (sessionId, update) => send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId, update } });
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-let nextId = 100, pending = {}, turn = null, mcpDecl = [];
+let nextId = 100, pending = {}, turn = null, mcpDecl = [], effort = 'high';
+const kiroMetadata = (sessionId) => send({ jsonrpc: '2.0', method: '_kiro.dev/metadata', params: { sessionId, contextUsagePercentage: 0.5, effort } });
 
 // --die-not-logged-in: the kiro shape — complain on stderr and exit before
 // ever speaking ACP.
@@ -36,7 +39,7 @@ async function onRequest(m) {
         : flag('--meta-auth-methods')
         ? [{ id: 'openai', name: 'Use OpenAI API key', _meta: { type: 'terminal', args: ['--auth-type=openai'] } }]
         : [{ id: 'fixture-login', name: 'Log in', type: 'terminal', args: ['auth', 'login'] }];
-      return reply({ protocolVersion: 1, agentCapabilities: { loadSession: !flag('--no-load'), promptCapabilities: { image: true }, mcpCapabilities: { http: true, sse: false }, _meta: { steering: { supported: true } } }, authMethods, agentInfo: { name: 'fixture', version: '0.0.1' }, _meta: { vendor: 'spike' } });
+      return reply({ protocolVersion: 1, agentCapabilities: { loadSession: !flag('--no-load'), promptCapabilities: { image: true }, mcpCapabilities: { http: true, sse: false }, _meta: { steering: { supported: true } } }, authMethods, agentInfo: { name: flag('--kiro') ? 'Kiro CLI Agent' : 'fixture', version: '0.0.1' }, _meta: { vendor: 'spike' } });
     }
     case 'session/new':
       if (flag('--auth-required')) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32000, message: flag('--capitalized-auth') ? 'Authentication required' : 'authentication required' } });
@@ -46,10 +49,13 @@ async function onRequest(m) {
       // --grok-models: the first-class models state (no model configOption);
       // switching must ride session/set_model.
       if (flag('--grok-models')) return reply({ sessionId: 'sess-1', models: { currentModelId: 'grok-4.5', availableModels: [{ modelId: 'grok-4.5', name: 'Grok 4.5', description: 'fast' }, { modelId: 'grok-4.6', name: 'Grok 4.6' }] } });
-      reply({ sessionId: 'sess-1', modes: { currentModeId: 'default', availableModes: [{ id: 'default', name: 'Default' }, { id: 'plan', name: 'Plan' }] }, configOptions: [{ id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'sonnet', options: [{ value: 'sonnet', name: 'Sonnet' }, { value: 'opus', name: 'Opus' }] }], _meta: { claude: { sessionId: 'uuid-1' } } });
+      // --kiro adds a model without effort levels.
+      const models = [{ value: 'sonnet', name: 'Sonnet' }, { value: 'opus', name: 'Opus' }, ...(flag('--kiro') ? [{ value: 'claude-haiku-4.5', name: 'Haiku' }] : [])];
+      reply({ sessionId: 'sess-1', modes: { currentModeId: 'default', availableModes: [{ id: 'default', name: 'Default' }, { id: 'plan', name: 'Plan' }] }, configOptions: [{ id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'sonnet', options: models }], _meta: { claude: { sessionId: 'uuid-1' } } });
       // Real ACP agents push the command list as an update just after
       // session/new; --commands-on-open reproduces it so probe can wait for it.
       if (flag('--commands-on-open')) notify('sess-1', { sessionUpdate: 'available_commands_update', availableCommands: [{ name: 'compact', description: 'Compact context' }] });
+      if (flag('--kiro')) kiroMetadata('sess-1');
       return;
     case 'session/load': return reply({ _meta: { loaded: m.params.sessionId } });
     case 'session/set_mode': {
@@ -77,6 +83,14 @@ async function runTurn(m) {
   const sid = m.params.sessionId; turn = { cancelled: false };
   const done = (stopReason) => { send({ jsonrpc: '2.0', id: m.id, result: { stopReason, _meta: { usage: { inputTokens: 1 } } } }); turn = null; };
   const ptext = m.params.prompt.find(b => b.type === 'text')?.text ?? '';
+  // Kiro's `/effort <level>`: an ack chunk, end_turn, and the level rides
+  // every later metadata frame.
+  if (flag('--kiro') && ptext.startsWith('/effort ')) {
+    effort = ptext.slice('/effort '.length);
+    notify(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `Effort set to ${effort}` } });
+    done('end_turn');
+    return;
+  }
   // Errored prompts: "die-auth" loses the credentials, "die-rpc" is a plain failure.
   if (ptext.includes('die-auth')) { send({ jsonrpc: '2.0', id: m.id, error: { code: -32000, message: 'credentials expired' } }); turn = null; return; }
   if (ptext.includes('die-rpc')) { send({ jsonrpc: '2.0', id: m.id, error: { code: -32603, message: 'kaput' } }); turn = null; return; }
@@ -122,6 +136,7 @@ async function runTurn(m) {
   if (flood) await sleep(50);
   if (turn.cancelled) { done('cancelled'); return; }
   done('end_turn');
+  if (flag('--kiro')) kiroMetadata(sid);
   await sleep(num('--late-ms', 100));
   notify(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '(late noise)' } });
 }

@@ -567,3 +567,41 @@ async fn unsupported_starts_and_declarations_are_refused_typed() {
         );
     }
 }
+
+/// pi compacts on its own `compact` command; the receipt ends the turn, and
+/// a refusal ("session too small") is a diagnostic, not a silent no-op.
+#[tokio::test]
+async fn compact_reports_the_compaction_and_its_refusal() {
+    let (session, mut events) = open("compact", "").await;
+    assert!(
+        session
+            .info()
+            .details
+            .capabilities
+            .supports(Capability::Compact)
+    );
+    session.compact().await.unwrap();
+    let mut kinds = Vec::new();
+    while !matches!(kinds.last(), Some(EventKind::TurnEnded { .. })) {
+        kinds.push(next(&mut events).await.kind);
+    }
+    assert!(
+        kinds
+            .iter()
+            .any(|k| matches!(k, EventKind::ContextCompacted)),
+        "{kinds:?}"
+    );
+
+    let (session, mut events) = open("compact-refused", "--compact-refuses").await;
+    session.compact().await.unwrap();
+    let mut kinds = Vec::new();
+    while !matches!(kinds.last(), Some(EventKind::TurnEnded { .. })) {
+        kinds.push(next(&mut events).await.kind);
+    }
+    assert!(
+        kinds.iter().any(
+            |k| matches!(k, EventKind::Diagnostic(d) if d.message.contains("Nothing to compact"))
+        ),
+        "{kinds:?}"
+    );
+}

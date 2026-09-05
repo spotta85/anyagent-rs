@@ -942,3 +942,146 @@ async fn record_wire_tees_the_acp_wire_including_handshake() {
         "handshake initialize was not recorded"
     );
 }
+
+/// ACP has no compaction on the wire, so no ACP agent advertises it.
+#[tokio::test]
+async fn compact_is_unsupported_on_acp() {
+    let (session, _events) = open(&[]).await;
+    assert!(matches!(
+        session.compact().await,
+        Err(AgentError::UnsupportedFeature(_))
+    ));
+}
+
+/// Kiro effort: the shared levels for the model, none for models without effort, switched via a `/effort` prompt that queues behind a running turn, ack never leaks, settable at creation.
+#[tokio::test]
+async fn kiro_effort_is_a_live_option_backed_by_the_effort_prompt() {
+    let (session, mut events) = open(&["--kiro"]).await;
+    let effort = |session: &Session| {
+        session
+            .info()
+            .configuration
+            .options
+            .get(&ConfigId::new("effort"))
+            .cloned()
+    };
+    let option = session
+        .info()
+        .details
+        .config_options
+        .into_iter()
+        .find(|o| o.id.as_str() == "effort")
+        .expect("effort advertised");
+    assert!(option.live);
+    let anyagent::ConfigKind::Select { choices } = &option.kind else {
+        panic!("effort is a select");
+    };
+    assert_eq!(
+        choices.iter().map(|c| c.value.as_str()).collect::<Vec<_>>(),
+        ["low", "medium", "high", "xhigh", "max"]
+    );
+
+    // The metadata frame right after session/new fills in the current level.
+    while effort(&session) != Some(ConfigValue::Text("high".into())) {
+        next(&mut events).await;
+    }
+
+    // A live switch rides a `/effort` prompt; its ack chunk stays internal.
+    session.configure("effort", "low").await.unwrap();
+    while effort(&session) != Some(ConfigValue::Text("low".into())) {
+        let event = next(&mut events).await;
+        assert!(
+            !matches!(event.kind, EventKind::TextDelta { .. }),
+            "the effort ack leaked as text"
+        );
+    }
+
+    // A switch mid-turn waits for the turn, then applies.
+    session.prompt("hi").await.unwrap();
+    loop {
+        let event = next(&mut events).await;
+        match event.kind {
+            EventKind::RequestOpened(Request::Permission(r)) => {
+                session.configure("effort", "medium").await.unwrap();
+                session.answer(r.id, allow()).await.unwrap();
+            }
+            EventKind::TurnEnded { .. } => break,
+            _ => {}
+        }
+    }
+    while effort(&session) != Some(ConfigValue::Text("medium".into())) {
+        next(&mut events).await;
+    }
+
+    // A prompt sent while a switch runs waits for it, then runs.
+    session.configure("effort", "high").await.unwrap();
+    session.prompt("hi").await.unwrap();
+    let mut text = String::new();
+    loop {
+        let event = next(&mut events).await;
+        match event.kind {
+            EventKind::TextDelta { text: t, .. } => text.push_str(&t),
+            EventKind::RequestOpened(Request::Permission(r)) => {
+                session.answer(r.id, allow()).await.unwrap();
+            }
+            EventKind::TurnEnded { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(text.starts_with("Hello"), "got {text:?}");
+    assert!(
+        !text.contains("Effort set"),
+        "the effort ack leaked: {text:?}"
+    );
+    assert_eq!(effort(&session), Some(ConfigValue::Text("high".into())));
+
+    // A model without effort drops the option; switching back restores it.
+    let has_effort = |session: &Session| {
+        session
+            .info()
+            .details
+            .config_options
+            .iter()
+            .any(|o| o.id.as_str() == "effort")
+    };
+    session
+        .configure("model", "claude-haiku-4.5")
+        .await
+        .unwrap();
+    while has_effort(&session) {
+        next(&mut events).await;
+    }
+    assert_eq!(effort(&session), None);
+    assert!(matches!(
+        session.configure("effort", "low").await,
+        Err(AgentError::InvalidConfiguration(_))
+    ));
+    session.configure("model", "opus").await.unwrap();
+    while !has_effort(&session) {
+        next(&mut events).await;
+    }
+    session.close().await.unwrap();
+
+    // Creation-time effort on a model without it fails the open.
+    let refused = Runtime::new()
+        .open(
+            &fixture(&["--kiro"]),
+            SessionOptions::in_dir(std::env::temp_dir())
+                .configure("model", "claude-haiku-4.5")
+                .configure("effort", "low"),
+        )
+        .await
+        .map(|_| ());
+    assert!(matches!(refused, Err(AgentError::InvalidConfiguration(_))));
+
+    // Creation-time effort applies before the first turn.
+    let (session, _events) = Runtime::new()
+        .open(
+            &fixture(&["--kiro"]),
+            SessionOptions::in_dir(std::env::temp_dir()).configure("effort", "medium"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(effort(&session), Some(ConfigValue::Text("medium".into())));
+    session.close().await.unwrap();
+}

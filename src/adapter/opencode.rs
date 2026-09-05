@@ -360,6 +360,7 @@ fn driver_info(
                 Capability::Permissions,
                 Capability::Questions,
                 Capability::Rollback,
+                Capability::Compact,
                 Capability::SlashCommands,
                 Capability::Plan,
                 Capability::ContextUsage,
@@ -590,6 +591,9 @@ impl Drive {
                 self.turn_error = None;
                 self.start_turn(&input).await?;
             }
+            // `summarize` streams the summary and settles like a turn, so
+            // the drive loop tracks it as one (probed 2026-09-04, 1.18.27).
+            DriverCommand::Compact => self.compact().await?,
             // Never reached: Steer is unadvertised, so the engine queues
             // mid-turn prompts and re-sends them as `StartTurn`.
             DriverCommand::Steer { .. } => self.emit(DriverEvent::Steered(false)).await?,
@@ -692,6 +696,7 @@ impl Drive {
             "message.part.delta" => self.on_delta(props).await,
             "permission.asked" => self.on_permission(props).await,
             "question.asked" => self.on_question(props).await,
+            "session.compacted" => self.emit_kind(EventKind::ContextCompacted).await,
             "session.error" => self.on_error(props).await,
             // The rest is bookkeeping and reply echoes the engine already owns.
             _ => Ok(()),
@@ -978,6 +983,28 @@ impl Drive {
                     .as_str()
                     .unwrap_or("the agent reported an error");
                 self.diagnostic(DiagnosticLevel::Error, message).await
+            }
+        }
+    }
+
+    /// Summarizes the session in place. The server streams the summary and
+    /// ends with `session.compacted`, so the turn state follows a prompt's.
+    async fn compact(&mut self) -> Result<(), Gone> {
+        let body = self.model_body().unwrap_or_else(|| json!({}));
+        self.turn = Turn::Sent;
+        self.aborting = false;
+        self.turn_error = None;
+        let path = format!("/session/{}/summarize", self.session_id);
+        match self.http.post(&path, body).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                self.turn = Turn::Idle;
+                self.diagnostic(DiagnosticLevel::Warning, format!("compaction refused: {e}"))
+                    .await?;
+                self.emit(DriverEvent::TurnEnded(StopReason::Failed {
+                    message: e.to_string(),
+                }))
+                .await
             }
         }
     }

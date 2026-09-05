@@ -291,6 +291,7 @@ fn driver_info(
                 Capability::SlashCommands,
                 Capability::ContextUsage,
                 Capability::Questions,
+                Capability::Compact,
             ]),
             config_options,
             commands: slash_commands(&commands["commands"]),
@@ -403,6 +404,7 @@ enum Pending {
     Configure(ConfigId, ConfigValue),
     /// Thinking levels belong to the model, so a model change re-reads them.
     Thinking,
+    Compact,
 }
 
 struct Drive {
@@ -491,6 +493,13 @@ impl Drive {
                     self.wire.cancel_dialog(&wire_id).await?;
                 }
             }
+            // `compact` answers once, and that receipt ends the compaction
+            // turn; `compaction_end` reports the compaction itself, as it
+            // does for pi's own automatic compactions.
+            DriverCommand::Compact => {
+                let id = self.wire.send("compact", json!({})).await?;
+                self.pending.insert(id, Pending::Compact);
+            }
             DriverCommand::Configure(id, value) => self.configure(id, value).await?,
             DriverCommand::Rollback(..) => {
                 // Not advertised: pi forks a new session instead of rewinding.
@@ -572,6 +581,25 @@ impl Drive {
                 .await
             }
             Pending::Steer => self.emit(DriverEvent::Steered(success)).await,
+            // pi refuses a session that is too small to be worth summarizing.
+            // Either way the receipt is the end of the compaction turn.
+            Pending::Compact if !success => {
+                self.diagnostic(
+                    DiagnosticLevel::Warning,
+                    format!("compaction refused: {error}"),
+                )
+                .await?;
+                self.emit(DriverEvent::TurnEnded(StopReason::Failed {
+                    message: error.to_owned(),
+                }))
+                .await
+            }
+            Pending::Compact => {
+                self.emit(DriverEvent::TurnEnded(StopReason::Completed {
+                    source: CompletionSource::Protocol,
+                }))
+                .await
+            }
             Pending::Configure(id, _) if !success => {
                 self.diagnostic(
                     DiagnosticLevel::Warning,

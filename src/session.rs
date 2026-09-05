@@ -97,6 +97,7 @@ enum Command {
     Answer(RequestId, Answer, Reply<()>),
     Configure(ConfigId, ConfigValue, Reply<()>),
     Rollback(NonZeroU32, RollbackScope, Reply<()>),
+    Compact(Reply<()>),
     Cancel { clear_queue: bool, reply: Reply<()> },
     Close(Reply<()>),
 }
@@ -157,6 +158,15 @@ impl Session {
     ) -> Result<(), AgentError> {
         self.send(|reply| Command::Rollback(turns, scope, reply))
             .await
+    }
+
+    /// Asks the agent to summarize its own context now, freeing room in the
+    /// context window. Requires an idle session and compaction support.
+    /// `ContextCompacted` confirms; a refusal ("nothing to compact") arrives
+    /// as a diagnostic. Agents that summarize out loud run it as an
+    /// agent-originated turn, so a turn may follow.
+    pub async fn compact(&self) -> Result<(), AgentError> {
+        self.send(Command::Compact).await
     }
 
     /// Stops the active turn. The session and the queue survive; the next
@@ -494,6 +504,12 @@ impl Engine {
             Command::Rollback(turns, scope, reply) => {
                 let _ = reply.send(self.handle_rollback(turns, scope).await);
             }
+            Command::Compact(reply) => {
+                let result = self.handle_compact().await;
+                // Snapshot before the reply, as for `prompt`.
+                self.sync_status().await;
+                let _ = reply.send(result);
+            }
             Command::Cancel { clear_queue, reply } => {
                 let _ = reply.send(self.handle_cancel(clear_queue).await);
             }
@@ -632,6 +648,25 @@ impl Engine {
             return Err(AgentError::SessionBusy);
         }
         self.forward(DriverCommand::Rollback(turns, scope)).await
+    }
+
+    /// Compaction occupies the agent, so it runs as an agent-originated turn:
+    /// prompts queue behind it, and the adapter's turn end closes it.
+    async fn handle_compact(&mut self) -> Result<(), AgentError> {
+        if !self
+            .info()
+            .details
+            .capabilities
+            .supports(Capability::Compact)
+        {
+            return Err(AgentError::UnsupportedFeature("compact".into()));
+        }
+        if matches!(self.state, TurnState::Running { .. }) {
+            return Err(AgentError::SessionBusy);
+        }
+        self.forward(DriverCommand::Compact).await?;
+        self.enter_running(TurnOrigin::Agent).await;
+        Ok(())
     }
 
     /// Cancels the active turn; open requests close first. Idempotent.

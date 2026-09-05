@@ -12,8 +12,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 use crate::agent::{
-    AgentDetails, AgentInstallation, ConfigId, ConfigValue, Input, ResumeToken, RollbackScope,
-    SessionConfiguration, SessionOptions,
+    AgentDetails, AgentInstallation, ConfigChoice, ConfigId, ConfigValue, Input, ResumeToken,
+    RollbackScope, SessionConfiguration, SessionOptions,
 };
 use crate::error::AgentError;
 use crate::event::{
@@ -49,6 +49,9 @@ pub(crate) enum DriverCommand {
     },
     Configure(ConfigId, ConfigValue),
     Rollback(NonZeroU32, RollbackScope),
+    /// Summarize the session's context now. Most wires run it as a turn of
+    /// their own; the adapter only triggers it and lets its frames decode.
+    Compact,
     /// Interrupt the running turn. The adapter also drops any pending wire
     /// requests; the engine has already emitted their `RequestClosed`.
     Cancel,
@@ -129,6 +132,60 @@ pub(crate) fn apply_selection(
         option.current = Some(value.clone());
     }
     true
+}
+
+/// The effort levels current models share, as choices; `None` for the
+/// models without effort (kiro-cli 2.20.1's list, probed 2026-09-05).
+/// For adapters whose wire does not list levels per model.
+pub(crate) fn effort_choices(model: &str) -> Option<Vec<ConfigChoice>> {
+    const NO_EFFORT: [&str; 9] = [
+        "auto",
+        "claude-sonnet-4.5",
+        "claude-sonnet-4",
+        "claude-haiku-4.5",
+        "deepseek-3.2",
+        "minimax-m2.5",
+        "minimax-m2.1",
+        "glm-5",
+        "qwen3-coder-next",
+    ];
+    if NO_EFFORT.contains(&model) {
+        return None;
+    }
+    let choices = ["low", "medium", "high", "xhigh", "max"].map(|level| ConfigChoice {
+        value: level.to_owned(),
+        label: level.to_owned(),
+        description: None,
+    });
+    Some(choices.to_vec())
+}
+
+/// Shows Fast mode only for supported models, keeping its value in sync.
+pub(crate) fn set_fast_option(info: &mut DriverInfo, current: Option<bool>, live: bool) {
+    let id = ConfigId::new("fast");
+    info.details.config_options.retain(|option| option.id != id);
+    info.configuration.options.remove(&id);
+    if let Some(current) = current {
+        let value = ConfigValue::Bool(current);
+        let position = info
+            .details
+            .config_options
+            .iter()
+            .position(|option| option.id.as_str() == "model")
+            .map_or(0, |index| index + 1);
+        info.details.config_options.insert(
+            position,
+            crate::agent::ConfigOption {
+                id: id.clone(),
+                name: "Fast mode".into(),
+                category: Some("speed".into()),
+                kind: crate::agent::ConfigKind::Boolean,
+                current: Some(value.clone()),
+                live,
+            },
+        );
+        info.configuration.options.insert(id, value);
+    }
 }
 
 /// The per-agent config-home environment override for this session, as

@@ -1137,3 +1137,376 @@ async fn record_wire_tees_both_directions_including_handshake() {
         "handshake initialize was not recorded"
     );
 }
+
+/// Claude has no compaction control request: the adapter sends the CLI's own
+/// `/compact`. The compaction is a turn of the agent's own, and a refusal is
+/// reported rather than swallowed.
+#[tokio::test]
+async fn compact_runs_the_cli_command_and_reports_the_compaction() {
+    let (session, mut events) = open("compact", "").await;
+    assert!(
+        session
+            .info()
+            .details
+            .capabilities
+            .supports(Capability::Compact)
+    );
+    session.compact().await.unwrap();
+    let mut kinds = Vec::new();
+    while !matches!(kinds.last(), Some(EventKind::TurnEnded { .. })) {
+        kinds.push(next(&mut events).await.kind);
+    }
+    assert!(
+        matches!(
+            kinds.first(),
+            Some(EventKind::TurnStarted {
+                origin: TurnOrigin::Agent
+            })
+        ),
+        "{kinds:?}"
+    );
+    assert!(
+        kinds
+            .iter()
+            .any(|k| matches!(k, EventKind::ContextCompacted)),
+        "{kinds:?}"
+    );
+    assert!(
+        !kinds.iter().any(|k| matches!(k, EventKind::Diagnostic(_))),
+        "a successful compaction says nothing: {kinds:?}"
+    );
+
+    // A refusal answers out loud: the reason is said, the turn still ends.
+    let (session, mut events) = open("compact-refused", "--compact-refuses").await;
+    session.compact().await.unwrap();
+    let mut kinds = Vec::new();
+    while !matches!(kinds.last(), Some(EventKind::TurnEnded { .. })) {
+        kinds.push(next(&mut events).await.kind);
+    }
+    assert!(
+        kinds.iter().any(
+            |k| matches!(k, EventKind::Diagnostic(d) if d.message.contains("Not enough messages"))
+        ),
+        "{kinds:?}"
+    );
+}
+
+/// Claude advertises Fast for the catalog's Opus alias and sends a launch opt-in.
+#[tokio::test]
+async fn fast_mode_is_live_and_follows_the_model() {
+    let agent = AgentInstallation::at("claude", wrapper("fast", ""));
+    let (session, mut events) = Runtime::new()
+        .open(
+            &agent,
+            SessionOptions::in_dir(std::env::temp_dir()).configure("fast", true),
+        )
+        .await
+        .unwrap();
+    let fast = session
+        .info()
+        .details
+        .config_options
+        .into_iter()
+        .find(|o| o.id.as_str() == "fast")
+        .unwrap();
+    assert_eq!(fast.kind, ConfigKind::Boolean);
+    assert_eq!(fast.current, Some(ConfigValue::Bool(true)));
+    assert!(fast.live);
+    session.prompt("hi").await.unwrap();
+    assert!(
+        complete_turn(&session, &mut events)
+            .await
+            .contains("fast=true")
+    );
+    for (model, supported) in [("sonnet", false), ("default", true)] {
+        session.configure("model", model).await.unwrap();
+        loop {
+            if let EventKind::SessionUpdated(info) = next(&mut events).await.kind {
+                if info.configuration.options.get(&ConfigId::new("model"))
+                    != Some(&ConfigValue::from(model))
+                {
+                    continue;
+                }
+                assert_eq!(
+                    info.details
+                        .config_options
+                        .iter()
+                        .any(|o| o.id.as_str() == "fast"),
+                    supported
+                );
+                assert_eq!(
+                    info.configuration.options.get(&ConfigId::new("fast")),
+                    supported.then_some(&ConfigValue::Bool(true))
+                );
+                break;
+            }
+        }
+    }
+    session.close().await.unwrap();
+}
+
+/// Sonnet and catalogs without a Fast capability cannot silently accept opt-in.
+#[tokio::test]
+async fn fast_mode_rejects_unsupported_models_and_wrong_types() {
+    for (name, flags, model, value) in [
+        ("fast-sonnet", "", "sonnet", ConfigValue::Bool(true)),
+        (
+            "fast-missing",
+            "--no-fast-metadata",
+            "default",
+            ConfigValue::Bool(true),
+        ),
+        ("fast-type", "", "default", ConfigValue::from("true")),
+    ] {
+        let agent = AgentInstallation::at("claude", wrapper(name, flags));
+        let result = Runtime::new()
+            .open(
+                &agent,
+                SessionOptions::in_dir(std::env::temp_dir())
+                    .configure("model", model)
+                    .configure("fast", value),
+            )
+            .await;
+        assert!(matches!(result, Err(AgentError::InvalidConfiguration(_))));
+    }
+}
+
+/// False is a real launch override; omitted Fast defaults to off.
+#[tokio::test]
+async fn fast_mode_defaults_off_and_can_be_explicitly_disabled() {
+    let (session, _) = open("fast-off-default", "").await;
+    assert_eq!(
+        session
+            .info()
+            .configuration
+            .options
+            .get(&ConfigId::new("fast")),
+        Some(&ConfigValue::Bool(false))
+    );
+    session.close().await.unwrap();
+    let agent = AgentInstallation::at("claude", wrapper("fast-off", ""));
+    let (session, mut events) = Runtime::new()
+        .open(
+            &agent,
+            SessionOptions::in_dir(std::env::temp_dir()).configure("fast", false),
+        )
+        .await
+        .unwrap();
+    session.prompt("hi").await.unwrap();
+    assert!(
+        complete_turn(&session, &mut events)
+            .await
+            .contains("fast=false")
+    );
+    session.close().await.unwrap();
+}
+
+/// A speed change waits for the current reply and resumes its conversation.
+#[tokio::test]
+async fn fast_mode_resumes_after_the_current_turn_and_keeps_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = AgentInstallation::at("claude", wrapper("fast-resume", "--echo-relaunch"));
+    let (session, mut events) = Runtime::new()
+        .open(
+            &agent,
+            SessionOptions::in_dir(dir.path())
+                .configure("fast", false)
+                .configure("effort", "high"),
+        )
+        .await
+        .unwrap();
+    session.prompt("remember-this").await.unwrap();
+    // Hold a real tool permission so the fast change lands during the reply.
+    let permission = loop {
+        if let EventKind::RequestOpened(Request::Permission(request)) = next(&mut events).await.kind
+        {
+            break request.id;
+        }
+    };
+    session.configure("fast", true).await.unwrap();
+    session.configure("mode", "acceptEdits").await.unwrap();
+    session.configure("model", "sonnet").await.unwrap();
+    session.configure("model", "default").await.unwrap();
+    session.prompt("recall").await.unwrap();
+    session.answer(permission, allow()).await.unwrap();
+    complete_turn(&session, &mut events).await;
+    let text = complete_turn(&session, &mut events).await;
+    assert!(text.contains("recalled=remember-this"), "{text}");
+    assert!(text.contains("fast=true"), "{text}");
+    assert_eq!(session.info().resume_token.unwrap().as_str(), "sess-c1");
+    let launches: Vec<serde_json::Value> =
+        std::fs::read_to_string(dir.path().join("launches.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    assert_eq!(launches.len(), 2);
+    let args = launches[1].as_array().unwrap();
+    for (key, expected) in [
+        ("--resume", "sess-c1"),
+        ("--model", "default"),
+        ("--permission-mode", "acceptEdits"),
+        ("--effort", "high"),
+    ] {
+        let index = args.iter().position(|arg| arg == key).unwrap();
+        assert_eq!(args[index + 1], expected);
+    }
+    session.configure("fast", false).await.unwrap();
+    session.prompt("standard-again").await.unwrap();
+    let text = complete_turn(&session, &mut events).await;
+    assert!(text.contains("fast=false"), "{text}");
+    assert!(text.contains("recalled=remember-this|recall"), "{text}");
+    session.close().await.unwrap();
+}
+
+/// Before any transcript exists, Fast relaunches fresh; cancelled toggles do nothing.
+#[tokio::test]
+async fn fast_mode_before_the_first_prompt_and_redundant_toggles() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = AgentInstallation::at("claude", wrapper("fast-before-first", "--echo-relaunch"));
+    let (session, mut events) = Runtime::new()
+        .open(&agent, SessionOptions::in_dir(dir.path()))
+        .await
+        .unwrap();
+    session.configure("fast", true).await.unwrap();
+    session.prompt("first").await.unwrap();
+    assert!(
+        complete_turn(&session, &mut events)
+            .await
+            .contains("fast=true")
+    );
+    session.configure("fast", false).await.unwrap();
+    session.configure("fast", true).await.unwrap();
+    session.prompt("second").await.unwrap();
+    assert!(
+        complete_turn(&session, &mut events)
+            .await
+            .contains("recalled=first")
+    );
+    let launches = std::fs::read_to_string(dir.path().join("launches.jsonl")).unwrap();
+    assert_eq!(launches.lines().count(), 2);
+    assert!(!launches.contains("--resume"));
+    session.close().await.unwrap();
+}
+
+/// A failed resume reports the cause and closes instead of losing the prompt silently.
+#[tokio::test]
+async fn fast_mode_resume_failure_closes_the_session() {
+    let (session, mut events) = open("fast-resume-failure", "--resume-fails").await;
+    session.prompt("hi").await.unwrap();
+    complete_turn(&session, &mut events).await;
+    session.configure("fast", true).await.unwrap();
+    session.prompt("resume-me").await.unwrap();
+    let mut reported = false;
+    while let Some(event) = tokio::time::timeout(Duration::from_secs(10), events.next())
+        .await
+        .unwrap()
+    {
+        if let Ok(Event {
+            kind: EventKind::Diagnostic(d),
+            ..
+        }) = event
+        {
+            reported |= d.message.contains("fast mode resume failed")
+                && d.message.contains("resume refused");
+        }
+    }
+    assert!(reported);
+    assert!(matches!(
+        session.prompt("again").await,
+        Err(AgentError::SessionClosed)
+    ));
+}
+
+/// Resuming must not terminate a background tool still owned by the old process.
+#[tokio::test]
+async fn fast_mode_waits_for_background_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = AgentInstallation::at(
+        "claude",
+        wrapper(
+            "fast-background",
+            "--echo-relaunch --wake-once --hold-background",
+        ),
+    );
+    let (session, mut events) = Runtime::new()
+        .open(&agent, SessionOptions::in_dir(dir.path()))
+        .await
+        .unwrap();
+    session.prompt("background").await.unwrap();
+    assert_eq!(complete_turn(&session, &mut events).await, "started");
+    session.configure("fast", true).await.unwrap();
+    session.prompt("while-background-runs").await.unwrap();
+    complete_turn(&session, &mut events).await;
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("launches.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    std::fs::write(dir.path().join("release-background"), "").unwrap();
+    assert_eq!(complete_turn(&session, &mut events).await, "BG-DONE");
+    session.prompt("after-background").await.unwrap();
+    complete_turn(&session, &mut events).await;
+    let launches = std::fs::read_to_string(dir.path().join("launches.jsonl")).unwrap();
+    assert_eq!(launches.lines().count(), 2);
+    let args: Vec<String> = serde_json::from_str(launches.lines().last().unwrap()).unwrap();
+    let settings = args.iter().position(|arg| arg == "--settings").unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&args[settings + 1]).unwrap()["fastMode"],
+        true
+    );
+    assert!(args.iter().any(|arg| arg == "--resume"));
+    session.close().await.unwrap();
+}
+
+/// Relaunching a non-Opus model must not pass a retained Opus Fast preference.
+#[tokio::test]
+async fn rollback_after_a_model_switch_keeps_fast_model_gating() {
+    let agent = AgentInstallation::at("claude", wrapper("fast-rollback", ""));
+    let (session, mut events) = Runtime::new()
+        .open(
+            &agent,
+            SessionOptions::in_dir(std::env::temp_dir()).configure("fast", true),
+        )
+        .await
+        .unwrap();
+    for prompt in ["one", "two"] {
+        session.prompt(prompt).await.unwrap();
+        complete_turn(&session, &mut events).await;
+    }
+    session.configure("model", "sonnet").await.unwrap();
+    loop {
+        if let EventKind::SessionUpdated(info) = next(&mut events).await.kind
+            && info.configuration.options.get(&ConfigId::new("model"))
+                == Some(&ConfigValue::from("sonnet"))
+        {
+            break;
+        }
+    }
+    session
+        .rollback(
+            std::num::NonZeroU32::new(1).unwrap(),
+            RollbackScope::Conversation,
+        )
+        .await
+        .unwrap();
+    loop {
+        match next(&mut events).await.kind {
+            EventKind::SessionUpdated(info) if info.resume_token.is_none() => break,
+            EventKind::Diagnostic(d) => panic!("unexpected rollback diagnostic: {}", d.message),
+            _ => {}
+        }
+    }
+    session.prompt("after-rollback").await.unwrap();
+    complete_turn(&session, &mut events).await;
+    assert!(
+        !session
+            .info()
+            .configuration
+            .options
+            .contains_key(&ConfigId::new("fast"))
+    );
+    session.close().await.unwrap();
+}

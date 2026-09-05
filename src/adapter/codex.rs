@@ -250,6 +250,7 @@ fn parse_skill_commands(response: &Value) -> Vec<SlashCommand> {
 struct StartConfig {
     model: Option<String>,
     effort: Option<String>,
+    fast: Option<bool>,
     mode: Option<String>,
     sandbox: Option<String>,
 }
@@ -257,6 +258,15 @@ struct StartConfig {
 fn start_config(request: &ConnectRequest, models: &Value) -> Result<StartConfig, AgentError> {
     let mut config = StartConfig::default();
     for (id, value) in &request.options.configure {
+        if id.as_str() == "fast" {
+            let ConfigValue::Bool(fast) = value else {
+                return Err(AgentError::InvalidConfiguration(
+                    "`fast` takes a boolean".into(),
+                ));
+            };
+            config.fast = Some(*fast);
+            continue;
+        }
         let ConfigValue::Text(text) = value else {
             return Err(AgentError::InvalidConfiguration(format!(
                 "`{id}` takes a text value"
@@ -288,6 +298,17 @@ fn start_config(request: &ConnectRequest, models: &Value) -> Result<StartConfig,
                 "`{effort}` is not an effort level of the selected model"
             )));
         }
+    }
+    if config.fast == Some(true)
+        && config
+            .model
+            .clone()
+            .or_else(|| default_model(models))
+            .is_none_or(|model| fast_tier(models, &model).is_none())
+    {
+        return Err(AgentError::InvalidConfiguration(
+            "the selected model does not support fast mode".into(),
+        ));
     }
     Ok(config)
 }
@@ -447,7 +468,7 @@ fn driver_info(
                 .insert(ConfigId::new(id), ConfigValue::Text(value));
         }
     }
-    DriverInfo {
+    let mut info = DriverInfo {
         details: AgentDetails {
             version,
             auth,
@@ -460,6 +481,7 @@ fn driver_info(
                 Capability::Permissions,
                 Capability::Resume,
                 Capability::Fork,
+                Capability::Compact,
                 Capability::Plan,
                 Capability::Subagents,
                 Capability::SlashCommands,
@@ -485,7 +507,16 @@ fn driver_info(
         // Exactly one `turn/completed` per turn, even interrupted or 401.
         deterministic_turn_end: true,
         deterministic_agent_turn_end: true,
-    }
+    };
+    let model = info.configuration.options.get(&ConfigId::new("model"));
+    let supported =
+        matches!(model, Some(ConfigValue::Text(model)) if fast_tier(models, model).is_some());
+    let fast = config.fast.unwrap_or(matches!(
+        thread["serviceTier"].as_str(),
+        Some("priority" | "fast")
+    ));
+    crate::adapter::set_fast_option(&mut info, supported.then_some(fast), true);
+    info
 }
 
 // ---------------------------------------------------------------------------
@@ -498,6 +529,7 @@ enum Pending {
     Steer,
     Interrupt,
     Skills,
+    Compact,
 }
 
 /// A server→client request waiting for `answer`.
@@ -583,7 +615,7 @@ impl Drive {
             DriverCommand::StartTurn { input } => {
                 self.emit(DriverEvent::TurnAck).await?;
                 let text = self.input_text(&input).await?;
-                // model and effort ride on every turn (per-turn parameters).
+                // Model, effort, and speed ride on every turn.
                 let mut params = json!({
                     "threadId": self.thread_id,
                     "clientUserMessageId": self.mint(),
@@ -596,6 +628,16 @@ impl Drive {
                         params[key] = json!(value);
                     }
                 }
+                let fast = self.info.configuration.options.get(&ConfigId::new("fast"))
+                    == Some(&ConfigValue::Bool(true));
+                let tier = params["model"]
+                    .as_str()
+                    .and_then(|model| fast_tier(&self.models, model));
+                params["serviceTier"] = json!(if fast {
+                    tier.unwrap_or("default")
+                } else {
+                    "default"
+                });
                 let id = self.wire.request("turn/start", params).await?;
                 self.pending.insert(id, Pending::StartTurn);
             }
@@ -628,18 +670,35 @@ impl Drive {
                 }
             }
             DriverCommand::Configure(id, value) => {
-                // model and effort are per-turn parameters: apply locally,
+                // Model, effort, and speed are per-turn parameters: apply locally,
                 // the next `turn/start` carries them. mode and sandbox are
                 // creation-only, so the engine never forwards them.
-                if matches!(id.as_str(), "model" | "effort")
+                if matches!(id.as_str(), "model" | "effort" | "fast")
                     && crate::adapter::apply_selection(&mut self.info, &id, &value)
                 {
                     if let ("model", ConfigValue::Text(model)) = (id.as_str(), &value) {
                         refresh_effort(&mut self.info, &self.models, model);
+                        let fast = self.info.configuration.options.get(&ConfigId::new("fast"))
+                            == Some(&ConfigValue::Bool(true));
+                        crate::adapter::set_fast_option(
+                            &mut self.info,
+                            fast_tier(&self.models, model).map(|_| fast),
+                            true,
+                        );
                     }
                     self.emit(DriverEvent::InfoChanged(self.info.clone()))
                         .await?;
                 }
+            }
+            DriverCommand::Compact => {
+                let id = self
+                    .wire
+                    .request(
+                        "thread/compact/start",
+                        json!({ "threadId": self.thread_id }),
+                    )
+                    .await?;
+                self.pending.insert(id, Pending::Compact);
             }
             DriverCommand::Rollback(..) => {
                 // Not advertised: `thread/rollback` is deprecated upstream
@@ -695,6 +754,21 @@ impl Drive {
             Pending::Steer => self.emit(DriverEvent::Steered(error.is_none())).await?,
             // "no active turn to interrupt" means already idle: success.
             Pending::Interrupt => {}
+            // Compaction runs as its own wire turn, which ends the engine's.
+            // A refusal never starts one, so it ends that turn itself.
+            Pending::Compact => {
+                if let Some(message) = error {
+                    self.diagnostic(
+                        DiagnosticLevel::Warning,
+                        format!("compaction refused: {message}"),
+                    )
+                    .await?;
+                    self.emit(DriverEvent::TurnEnded(StopReason::Failed {
+                        message: message.to_owned(),
+                    }))
+                    .await?;
+                }
+            }
             Pending::Skills => {
                 let commands = parse_skill_commands(&frame["result"]);
                 if !commands.is_empty() {
@@ -1441,6 +1515,25 @@ fn model_entry<'a>(models: &'a Value, id: &str) -> Option<&'a Value> {
         .as_array()?
         .iter()
         .find(|m| m["id"].as_str() == Some(id))
+}
+
+/// Uses the advertised Fast tier, including the older speed-tier catalog.
+fn fast_tier<'a>(models: &'a Value, model: &str) -> Option<&'a str> {
+    let entry = model_entry(models, model)?;
+    entry["serviceTiers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|tier| tier["id"].as_str())
+        .find(|id| matches!(*id, "priority" | "fast"))
+        .or_else(|| {
+            entry["additionalSpeedTiers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .find(|id| *id == "fast")
+        })
 }
 
 fn default_model(models: &Value) -> Option<String> {

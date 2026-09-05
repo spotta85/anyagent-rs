@@ -20,8 +20,8 @@ let turn = null; // { id, started, interrupted, steered: [] }
 const waiters = {}; // server request id -> resolver
 
 const MODELS = [
-  { id: 'gpt-6', model: 'gpt-6', displayName: 'GPT-6', description: 'Frontier model.', hidden: false, isDefault: true, defaultReasoningEffort: 'medium', supportedReasoningEfforts: [{ reasoningEffort: 'low', description: 'Fast' }, { reasoningEffort: 'medium', description: 'Balanced' }, { reasoningEffort: 'high', description: 'Deep' }] },
-  { id: 'gpt-6-mini', model: 'gpt-6-mini', displayName: 'GPT-6 Mini', description: 'Small model.', hidden: false, isDefault: false, defaultReasoningEffort: 'low', supportedReasoningEfforts: [{ reasoningEffort: 'low', description: 'Fast' }, { reasoningEffort: 'medium', description: 'Balanced' }] },
+  { id: 'gpt-6', model: 'gpt-6', displayName: 'GPT-6', description: 'Frontier model.', serviceTiers: [{ id: 'priority', name: 'Fast' }], hidden: false, isDefault: true, defaultReasoningEffort: 'medium', supportedReasoningEfforts: [{ reasoningEffort: 'low', description: 'Fast' }, { reasoningEffort: 'medium', description: 'Balanced' }, { reasoningEffort: 'high', description: 'Deep' }] },
+  { id: 'gpt-6-mini', model: 'gpt-6-mini', displayName: 'GPT-6 Mini', description: 'Small model.', additionalSpeedTiers: flag('--no-mini-fast') ? [] : ['fast'], hidden: false, isDefault: false, defaultReasoningEffort: 'low', supportedReasoningEfforts: [{ reasoningEffort: 'low', description: 'Fast' }, { reasoningEffort: 'medium', description: 'Balanced' }] },
   { id: 'gpt-secret', model: 'gpt-secret', displayName: 'Secret', description: null, hidden: true, isDefault: false, defaultReasoningEffort: 'low', supportedReasoningEfforts: [] },
 ];
 const RATE_LIMITS = {
@@ -60,6 +60,7 @@ function threadResult(params) {
     thread: THREAD,
     model: 'gpt-6', // the config-file default; per-turn model rides turn/start
     reasoningEffort: null,
+    serviceTier: flag('--default-fast') ? 'priority' : null,
     approvalPolicy: params.approvalPolicy ?? 'on-request',
     sandbox: { type: sandboxType, networkAccess: false },
   };
@@ -107,6 +108,18 @@ async function onRequest(m) {
       turn = { id: `turn-${turnN++}`, started: false, interrupted: false };
       reply({ turn: { id: turn.id, status: 'inProgress' } });
       runTurn(m.params).catch(() => process.exit(1));
+      return;
+    }
+    // Recorded 2026-08-27 (11-config-plan-compact): an empty result, then a
+    // turn of its own carrying one `contextCompaction` item.
+    case 'thread/compact/start': {
+      if (flag('--compact-refuses')) return refuse('nothing to compact');
+      reply({});
+      const id = `turn-${turnN++}`;
+      send({ method: 'turn/started', params: { threadId: THREAD.id, turn: { id, status: 'inProgress' } } });
+      send({ method: 'item/started', params: { threadId: THREAD.id, turnId: id, item: { type: 'contextCompaction', id: 'cc-1' } } });
+      send({ method: 'item/completed', params: { threadId: THREAD.id, turnId: id, item: { type: 'contextCompaction', id: 'cc-1' } } });
+      send({ method: 'turn/completed', params: { threadId: THREAD.id, turn: { id, status: 'completed', error: null } } });
       return;
     }
     case 'turn/steer': {
@@ -164,7 +177,7 @@ async function runTurn(params) {
   const msg = item({ type: 'agentMessage', text: '', phase: 'final_answer' });
   itemStarted(msg);
   delta(msg.id, 'Hello ');
-  delta(msg.id, `model=${params.model ?? 'unset'} effort=${params.effort ?? 'unset'} `);
+  delta(msg.id, `model=${params.model ?? 'unset'} effort=${params.effort ?? 'unset'} tier=${params.serviceTier ?? 'unset'} `);
   if (flag('--echo-config-home')) delta(msg.id, `cfg=${process.env.CODEX_HOME ?? 'unset'} `);
   if (THREAD.forkPoint !== undefined) delta(msg.id, `fork=${THREAD.forkPoint} `);
   if (prompt.includes('Attached files:')) delta(msg.id, 'ref=1 ');

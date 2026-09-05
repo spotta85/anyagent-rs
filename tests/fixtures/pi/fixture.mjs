@@ -91,6 +91,14 @@ async function onCommand(cmd) {
       ok();
       return run(cmd.message);
     }
+    // Like pi 0.84.4: a session with nothing worth summarizing is refused
+    // (probed live). The success path is modelled, not recorded: pi cannot
+    // reach a provider on the machine this was written on.
+    case 'compact':
+      if (flag('--compact-refuses')) return no('Nothing to compact (session too small)');
+      send({ type: 'compaction_start' });
+      send({ type: 'compaction_end' });
+      return ok();
     case 'steer':
       if (!streaming) return no('nothing is streaming');
       steered.push(cmd.message);

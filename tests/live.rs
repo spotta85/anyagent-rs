@@ -21,9 +21,9 @@ use std::time::Duration;
 use futures::StreamExt;
 
 use anyagent::{
-    AgentError, Answer, AuthStatus, Capability, ConfigKind, DeliveryKind, Event, EventKind, Events,
-    MessageId, PermissionChoice, QuestionAnswer, Request, RequestId, RollbackScope, Runtime,
-    Session, SessionOptions, StopReason, ToolStatus, TurnOrigin,
+    AgentError, Answer, AuthStatus, Capability, ConfigId, ConfigKind, ConfigValue, DeliveryKind,
+    Event, EventKind, Events, MessageId, PermissionChoice, PromptId, QuestionAnswer, Request,
+    RequestId, RollbackScope, Runtime, Session, SessionOptions, StopReason, ToolStatus, TurnOrigin,
 };
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -183,6 +183,78 @@ async fn open_reports_token_capabilities_and_options() {
         }
         session.close().await.unwrap();
         pass(h, "open info complete");
+    }
+}
+
+/// Kiro effort: advertised at open, synced from metadata, switched live via the `/effort` prompt with no ack leaking as text.
+#[tokio::test]
+#[ignore = "live: talks to real agents"]
+async fn effort_switches_live_on_kiro() {
+    for h in enabled().into_iter().filter(|h| *h == "kiro") {
+        let (session, mut events, _dir) = open(h).await;
+        let effort = |session: &Session| {
+            session
+                .info()
+                .configuration
+                .options
+                .get(&ConfigId::new("effort"))
+                .cloned()
+        };
+        assert!(
+            session
+                .info()
+                .details
+                .config_options
+                .iter()
+                .any(|o| o.id.as_str() == "effort" && o.live),
+            "{h}: no live `effort` option"
+        );
+        let levels: Vec<String> = session
+            .info()
+            .details
+            .config_options
+            .iter()
+            .find(|o| o.id.as_str() == "effort")
+            .map(|o| match &o.kind {
+                ConfigKind::Select { choices } => choices.iter().map(|c| c.value.clone()).collect(),
+                _ => Vec::new(),
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            levels,
+            ["low", "medium", "high", "xhigh", "max"],
+            "{h}: levels"
+        );
+        // The metadata frame after session/new names the current level.
+        while effort(&session).is_none() {
+            next(&mut events, "effort sync").await;
+        }
+        let target = if effort(&session) == Some(ConfigValue::Text("low".into())) {
+            "medium"
+        } else {
+            "low"
+        };
+        session.configure("effort", target).await.unwrap();
+        while effort(&session) != Some(ConfigValue::Text(target.into())) {
+            let event = next(&mut events, "effort switch").await;
+            assert!(
+                !matches!(event.kind, EventKind::TextDelta { .. }),
+                "{h}: the effort ack leaked as text"
+            );
+        }
+        session
+            .prompt("Reply with just the word ok.")
+            .await
+            .unwrap();
+        let text = drain_to_turn_end(&session, &mut events, "turn after switch").await;
+        assert!(text.to_lowercase().contains("ok"), "{h}: got {text:?}");
+        assert_eq!(
+            effort(&session),
+            Some(ConfigValue::Text(target.into())),
+            "{h}: metadata disagrees after the turn"
+        );
+        session.close().await.unwrap();
+        pass(h, &format!("effort switched to {target}"));
     }
 }
 
@@ -831,6 +903,60 @@ async fn plan_usage_arrives_after_a_turn() {
     }
 }
 
+/// compact() summarizes the session's own context: the compaction is reported
+/// and the agent still remembers what it was told before it.
+#[tokio::test]
+#[ignore = "live: talks to real agents"]
+async fn compact_summarizes_the_session_without_losing_it() {
+    for h in enabled() {
+        let (session, mut events, _dir) = open(h).await;
+        if !session
+            .info()
+            .details
+            .capabilities
+            .supports(Capability::Compact)
+        {
+            println!("SKIP {h}: compaction not advertised");
+            session.close().await.unwrap();
+            continue;
+        }
+        // Two exchanges: an agent with nothing to summarize refuses.
+        session
+            .prompt("Remember this codeword: ALPHA9. Just confirm. No tools.")
+            .await
+            .unwrap();
+        drain_to_turn_end(&session, &mut events, &format!("{h}: codeword")).await;
+        session
+            .prompt("Now tell me a one-sentence fact about the number nine. No tools.")
+            .await
+            .unwrap();
+        drain_to_turn_end(&session, &mut events, &format!("{h}: filler")).await;
+
+        session.compact().await.unwrap();
+        drain_to_compaction(&session, &mut events, &format!("{h}: compaction")).await;
+
+        // Some agents answer their own compaction out loud, so the recall
+        // prompt may queue behind that turn; wait for the turn it starts.
+        let recall = session
+            .prompt("What codeword did I give you? Answer with the word only. No tools.")
+            .await
+            .unwrap();
+        let text = drain_prompt_turn(
+            &session,
+            &mut events,
+            recall.prompt_id,
+            &format!("{h}: recall"),
+        )
+        .await;
+        assert!(
+            text.contains("ALPHA9"),
+            "{h}: compaction lost the conversation: {text:?}"
+        );
+        session.close().await.unwrap();
+        pass(h, "compacted and kept the conversation");
+    }
+}
+
 /// Rollback(1, Conversation) forgets exactly the last turn and changes the resume token.
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
@@ -1220,6 +1346,53 @@ async fn drain_to_turn_end(session: &Session, events: &mut Events, step: &str) -
                 session.answer(request.id(), allow()).await.unwrap();
             }
             EventKind::TurnEnded { .. } => return text,
+            _ => {}
+        }
+    }
+}
+
+/// Drains the turn this prompt starts, skipping whatever the agent was
+/// already running, and returns that turn's text.
+async fn drain_prompt_turn(
+    session: &Session,
+    events: &mut Events,
+    prompt: PromptId,
+    step: &str,
+) -> String {
+    loop {
+        match next(events, step).await.kind {
+            EventKind::TurnStarted {
+                origin: TurnOrigin::Prompt(id),
+            } if id == prompt => break,
+            EventKind::RequestOpened(request) => {
+                session.answer(request.id(), allow()).await.unwrap();
+            }
+            _ => {}
+        }
+    }
+    drain_to_turn_end(session, events, step).await
+}
+
+/// Drains the compaction turn: it must report the compaction and then end.
+/// A refusal fails here rather than leaving a half-checked session.
+async fn drain_to_compaction(session: &Session, events: &mut Events, step: &str) {
+    let mut compacted = false;
+    loop {
+        match next(events, step).await.kind {
+            EventKind::ContextCompacted => compacted = true,
+            EventKind::RequestOpened(request) => {
+                session.answer(request.id(), allow()).await.unwrap();
+            }
+            EventKind::Diagnostic(d) if d.message.contains("compaction refused") => {
+                panic!("{step}: {}", d.message)
+            }
+            EventKind::TurnEnded { .. } => {
+                assert!(
+                    compacted,
+                    "{step}: the compaction turn reported no compaction"
+                );
+                return;
+            }
             _ => {}
         }
     }

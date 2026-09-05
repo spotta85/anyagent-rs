@@ -8,6 +8,10 @@
 //! handle plus one `Events` stream, and everything the agent does — text,
 //! tools, permission requests, turn boundaries — arrives on that stream as
 //! the same typed events regardless of which agent is on the other end.
+//!
+//! `/set <option> <value>` changes a live setting, even mid-turn — try
+//! `/set effort low` or `/set model sonnet`; the agent's own list is in
+//! `session.info().details.config_options`.
 
 use anyagent::{Answer, EventKind, PermissionChoice, Request, Runtime, SessionOptions, StopReason};
 use futures::StreamExt;
@@ -35,7 +39,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if line.trim().is_empty() {
                 continue;
             }
-            if let Err(e) = prompter.prompt(line).await {
+            // `/set effort low` etc. configures a live option; the change
+            // is confirmed by a `SessionUpdated` event, not by the call.
+            let result = match line.strip_prefix("/set ") {
+                Some(rest) => match rest.split_once(' ') {
+                    Some((id, value)) => prompter.configure(id, value).await.map(|_| ()),
+                    None => Err(anyagent::AgentError::InvalidConfiguration(
+                        "usage: /set <option> <value>".into(),
+                    )),
+                },
+                None => prompter.prompt(line).await.map(|_| ()),
+            };
+            if let Err(e) = result {
                 eprintln!("! {e}");
             }
         }
@@ -53,6 +68,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 session
                     .answer(request.id, Answer::Permission(PermissionChoice::AllowOnce))
                     .await?;
+            }
+            EventKind::SessionUpdated(info) => {
+                let set: Vec<String> = info
+                    .configuration
+                    .options
+                    .iter()
+                    .map(|(id, v)| format!("{id}={v:?}"))
+                    .collect();
+                eprintln!("  [config] {}", set.join(" "));
             }
             EventKind::TurnEnded { stop, .. } => match stop {
                 StopReason::Completed { .. } => println!("\n"),

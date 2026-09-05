@@ -123,6 +123,52 @@ Only ids from `details.config_options` are valid. The change is confirmed by a
 `SessionUpdated` event carrying the new `SessionConfiguration` — if you need to
 know it landed, wait for that rather than for `configure` to return.
 
+### Fast mode
+
+Use the same boolean for Codex and Claude:
+
+```rust
+let options = SessionOptions::in_dir("/path/to/repo").configure("fast", true);
+```
+
+The `fast` option appears in `details.config_options` only when the selected
+model advertises support. Codex reads its service-tier catalog; Claude reads
+`supportsFastMode`, including Opus through the `default` alias. The option
+updates when the model changes. No model names are hardcoded.
+
+Both providers support `session.configure("fast", true).await?`. Codex sends
+it with the next turn. Claude automatically resumes with the new launch
+setting before the next turn, keeping the same `Session` handle and conversation.
+An active reply finishes normally; background tools delay the resume until a
+subsequent turn after they finish. `SessionUpdated` confirms the selected value.
+Fast mode lowers latency with increased usage or cost. Account access and
+provider cooldowns still apply; the boolean records the selected setting.
+
+### Reasoning effort
+
+The `effort` option is the same id everywhere; only how it can be set differs:
+
+| Agent | Values | At open | Live (`configure`) |
+|---|---|---|---|
+| Claude | from the model's `supportedEffortLevels` | yes | no (creation-only) |
+| Codex | from the model catalog | yes | yes, sent with the next turn |
+| Kiro | `low`, `medium`, `high`, `xhigh`, `max`; absent on models without effort (haiku 4.5, sonnet 4.5 and older, deepseek, minimax, glm, qwen, auto) | yes | yes |
+
+```rust
+// At open
+let options = SessionOptions::in_dir("/path/to/repo").configure("effort", "low");
+
+// Mid-session (Codex, Kiro)
+session.configure("effort", "high").await?;
+```
+
+Kiro has no wire call for effort: anyagent runs its `/effort <level>` command
+as a hidden prompt. A `configure` made while a turn is running waits for that
+turn to end, and a prompt sent while the switch runs waits behind it, so
+`configure` never fails for being busy. The current level is read back from
+kiro's metadata after every turn. The option follows the model: switching to
+a model without effort removes it, and a `SessionUpdated` carries the change.
+
 ## Cancelling
 
 ```rust
@@ -162,5 +208,5 @@ if session.info().details.capabilities.supports(Capability::Steer) {
 ```
 
 The full set: `Images`, `Resume`, `Steer`, `Permissions`, `Questions`,
-`Rollback`, `RollbackFiles`, `Fork`, `SlashCommands`, `Plan`, `Subagents`,
-`ContextUsage`, `PlanUsage`.
+`Rollback`, `RollbackFiles`, `Fork`, `Compact`, `SlashCommands`, `Plan`,
+`Subagents`, `ContextUsage`, `PlanUsage`.

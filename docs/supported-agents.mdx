@@ -33,6 +33,23 @@ or set the provider's API-key variable.
 </Note>
 
 <Note>
+Compaction (`session.compact()`) is native-adapter only: claude, codex,
+opencode, and pi each have their own way to summarize a session, and the four
+are verified live except pi's success path. ACP has no compaction in schema
+1.7, so ACP agents refuse with `UnsupportedFeature` — kiro's own `/compact`
+command runs asynchronously with nothing to wait on.
+</Note>
+
+<Note>
+Kiro exposes `effort` (low / medium / high / xhigh / max) as a live config
+option on models that have it, even though it advertises none over ACP: the
+adapter reads the current level from
+kiro's metadata frames and switches it by running `/effort <level>` as a
+prompt between turns. A switch made mid-turn waits for that turn to end, and
+a prompt sent while the switch runs waits behind it.
+</Note>
+
+<Note>
 Hermes gates only its file tools behind permission requests — its terminal
 tool runs without asking, so a denied write does not stop the agent from
 writing via shell. Sandbox accordingly if that matters to your app.

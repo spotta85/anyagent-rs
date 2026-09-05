@@ -66,6 +66,21 @@ comes back as a `Diagnostic`, not an error from `rollback` itself.
 and check `RollbackFiles` before offering the option — not every agent has it.
 </Warning>
 
+## Compact
+
+Compaction asks the agent to summarize its own context, freeing room in the
+window without losing the thread.
+
+```rust
+session.compact().await?;
+```
+
+The session must be idle and advertise `Capability::Compact` (claude, codex,
+opencode, pi). Compaction occupies the agent, so it runs as an
+agent-originated turn: `ContextCompacted` reports it, prompts sent meanwhile
+queue behind it, and an agent that finds nothing to summarize says so as a
+`Diagnostic`.
+
 ## Fork vs rollback
 
 <CardGroup cols={2}>

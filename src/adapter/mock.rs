@@ -51,6 +51,8 @@ pub(crate) struct Script {
     /// Emitted before each `StartTurn`'s ack, modelling a frame from the
     /// previous turn that lost the promotion race.
     pub stale_before_ack: Option<EventKind>,
+    /// Advertise compaction; `compact` then reports `ContextCompacted`.
+    pub compact: bool,
 }
 
 impl Default for Script {
@@ -63,6 +65,7 @@ impl Default for Script {
             deterministic_agent: true,
             buffer: 64,
             stale_before_ack: None,
+            compact: false,
         }
     }
 }
@@ -195,6 +198,16 @@ async fn drive(
                     return;
                 }
             }
+            DriverCommand::Compact => {
+                if !send(DriverEvent::event(EventKind::ContextCompacted)).await
+                    || !send(DriverEvent::TurnEnded(StopReason::Completed {
+                        source: CompletionSource::Protocol,
+                    }))
+                    .await
+                {
+                    return;
+                }
+            }
             DriverCommand::Cancel | DriverCommand::Configure(..) | DriverCommand::Rollback(..) => {}
             DriverCommand::Close => return,
         }
@@ -205,6 +218,9 @@ fn info(script: &Script) -> DriverInfo {
     let mut caps = vec![Capability::Permissions, Capability::Questions];
     if script.steer {
         caps.push(Capability::Steer);
+    }
+    if script.compact {
+        caps.push(Capability::Compact);
     }
     DriverInfo {
         details: AgentDetails {
