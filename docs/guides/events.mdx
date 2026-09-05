@@ -141,7 +141,8 @@ parent in a UI.
 </ResponseField>
 
 <ResponseField name="ContextCompacted" type="—">
-  The agent compacted its context. The next `ContextUsage` will drop.
+  The agent compacted its context, on its own or because you called
+  `session.compact()`. The next `ContextUsage` will drop.
 </ResponseField>
 
 <ResponseField name="PlanUsageUpdated" type="PlanUsage">

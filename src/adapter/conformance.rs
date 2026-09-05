@@ -725,6 +725,33 @@ async fn unknown_requests_and_prompts_are_rejected() {
     );
 }
 
+/// Compaction reaches the agent only when it is advertised and the session
+/// is idle; `ContextCompacted` is the confirmation.
+#[tokio::test]
+async fn compact_runs_on_an_idle_session_and_reports_the_compaction() {
+    let script = Script {
+        compact: true,
+        ..Script::default()
+    };
+    let (session, mut events) = open(MockAdapter::new(script), None).await;
+    session.compact().await.unwrap();
+    // Compaction occupies the agent, so it is a turn of the agent's own.
+    assert!(matches!(
+        next(&mut events).await.kind,
+        EventKind::TurnStarted {
+            origin: TurnOrigin::Agent
+        }
+    ));
+    assert!(matches!(
+        next(&mut events).await.kind,
+        EventKind::ContextCompacted
+    ));
+    assert!(matches!(
+        next(&mut events).await.kind,
+        EventKind::TurnEnded { .. }
+    ));
+}
+
 /// Pulls events until `count` turns have started, answering any request;
 /// returns the prompt ids of those turns in order.
 async fn drain_turn_starts(session: &Session, events: &mut Events, count: usize) -> Vec<PromptId> {

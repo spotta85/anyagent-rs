@@ -10,7 +10,7 @@ use std::time::Duration;
 use futures::StreamExt;
 
 use anyagent::{
-    AgentError, AgentInstallation, Answer, AuthKind, AuthStatus, Capability, ConfigKind,
+    AgentError, AgentInstallation, Answer, AuthKind, AuthStatus, Capability, ConfigId, ConfigKind,
     ConfigValue, DeliveryKind, Event, EventKind, Events, Input, McpServer, PermissionChoice,
     PlanStatus, QuestionAnswer, Request, Runtime, Session, SessionOptions, StopReason, ToolInput,
     ToolKind, ToolStatus,
@@ -412,7 +412,10 @@ async fn service_tier_rides_turns_and_default_is_omitted() {
     session.configure("serviceTier", "default").await.unwrap();
     loop {
         if let EventKind::SessionUpdated(info) = next(&mut events).await.kind {
-            assert_eq!(text_option(&info, "serviceTier").as_deref(), Some("default"));
+            assert_eq!(
+                text_option(&info, "serviceTier").as_deref(),
+                Some("default")
+            );
             break;
         }
     }
@@ -840,4 +843,134 @@ async fn a_dead_agent_surfaces_the_exit_and_stderr() {
         }
     }
     drop(session);
+}
+
+/// Codex compacts through `thread/compact/start`, which runs a turn of its
+/// own; a refusal never starts one, so the adapter ends the turn itself.
+#[tokio::test]
+async fn compact_reports_the_compaction_as_an_agent_turn() {
+    let (session, mut events) = open("compact", "").await;
+    assert!(
+        session
+            .info()
+            .details
+            .capabilities
+            .supports(Capability::Compact)
+    );
+    session.compact().await.unwrap();
+    let mut kinds = Vec::new();
+    while !matches!(kinds.last(), Some(EventKind::TurnEnded { .. })) {
+        kinds.push(next(&mut events).await.kind);
+    }
+    assert!(
+        kinds
+            .iter()
+            .any(|k| matches!(k, EventKind::ContextCompacted)),
+        "{kinds:?}"
+    );
+
+    let (session, mut events) = open("compact-refused", "--compact-refuses").await;
+    session.compact().await.unwrap();
+    let mut kinds = Vec::new();
+    while !matches!(kinds.last(), Some(EventKind::TurnEnded { .. })) {
+        kinds.push(next(&mut events).await.kind);
+    }
+    assert!(
+        kinds.iter().any(
+            |k| matches!(k, EventKind::Diagnostic(d) if d.message.contains("nothing to compact"))
+        ),
+        "{kinds:?}"
+    );
+}
+
+/// Fast uses the catalog's tier, changes live, and clears on unsupported models.
+#[tokio::test]
+async fn fast_mode_follows_the_model_catalog_and_turns() {
+    let (session, mut events) = open_with(
+        "fast",
+        "--no-mini-fast",
+        SessionOptions::in_dir(std::env::temp_dir()).configure("fast", true),
+    )
+    .await
+    .unwrap();
+    let fast = session
+        .info()
+        .details
+        .config_options
+        .into_iter()
+        .find(|o| o.id.as_str() == "fast")
+        .unwrap();
+    assert_eq!(fast.kind, ConfigKind::Boolean);
+    assert_eq!(fast.current, Some(ConfigValue::Bool(true)));
+    assert!(fast.live);
+    // `default` is omitted from the turn params (probed): the fixture echoes
+    // it as `unset`.
+    for (id, value, tier) in [
+        ("fast", ConfigValue::Bool(true), "priority"),
+        ("fast", ConfigValue::Bool(false), "unset"),
+        ("fast", ConfigValue::Bool(true), "priority"),
+        ("model", ConfigValue::from("gpt-6-mini"), "unset"),
+        ("model", ConfigValue::from("gpt-6"), "unset"),
+    ] {
+        session.configure(id, value).await.unwrap();
+        session.prompt("hi").await.unwrap();
+        let text = complete_turn(&session, &mut events, PermissionChoice::AllowOnce).await;
+        assert!(text.contains(&format!("tier={tier}")), "{text}");
+        if id == "model" && tier == "unset" && text.contains("model=gpt-6-mini ") {
+            assert!(
+                !session
+                    .info()
+                    .details
+                    .config_options
+                    .iter()
+                    .any(|o| o.id.as_str() == "fast")
+            );
+            assert!(session.configure("fast", true).await.is_err());
+        }
+    }
+    session.close().await.unwrap();
+}
+
+/// Inherited Fast and the older catalog both retain the correct wire tier.
+#[tokio::test]
+async fn fast_mode_preserves_defaults_and_legacy_tiers() {
+    let (session, mut events) = open_with(
+        "fast-default",
+        "--default-fast",
+        SessionOptions::in_dir(std::env::temp_dir()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        session
+            .info()
+            .configuration
+            .options
+            .get(&ConfigId::new("fast")),
+        Some(&ConfigValue::Bool(true))
+    );
+    session.configure("model", "gpt-6-mini").await.unwrap();
+    session.prompt("hi").await.unwrap();
+    let text = complete_turn(&session, &mut events, PermissionChoice::AllowOnce).await;
+    assert!(text.contains("tier=fast"), "{text}");
+    session.close().await.unwrap();
+}
+
+/// Invalid Fast selections fail before a turn reaches the provider.
+#[tokio::test]
+async fn invalid_fast_configuration_is_rejected() {
+    for (name, model, value) in [
+        ("fast-type", "gpt-6", ConfigValue::from("true")),
+        ("fast-unsupported", "gpt-6-mini", ConfigValue::Bool(true)),
+    ] {
+        let result = open_with(
+            name,
+            "--no-mini-fast",
+            SessionOptions::in_dir(std::env::temp_dir())
+                .configure("model", model)
+                .configure("fast", value),
+        )
+        .await;
+        assert!(matches!(result, Err(AgentError::InvalidConfiguration(_))));
+    }
 }

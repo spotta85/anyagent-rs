@@ -21,16 +21,23 @@ use std::time::Duration;
 use futures::StreamExt;
 
 use anyagent::{
-    AgentError, Answer, AuthStatus, Capability, ConfigKind, DeliveryKind, Event, EventKind, Events,
-    MessageId, PermissionChoice, QuestionAnswer, Request, RequestId, ResumeToken, RollbackScope,
-    Runtime, Session, SessionOptions, StopReason, ToolStatus, TurnOrigin,
+    AgentError, Answer, AuthStatus, Capability, ConfigKind, ConfigValue, DeliveryKind, Event,
+    EventKind, Events, MessageId, PermissionChoice, PromptId, QuestionAnswer, Request, RequestId,
+    ResumeToken, RollbackScope, Runtime, Session, SessionOptions, StopReason, ToolStatus,
+    TurnOrigin,
 };
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(120);
 const OPENCODE_MODEL: &str = "opencode/big-pickle";
+/// The host config's default (`gpt-6-astra`) needs a newer CLI; luna is cheap and available.
+const CODEX_MODEL: &str = "gpt-5.6-luna";
 /// pi's model values are `provider/modelId`.
 const PI_MODEL: &str = "openrouter/nvidia/nemotron-3-super-120b-a12b:free";
 const COUNT: &str = "Count from 1 to 400, one number per line. No other text. No tools.";
+const TITLE: &str = "Title this conversation in at most six words: the user asked how to rename \
+a git branch. Reply with only the title. No tools.";
+/// `generate` pins claude to Opus 4.8 so the one-shot path is checked on a real model choice.
+const CLAUDE_GENERATE_MODEL: &str = "claude-opus-4-8";
 
 // -- gate -------------------------------------------------------------------
 
@@ -188,6 +195,100 @@ async fn open_reports_token_capabilities_and_options() {
     }
 }
 
+/// Effort is one option everywhere it exists: `effort`, a live select whose choices follow the model, switched via `configure` and confirmed by `SessionUpdated`; verified on kiro, grok, opencode, pi.
+#[tokio::test]
+#[ignore = "live: talks to real agents"]
+async fn effort_switches_live() {
+    // grok is not in the shared matrix (no modes, so other tests would
+    // fail on it); this test names its own harnesses.
+    let list = std::env::var("ANYAGENT_LIVE").unwrap_or_default();
+    let named = |h: &str| list == "all" || list.split(',').any(|p| p.trim() == h);
+    for h in ["kiro", "grok", "opencode", "pi"]
+        .into_iter()
+        .filter(|h| named(h))
+    {
+        let runtime = Runtime::new();
+        if runtime.discover().await.require(h).is_err() {
+            println!("SKIP {h}: not discovered");
+            continue;
+        }
+        let (session, mut events, _dir) = open(h).await;
+        let option = |session: &Session| {
+            session
+                .info()
+                .details
+                .config_options
+                .into_iter()
+                .find(|o| o.id.as_str() == "effort")
+        };
+        // The pinned zen model has no variants; a free one with them also
+        // proves the option follows a live model switch.
+        if h == "opencode" {
+            session
+                .configure("model", "opencode/ling-3.0-flash-fin-free")
+                .await
+                .unwrap();
+            while option(&session).is_none() {
+                next(&mut events, "effort after model switch").await;
+            }
+        }
+        let Some(effort) = option(&session) else {
+            assert_ne!(h, "kiro", "kiro: no `effort` option");
+            println!("SKIP {h}: the selected model has no effort levels");
+            session.close().await.unwrap();
+            continue;
+        };
+        assert!(effort.live, "{h}: effort is not live");
+        let ConfigKind::Select { choices } = &effort.kind else {
+            panic!("{h}: effort is not a select");
+        };
+        let levels: Vec<&str> = choices.iter().map(|c| c.value.as_str()).collect();
+        if h == "kiro" {
+            assert_eq!(
+                levels,
+                ["low", "medium", "high", "xhigh", "max"],
+                "{h}: levels"
+            );
+        }
+        // kiro reports the current level in a metadata frame right after open.
+        if h == "kiro" {
+            while option(&session).is_some_and(|o| o.current.is_none()) {
+                next(&mut events, "effort sync").await;
+            }
+        }
+        let current = option(&session).and_then(|o| o.current);
+        let target = levels
+            .iter()
+            .find(|l| Some(ConfigValue::Text((**l).to_owned())) != current)
+            .copied()
+            .expect("a level other than the current one");
+        session.configure("effort", target).await.unwrap();
+        while option(&session).and_then(|o| o.current) != Some(ConfigValue::Text(target.into())) {
+            let event = next(&mut events, "effort switch").await;
+            assert!(
+                !matches!(event.kind, EventKind::TextDelta { .. }),
+                "{h}: a switch leaked text"
+            );
+        }
+        session
+            .prompt("Reply with just the word ok.")
+            .await
+            .unwrap();
+        let text = drain_to_turn_end(&session, &mut events, "turn after switch").await;
+        assert!(text.to_lowercase().contains("ok"), "{h}: got {text:?}");
+        assert_eq!(
+            option(&session).and_then(|o| o.current),
+            Some(ConfigValue::Text(target.into())),
+            "{h}: effort changed under us after the turn"
+        );
+        session.close().await.unwrap();
+        pass(
+            h,
+            &format!("effort switched to {target} ({} levels)", levels.len()),
+        );
+    }
+}
+
 /// Probe returns version + model/mode + commands without creating a session or leaving claude transcripts.
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
@@ -242,6 +343,66 @@ async fn probe_reports_details_without_a_session() {
             ),
         );
     }
+}
+
+/// `generate` is prompt in, text out, with no session to manage; claude runs it on Opus 4.8.
+#[tokio::test]
+#[ignore = "live: talks to real agents"]
+async fn generate_returns_text_without_a_session() {
+    for h in enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new();
+        let report = runtime.discover().await;
+        let agent = report
+            .require(h)
+            .unwrap_or_else(|_| panic!("{h}: not discovered"));
+        let mut opts = options(h, dir.path());
+        if h == "claude" {
+            opts = opts.configure("model", CLAUDE_GENERATE_MODEL);
+        }
+        let text = runtime
+            .generate(agent, opts, TITLE)
+            .await
+            .unwrap_or_else(|e| panic!("{h}: generate failed: {e}"));
+        assert!(text.to_lowercase().contains("branch"), "{h}: got {text:?}");
+        assert!(
+            text.split_whitespace().count() <= 8,
+            "{h}: not a title: {text:?}"
+        );
+        pass(h, &format!("generate returned {text:?}"));
+    }
+}
+
+/// Even a prompt asking to read a file cannot enable Pi's tools during generation.
+#[tokio::test]
+#[ignore = "live: talks to real agents"]
+async fn pi_generate_stays_text_only() {
+    // Pi can authenticate through OAuth without OPENROUTER_API_KEY.
+    let selected = std::env::var("ANYAGENT_LIVE").unwrap_or_default();
+    if selected != "all" && !selected.split(',').any(|h| h.trim() == "pi") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("context.txt"), "tool-only context").unwrap();
+    let log = dir.path().join("wire.jsonl");
+    let runtime = Runtime::new();
+    let report = runtime.discover().await;
+    let agent = report.require("pi").expect("pi not discovered");
+    let text = tokio::time::timeout(EVENT_TIMEOUT, runtime.generate(
+        agent, options("pi", dir.path()).record_wire(&log),
+        "Read context.txt using a tool, then return a short summary. If no tools are available, say that briefly.",
+    )).await.expect("pi generation timed out").expect("pi generation failed");
+    assert!(!text.trim().is_empty());
+    let wire = std::fs::read_to_string(log).unwrap();
+    assert!(
+        !wire.contains("tool_execution_") && !wire.contains("toolcall_start"),
+        "Pi attempted a tool call"
+    );
+    assert!(
+        !wire.contains("\"sessionFile\":\""),
+        "Pi persisted its session"
+    );
+    pass("pi", &format!("tool-free generation returned {text:?}"));
 }
 
 /// Turn is bracketed by TurnStarted(Prompt)/TurnEnded(Completed), sequences strictly increase, and stays quiet after end.
@@ -880,6 +1041,60 @@ async fn plan_usage_arrives_after_a_turn() {
     }
 }
 
+/// compact() summarizes the session's own context: the compaction is reported
+/// and the agent still remembers what it was told before it.
+#[tokio::test]
+#[ignore = "live: talks to real agents"]
+async fn compact_summarizes_the_session_without_losing_it() {
+    for h in enabled() {
+        let (session, mut events, _dir) = open(h).await;
+        if !session
+            .info()
+            .details
+            .capabilities
+            .supports(Capability::Compact)
+        {
+            println!("SKIP {h}: compaction not advertised");
+            session.close().await.unwrap();
+            continue;
+        }
+        // Two exchanges: an agent with nothing to summarize refuses.
+        session
+            .prompt("Remember this codeword: ALPHA9. Just confirm. No tools.")
+            .await
+            .unwrap();
+        drain_to_turn_end(&session, &mut events, &format!("{h}: codeword")).await;
+        session
+            .prompt("Now tell me a one-sentence fact about the number nine. No tools.")
+            .await
+            .unwrap();
+        drain_to_turn_end(&session, &mut events, &format!("{h}: filler")).await;
+
+        session.compact().await.unwrap();
+        drain_to_compaction(&session, &mut events, &format!("{h}: compaction")).await;
+
+        // Some agents answer their own compaction out loud, so the recall
+        // prompt may queue behind that turn; wait for the turn it starts.
+        let recall = session
+            .prompt("What codeword did I give you? Answer with the word only. No tools.")
+            .await
+            .unwrap();
+        let text = drain_prompt_turn(
+            &session,
+            &mut events,
+            recall.prompt_id,
+            &format!("{h}: recall"),
+        )
+        .await;
+        assert!(
+            text.contains("ALPHA9"),
+            "{h}: compaction lost the conversation: {text:?}"
+        );
+        session.close().await.unwrap();
+        pass(h, "compacted and kept the conversation");
+    }
+}
+
 /// Rollback(1, Conversation) forgets exactly the last turn and changes the resume token.
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
@@ -1240,7 +1455,17 @@ async fn open(harness: &str) -> (Session, Events, tempfile::TempDir) {
     let agent = report
         .require(harness)
         .unwrap_or_else(|_| panic!("{harness}: not discovered"));
-    let mut options = SessionOptions::in_dir(dir.path());
+    let (session, events) = runtime
+        .open(agent, options(harness, dir.path()))
+        .await
+        .unwrap_or_else(|e| panic!("{harness}: open failed: {e}"));
+    (session, events, dir)
+}
+
+/// The per-harness options every live session opens with: pinned models
+/// and deterministic approvals.
+fn options(harness: &str, dir: &std::path::Path) -> SessionOptions {
+    let mut options = SessionOptions::in_dir(dir);
     if harness == "opencode" {
         options = options.configure("model", OPENCODE_MODEL);
     }
@@ -1251,14 +1476,11 @@ async fn open(harness: &str) -> (Session, Events, tempfile::TempDir) {
         // Deterministic approvals regardless of the host config: a write
         // escalates past the read-only sandbox and asks.
         options = options
+            .configure("model", CODEX_MODEL)
             .configure("sandbox", "read-only")
             .configure("mode", "on-request");
     }
-    let (session, events) = runtime
-        .open(agent, options)
-        .await
-        .unwrap_or_else(|e| panic!("{harness}: open failed: {e}"));
-    (session, events, dir)
+    options
 }
 
 /// Next event within the timeout; a hang fails naming the step.
@@ -1282,6 +1504,53 @@ async fn drain_to_turn_end(session: &Session, events: &mut Events, step: &str) -
                 session.answer(request.id(), allow()).await.unwrap();
             }
             EventKind::TurnEnded { .. } => return text,
+            _ => {}
+        }
+    }
+}
+
+/// Drains the turn this prompt starts, skipping whatever the agent was
+/// already running, and returns that turn's text.
+async fn drain_prompt_turn(
+    session: &Session,
+    events: &mut Events,
+    prompt: PromptId,
+    step: &str,
+) -> String {
+    loop {
+        match next(events, step).await.kind {
+            EventKind::TurnStarted {
+                origin: TurnOrigin::Prompt(id),
+            } if id == prompt => break,
+            EventKind::RequestOpened(request) => {
+                session.answer(request.id(), allow()).await.unwrap();
+            }
+            _ => {}
+        }
+    }
+    drain_to_turn_end(session, events, step).await
+}
+
+/// Drains the compaction turn: it must report the compaction and then end.
+/// A refusal fails here rather than leaving a half-checked session.
+async fn drain_to_compaction(session: &Session, events: &mut Events, step: &str) {
+    let mut compacted = false;
+    loop {
+        match next(events, step).await.kind {
+            EventKind::ContextCompacted => compacted = true,
+            EventKind::RequestOpened(request) => {
+                session.answer(request.id(), allow()).await.unwrap();
+            }
+            EventKind::Diagnostic(d) if d.message.contains("compaction refused") => {
+                panic!("{step}: {}", d.message)
+            }
+            EventKind::TurnEnded { .. } => {
+                assert!(
+                    compacted,
+                    "{step}: the compaction turn reported no compaction"
+                );
+                return;
+            }
             _ => {}
         }
     }

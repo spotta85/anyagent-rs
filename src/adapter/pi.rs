@@ -125,6 +125,9 @@ fn launch_args(options: &SessionOptions) -> Result<Vec<String>, AgentError> {
         ));
     }
     let mut args = Vec::new();
+    if options.no_tools {
+        args.extend(["--no-tools".into(), "--no-session".into()]);
+    }
     match &options.start {
         SessionStart::New => {}
         SessionStart::Resume(token) => {
@@ -149,7 +152,7 @@ fn launch_args(options: &SessionOptions) -> Result<Vec<String>, AgentError> {
                 args.push("--model".to_owned());
                 args.push(model_id.to_owned());
             }
-            ("thinking", ConfigValue::Text(level)) => {
+            ("effort", ConfigValue::Text(level)) => {
                 args.push("--thinking".to_owned());
                 args.push(level.clone());
             }
@@ -255,7 +258,7 @@ fn driver_info(
     version: Option<String>,
 ) -> DriverInfo {
     let model = model_value(&state["model"]);
-    let thinking = state["thinkingLevel"].as_str().map(str::to_owned);
+    let effort = state["thinkingLevel"].as_str().map(str::to_owned);
     let mut configuration = SessionConfiguration::default();
     let mut config_options = vec![ConfigOption {
         id: ConfigId::new("model"),
@@ -267,10 +270,10 @@ fn driver_info(
         current: model.clone().map(ConfigValue::Text),
         live: true,
     }];
-    if let Some(option) = thinking_option(&levels["levels"], thinking.clone()) {
+    if let Some(option) = effort_option(&levels["levels"], effort.clone()) {
         config_options.push(option);
     }
-    for (id, value) in [("model", model), ("thinking", thinking)] {
+    for (id, value) in [("model", model), ("effort", effort)] {
         if let Some(value) = value {
             configuration
                 .options
@@ -291,6 +294,7 @@ fn driver_info(
                 Capability::SlashCommands,
                 Capability::ContextUsage,
                 Capability::Questions,
+                Capability::Compact,
             ]),
             config_options,
             commands: slash_commands(&commands["commands"]),
@@ -347,9 +351,10 @@ fn split_model(value: &str) -> Result<(&str, &str), AgentError> {
     }
 }
 
-/// The thinking levels of the *current* model; a model without reasoning
-/// support reports `off` alone, which is not worth advertising.
-fn thinking_option(levels: &Value, current: Option<String>) -> Option<ConfigOption> {
+/// Pi's thinking levels for the *current* model as the `effort` option; a
+/// model without reasoning support reports `off` alone, which is not worth
+/// advertising.
+fn effort_option(levels: &Value, current: Option<String>) -> Option<ConfigOption> {
     let choices: Vec<ConfigChoice> = levels
         .as_array()?
         .iter()
@@ -363,8 +368,8 @@ fn thinking_option(levels: &Value, current: Option<String>) -> Option<ConfigOpti
     // A level the new model does not offer is not the current one.
     let current = current.filter(|level| choices.iter().any(|c| &c.value == level));
     (choices.len() > 1).then(|| ConfigOption {
-        id: ConfigId::new("thinking"),
-        name: "Thinking level".into(),
+        id: ConfigId::new("effort"),
+        name: "Reasoning effort".into(),
         category: Some("thought_level".into()),
         kind: ConfigKind::Select { choices },
         current: current.map(ConfigValue::Text),
@@ -403,6 +408,7 @@ enum Pending {
     Configure(ConfigId, ConfigValue),
     /// Thinking levels belong to the model, so a model change re-reads them.
     Thinking,
+    Compact,
 }
 
 struct Drive {
@@ -491,6 +497,13 @@ impl Drive {
                     self.wire.cancel_dialog(&wire_id).await?;
                 }
             }
+            // `compact` answers once, and that receipt ends the compaction
+            // turn; `compaction_end` reports the compaction itself, as it
+            // does for pi's own automatic compactions.
+            DriverCommand::Compact => {
+                let id = self.wire.send("compact", json!({})).await?;
+                self.pending.insert(id, Pending::Compact);
+            }
             DriverCommand::Configure(id, value) => self.configure(id, value).await?,
             DriverCommand::Rollback(..) => {
                 // Not advertised: pi forks a new session instead of rewinding.
@@ -572,6 +585,25 @@ impl Drive {
                 .await
             }
             Pending::Steer => self.emit(DriverEvent::Steered(success)).await,
+            // pi refuses a session that is too small to be worth summarizing.
+            // Either way the receipt is the end of the compaction turn.
+            Pending::Compact if !success => {
+                self.diagnostic(
+                    DiagnosticLevel::Warning,
+                    format!("compaction refused: {error}"),
+                )
+                .await?;
+                self.emit(DriverEvent::TurnEnded(StopReason::Failed {
+                    message: error.to_owned(),
+                }))
+                .await
+            }
+            Pending::Compact => {
+                self.emit(DriverEvent::TurnEnded(StopReason::Completed {
+                    source: CompletionSource::Protocol,
+                }))
+                .await
+            }
             Pending::Configure(id, _) if !success => {
                 self.diagnostic(
                     DiagnosticLevel::Warning,
@@ -597,22 +629,22 @@ impl Drive {
             }
             Pending::Thinking if !success => Ok(()),
             Pending::Thinking => {
-                let current = self.selected("thinking");
-                let option = thinking_option(&frame["data"]["levels"], current);
+                let current = self.selected("effort");
+                let option = effort_option(&frame["data"]["levels"], current);
                 self.info
                     .details
                     .config_options
-                    .retain(|o| o.id.as_str() != "thinking");
+                    .retain(|o| o.id.as_str() != "effort");
                 self.info
                     .configuration
                     .options
-                    .remove(&ConfigId::new("thinking"));
+                    .remove(&ConfigId::new("effort"));
                 if let Some(option) = option {
                     if let Some(ConfigValue::Text(level)) = option.current.clone() {
                         self.info
                             .configuration
                             .options
-                            .insert(ConfigId::new("thinking"), ConfigValue::Text(level));
+                            .insert(ConfigId::new("effort"), ConfigValue::Text(level));
                     }
                     self.info.details.config_options.push(option);
                 }
@@ -843,7 +875,7 @@ impl Drive {
                         .await;
                 }
             },
-            "thinking" => ("set_thinking_level", json!({ "level": text })),
+            "effort" => ("set_thinking_level", json!({ "level": text })),
             _ => return Ok(()),
         };
         let wire_id = self.wire.send(command, body).await?;

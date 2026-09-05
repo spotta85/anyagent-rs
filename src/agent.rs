@@ -150,6 +150,8 @@ pub enum Capability {
     /// `rollback` may also restore the files the dropped turns changed.
     RollbackFiles,
     Fork,
+    /// `compact` can summarize the session's context on demand.
+    Compact,
     SlashCommands,
     Plan,
     Subagents,
@@ -278,7 +280,7 @@ impl Capabilities {
 }
 
 /// A session setting the agent advertises. Well-known ids: `model`, `effort`,
-/// `mode`, `sandbox`.
+/// `mode`, `sandbox`, `fast` (boolean, lower latency with increased usage).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigOption {
     pub id: ConfigId,
@@ -286,6 +288,7 @@ pub struct ConfigOption {
     pub category: Option<String>,
     pub kind: ConfigKind,
     pub current: Option<ConfigValue>,
+    /// Changeable through `Session::configure`; the adapter may resume internally.
     pub live: bool,
 }
 
@@ -366,6 +369,7 @@ pub struct SessionOptions {
     pub(crate) cwd: PathBuf,
     pub(crate) start: SessionStart,
     pub(crate) permission_mode: PermissionMode,
+    pub(crate) no_tools: bool,
     pub(crate) quiet_window: Option<Duration>,
     pub(crate) mcp_servers: Vec<McpServer>,
     pub(crate) configure: Vec<(ConfigId, ConfigValue)>,
@@ -392,6 +396,7 @@ impl SessionOptions {
             cwd: std::path::absolute(&cwd).unwrap_or(cwd),
             start: SessionStart::New,
             permission_mode: PermissionMode::Ask,
+            no_tools: false,
             quiet_window: None,
             mcp_servers: Vec::new(),
             configure: Vec::new(),

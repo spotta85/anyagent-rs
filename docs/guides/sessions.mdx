@@ -38,6 +38,19 @@ let (session, events) = runtime
 exactly what crossed the wire, unredacted (prompts, file contents, command
 output — possibly secrets), so treat the file as sensitive.
 
+## One-shot generation
+
+`runtime.generate(agent, options, prompt)` returns text and closes the session.
+It requires a new session; resume and fork options are rejected. Permission
+requests are denied, free-text questions receive a blank answer, and questions
+requiring a choice cancel generation. Any reported tool activity also cancels
+generation, including a proposed call that has not executed.
+
+For native Pi, generation launches with `--no-tools --no-session`. Tools are
+disabled and the session is not saved. Include context inline in the prompt;
+path attachments cannot be opened without tools. Other agents must expose
+permission requests to support generation.
+
 ## Prompting
 
 ```rust
@@ -123,6 +136,60 @@ Only ids from `details.config_options` are valid. The change is confirmed by a
 `SessionUpdated` event carrying the new `SessionConfiguration` — if you need to
 know it landed, wait for that rather than for `configure` to return.
 
+### Fast mode
+
+Use the same boolean for Codex and Claude:
+
+```rust
+let options = SessionOptions::in_dir("/path/to/repo").configure("fast", true);
+```
+
+The `fast` option appears in `details.config_options` only when the selected
+model advertises support. Codex reads its service-tier catalog; Claude reads
+`supportsFastMode`, including Opus through the `default` alias. The option
+updates when the model changes. No model names are hardcoded.
+
+Both providers support `session.configure("fast", true).await?`. Codex sends
+it with the next turn. Claude automatically resumes with the new launch
+setting before the next turn, keeping the same `Session` handle and conversation.
+An active reply finishes normally; background tools delay the resume until a
+subsequent turn after they finish. `SessionUpdated` confirms the selected value.
+Fast mode lowers latency with increased usage or cost. Account access and
+provider cooldowns still apply; the boolean records the selected setting.
+
+### Reasoning effort
+
+The `effort` option is the same everywhere it exists: a live select whose
+choices follow the selected model. Set it at open or mid-session, and read the
+result from `SessionUpdated`.
+
+```rust
+// At open
+let options = SessionOptions::in_dir("/path/to/repo").configure("effort", "low");
+
+// Mid-session
+session.configure("effort", "high").await?;
+```
+
+| Agent | Where the choices come from | Live |
+|---|---|---|
+| Claude | the model's `supportedEffortLevels` | no, creation-only |
+| Codex | its model catalog, sent with the next turn | yes |
+| opencode | the model's `variants`, sent as `variant` with every prompt | yes |
+| grok | the model's `reasoningEfforts`, with grok's labels, set through `set_model` | yes |
+| pi | the model's thinking levels | yes |
+| Kiro | `low`, `medium`, `high`, `xhigh`, `max`; absent on models without effort (haiku 4.5, sonnet 4.5 and older, deepseek, minimax, glm, qwen, auto) | yes |
+
+Switching the model rebuilds the choices, and a model without any drops the
+option; a `SessionUpdated` carries either change. Hermes and qwen expose no
+levels and no way to set one, so they have no `effort` option.
+
+Kiro has no wire call for effort: anyagent runs its `/effort <level>` command
+as a hidden prompt. A `configure` made while a turn is running waits for that
+turn to end, and a prompt sent while the switch runs waits behind it, so
+`configure` never fails for being busy. The current level is read back from
+kiro's metadata after every turn.
+
 ## Cancelling
 
 ```rust
@@ -162,5 +229,5 @@ if session.info().details.capabilities.supports(Capability::Steer) {
 ```
 
 The full set: `Images`, `Resume`, `Steer`, `Permissions`, `Questions`,
-`Rollback`, `RollbackFiles`, `Fork`, `SlashCommands`, `Plan`, `Subagents`,
-`ContextUsage`, `PlanUsage`.
+`Rollback`, `RollbackFiles`, `Fork`, `Compact`, `SlashCommands`, `Plan`,
+`Subagents`, `ContextUsage`, `PlanUsage`.

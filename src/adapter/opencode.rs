@@ -76,6 +76,7 @@ impl Adapter for OpencodeAdapter {
                 info: launched.info,
                 session_id: launched.session_id,
                 windows: launched.windows,
+                variants: launched.variants,
                 login: login_methods(&request.installation),
                 messages: HashMap::new(),
                 ended: HashSet::new(),
@@ -117,6 +118,7 @@ struct Launched {
     info: DriverInfo,
     session_id: String,
     windows: HashMap<String, u64>,
+    variants: HashMap<String, Vec<String>>,
 }
 
 /// Spawns the server, waits for health, subscribes to the event bus, binds
@@ -149,8 +151,9 @@ async fn launch(
     let boot = async {
         let version = await_health(&http).await?;
         let frames = open_bus(&http, recorder.clone()).await?;
-        let (info, session_id, windows) = handshake(&http, request, recorder, version).await?;
-        Ok((frames, info, session_id, windows))
+        let (info, session_id, windows, variants) =
+            handshake(&http, request, recorder, version).await?;
+        Ok((frames, info, session_id, windows, variants))
     };
     let outcome = tokio::time::timeout(HANDSHAKE_TIMEOUT, boot).await;
     // A squatter on the picked port (the pick-then-bind race) makes opencode
@@ -161,13 +164,14 @@ async fn launch(
         return Err(AgentError::ProcessExited { status, stderr });
     }
     match outcome {
-        Ok(Ok((frames, info, session_id, windows))) => Ok(Launched {
+        Ok(Ok((frames, info, session_id, windows, variants))) => Ok(Launched {
             server,
             http,
             frames,
             info,
             session_id,
             windows,
+            variants,
         }),
         Ok(Err(e)) => {
             let e = crate::adapter::with_stderr(e, &server);
@@ -220,7 +224,15 @@ async fn handshake(
     request: &ConnectRequest,
     recorder: Option<WireRecorder>,
     version: Option<String>,
-) -> Result<(DriverInfo, String, HashMap<String, u64>), AgentError> {
+) -> Result<
+    (
+        DriverInfo,
+        String,
+        HashMap<String, u64>,
+        HashMap<String, Vec<String>>,
+    ),
+    AgentError,
+> {
     let providers = http.get("/config/providers").await?;
     let connected = http.get("/provider").await?["connected"].clone();
     let commands = http.get("/command").await?;
@@ -233,7 +245,7 @@ async fn handshake(
         .ok_or_else(|| AgentError::ProtocolFailed("session create returned no id".into()))?
         .to_owned();
     let choices = model_choices(&providers, &connected);
-    let configured = start_model(&request.options, &choices)?;
+    let (model, effort) = start_config(&request.options, &choices)?;
     let mut info = driver_info(
         choices,
         &commands,
@@ -241,18 +253,29 @@ async fn handshake(
         auth_status(request, &connected),
         version,
     );
-    // A creation-time `configure("model", …)` overrides the session default
-    // (v1 has no model endpoint, so it rides every prompt).
-    if let Some(model) = configured {
+    // Creation-time `configure` overrides the session defaults (v1 has no
+    // model endpoint, so model and effort ride every prompt).
+    if let Some(model) = model {
         apply_selection(
             &mut info,
             &ConfigId::new("model"),
             &ConfigValue::Text(model),
         );
     }
+    let variants = model_variants(&providers);
+    sync_effort(&mut info, &variants);
+    if let Some(effort) = effort {
+        let value = ConfigValue::Text(effort.clone());
+        if !offers(&info, "effort", &value) {
+            return Err(AgentError::InvalidConfiguration(format!(
+                "`{effort}` is not a choice for `effort`"
+            )));
+        }
+        apply_selection(&mut info, &ConfigId::new("effort"), &value);
+    }
     // The `ses_…` id is the durable handle: resuming re-adopts it.
     info.resume_token = Some(ResumeToken::new(&session_id));
-    Ok((info, session_id, model_windows(&providers)))
+    Ok((info, session_id, model_windows(&providers), variants))
 }
 
 /// Polls `/global/health` until the server answers, returning its version.
@@ -377,6 +400,7 @@ fn driver_info(
                 Capability::Permissions,
                 Capability::Questions,
                 Capability::Rollback,
+                Capability::Compact,
                 Capability::SlashCommands,
                 Capability::Plan,
                 Capability::ContextUsage,
@@ -474,35 +498,110 @@ fn current_model(info: &DriverInfo) -> Option<String> {
     }
 }
 
-/// Creation-time `configure` values, validated: only `model`, and only one
-/// of the advertised choices (an unknown model would fail the first turn).
-fn start_model(
+/// Creation-time `configure` values as (model, effort): only those two,
+/// and the model only from the advertised choices (an unknown model would
+/// fail the first turn). Effort is checked once the model is known.
+fn start_config(
     options: &SessionOptions,
     choices: &[ConfigChoice],
-) -> Result<Option<String>, AgentError> {
+) -> Result<(Option<String>, Option<String>), AgentError> {
     let mut model = None;
+    let mut effort = None;
     for (id, value) in &options.configure {
-        let text = match (id.as_str(), value) {
-            ("model", ConfigValue::Text(text)) => text,
-            ("model", _) => {
-                return Err(AgentError::InvalidConfiguration(
-                    "`model` takes a text value".into(),
-                ));
-            }
+        let slot = match id.as_str() {
+            "model" => &mut model,
+            "effort" => &mut effort,
             _ => {
                 return Err(AgentError::InvalidConfiguration(format!(
                     "`{id}` is not a creation-time option of this agent"
                 )));
             }
         };
-        if !choices.iter().any(|c| &c.value == text) {
+        let ConfigValue::Text(text) = value else {
+            return Err(AgentError::InvalidConfiguration(format!(
+                "`{id}` takes a text value"
+            )));
+        };
+        if id.as_str() == "model" && !choices.iter().any(|c| &c.value == text) {
             return Err(AgentError::InvalidConfiguration(format!(
                 "`{text}` is not a choice for `model`"
             )));
         }
-        model = Some(text.clone());
+        *slot = Some(text.clone());
     }
-    Ok(model)
+    Ok((model, effort))
+}
+
+/// Every model's reasoning variants from the provider catalog, keyed
+/// `providerID/modelID` and in ladder order; models without any are absent.
+fn model_variants(providers: &Value) -> HashMap<String, Vec<String>> {
+    const LADDER: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+    let mut variants = HashMap::new();
+    for provider in providers["providers"].as_array().into_iter().flatten() {
+        let Some(pid) = provider["id"].as_str() else {
+            continue;
+        };
+        for (mid, model) in provider["models"].as_object().into_iter().flatten() {
+            let mut names: Vec<String> = model["variants"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(name, _)| name.clone())
+                .collect();
+            if names.is_empty() {
+                continue;
+            }
+            names.sort_by_key(|n| LADDER.iter().position(|l| l == n).unwrap_or(LADDER.len()));
+            variants.insert(format!("{pid}/{mid}"), names);
+        }
+    }
+    variants
+}
+
+/// Makes the `effort` option match the selected model: its variants as
+/// choices, the selection kept when the model offers it, and no option for
+/// a model without variants. The value rides every prompt as `variant`.
+fn sync_effort(info: &mut DriverInfo, variants: &HashMap<String, Vec<String>>) {
+    let id = ConfigId::new("effort");
+    let current = match info.configuration.options.remove(&id) {
+        Some(ConfigValue::Text(effort)) => Some(effort),
+        _ => None,
+    };
+    info.details.config_options.retain(|o| o.id != id);
+    let Some(names) = current_model(info).and_then(|model| variants.get(&model)) else {
+        return;
+    };
+    let current = current.filter(|c| names.contains(c)).map(ConfigValue::Text);
+    if let Some(current) = &current {
+        info.configuration
+            .options
+            .insert(id.clone(), current.clone());
+    }
+    info.details.config_options.push(ConfigOption {
+        id,
+        name: "Reasoning effort".into(),
+        category: Some("thought_level".into()),
+        kind: ConfigKind::Select {
+            choices: names
+                .iter()
+                .map(|name| ConfigChoice {
+                    value: name.clone(),
+                    label: name.clone(),
+                    description: None,
+                })
+                .collect(),
+        },
+        current,
+        live: true,
+    });
+}
+
+/// Whether the advertised select `id` offers `value`.
+fn offers(info: &DriverInfo, id: &str, value: &ConfigValue) -> bool {
+    info.details.config_options.iter().any(|o| {
+        o.id.as_str() == id
+            && matches!((&o.kind, value), (ConfigKind::Select { choices }, ConfigValue::Text(v)) if choices.iter().any(|c| &c.value == v))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -541,6 +640,8 @@ struct Drive {
     login: Vec<LoginMethod>,
     /// Context window per model, for `ContextUsage`.
     windows: HashMap<String, u64>,
+    /// Reasoning variants per model, behind the `effort` option.
+    variants: HashMap<String, Vec<String>>,
     /// Assistant `msg_…` id → our streaming message id. Only assistant
     /// messages are minted, so membership gates what streams (the user
     /// message carries a replay of our own prompt).
@@ -650,6 +751,9 @@ impl Drive {
                 self.turn_error = None;
                 self.start_turn(&input).await?;
             }
+            // `summarize` streams the summary and settles like a turn, so
+            // the drive loop tracks it as one (probed 2026-09-04, 1.18.27).
+            DriverCommand::Compact => self.compact().await?,
             // Never reached: Steer is unadvertised, so the engine queues
             // mid-turn prompts and re-sends them as `StartTurn`.
             DriverCommand::Steer { .. } => self.emit(DriverEvent::Steered(false)).await?,
@@ -705,6 +809,14 @@ impl Drive {
         let mut body = json!({ "parts": parts });
         if let Some(model) = self.model_body() {
             body["model"] = model;
+        }
+        if let Some(ConfigValue::Text(effort)) = self
+            .info
+            .configuration
+            .options
+            .get(&ConfigId::new("effort"))
+        {
+            body["variant"] = json!(effort);
         }
         let path = format!("/session/{}/prompt_async", self.session_id);
         match self.http.post(&path, body).await {
@@ -788,15 +900,11 @@ impl Drive {
             return match kind {
                 "permission.asked" => self.on_permission(props).await,
                 "question.asked" => self.on_question(props).await,
-                "message.updated" if parent.is_some() => {
-                    self.on_message(props, parent).await
-                }
+                "message.updated" if parent.is_some() => self.on_message(props, parent).await,
                 "message.part.updated" if parent.is_some() => {
                     self.on_part(&props["part"], parent).await
                 }
-                "message.part.delta" if parent.is_some() => {
-                    self.on_delta(props, parent).await
-                }
+                "message.part.delta" if parent.is_some() => self.on_delta(props, parent).await,
                 _ => Ok(()),
             };
         }
@@ -839,6 +947,7 @@ impl Drive {
             "message.part.delta" => self.on_delta(props, None).await,
             "permission.asked" => self.on_permission(props).await,
             "question.asked" => self.on_question(props).await,
+            "session.compacted" => self.emit_kind(EventKind::ContextCompacted).await,
             "session.error" => self.on_error(props).await,
             // The rest is bookkeeping and reply echoes the engine already owns.
             _ => Ok(()),
@@ -861,16 +970,12 @@ impl Drive {
         };
         // A republished message of a settled turn must not re-mint: its
         // part snapshots would stream into the next turn.
-        if parent.is_none()
-            && !self.messages.contains_key(oc_id)
-            && oc_id <= self.tide.as_str()
-        {
+        if parent.is_none() && !self.messages.contains_key(oc_id) && oc_id <= self.tide.as_str() {
             return Ok(());
         }
         let message_id = self.message_id(oc_id);
         if let Some(parent) = &parent {
-            self.child_messages
-                .insert(oc_id.to_owned(), parent.clone());
+            self.child_messages.insert(oc_id.to_owned(), parent.clone());
         } else if let Some(error) = info.get("error").filter(|e| !e.is_null()) {
             self.turn_error = Some(message_error(error));
         }
@@ -986,8 +1091,7 @@ impl Drive {
         let oc_id = props["messageID"].as_str().unwrap_or_default();
         let message_id = self.message_id(oc_id);
         if let Some(parent) = &parent {
-            self.child_messages
-                .insert(oc_id.to_owned(), parent.clone());
+            self.child_messages.insert(oc_id.to_owned(), parent.clone());
         }
         self.emit_text(kind, message_id, delta, parent).await
     }
@@ -1307,6 +1411,28 @@ impl Drive {
         }
     }
 
+    /// Summarizes the session in place. The server streams the summary and
+    /// ends with `session.compacted`, so the turn state follows a prompt's.
+    async fn compact(&mut self) -> Result<(), Gone> {
+        let body = self.model_body().unwrap_or_else(|| json!({}));
+        self.turn = Turn::Sent;
+        self.aborting = false;
+        self.turn_error = None;
+        let path = format!("/session/{}/summarize", self.session_id);
+        match self.http.post(&path, body).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                self.turn = Turn::Idle;
+                self.diagnostic(DiagnosticLevel::Warning, format!("compaction refused: {e}"))
+                    .await?;
+                self.emit(DriverEvent::TurnEnded(StopReason::Failed {
+                    message: e.to_string(),
+                }))
+                .await
+            }
+        }
+    }
+
     /// Drops the rolled-back turns; opencode restores conversation, not files.
     /// Note `GET /message` still lists reverted messages afterward: the revert
     /// trims the model's context, not the listing.
@@ -1340,22 +1466,28 @@ impl Drive {
     }
 
     /// Applies a live model change; it rides the next prompt.
+    /// Model and effort are per-prompt values: switching is a matter of
+    /// remembering the selection. Effort's choices follow the model.
     async fn configure(&mut self, id: ConfigId, value: ConfigValue) -> Result<(), Gone> {
-        if id.as_str() != "model" {
-            return Ok(());
-        }
-        let ConfigValue::Text(model) = &value else {
+        let ConfigValue::Text(text) = &value else {
             return Ok(());
         };
-        if model.split_once('/').is_none() {
-            return self
-                .diagnostic(
-                    DiagnosticLevel::Warning,
-                    format!("`{model}` is not a `provider/model` value"),
-                )
-                .await;
+        match id.as_str() {
+            "model" if text.split_once('/').is_none() => {
+                return self
+                    .diagnostic(
+                        DiagnosticLevel::Warning,
+                        format!("`{text}` is not a `provider/model` value"),
+                    )
+                    .await;
+            }
+            "model" | "effort" => {}
+            _ => return Ok(()),
         }
         if apply_selection(&mut self.info, &id, &value) {
+            if id.as_str() == "model" {
+                sync_effort(&mut self.info, &self.variants);
+            }
             self.emit(DriverEvent::InfoChanged(self.info.clone()))
                 .await?;
         }
@@ -2151,6 +2283,48 @@ mod tests {
         );
         assert_eq!(fork_body(&messages, "msg_3").unwrap(), json!({}));
         assert!(fork_body(&messages, "msg_9").is_err());
+    }
+
+    #[test]
+    fn effort_follows_the_selected_model_variants() {
+        let providers = json!({ "providers": [{ "id": "p", "models": {
+            "a": { "variants": { "max": {}, "high": {}, "low": {}, "custom": {} } },
+            "b": { "variants": { "high": {} } },
+            "c": { "variants": {} },
+        } }] });
+        let variants = model_variants(&providers);
+        assert_eq!(variants["p/a"], ["low", "high", "max", "custom"]);
+        assert!(!variants.contains_key("p/c"));
+
+        let choices = model_choices(&providers, &json!(["p"]));
+        let mut info = driver_info(choices, &json!([]), &json!({}), AuthStatus::Unknown, None);
+        let select = |info: &mut DriverInfo, id: &str, value: &str| {
+            apply_selection(info, &ConfigId::new(id), &ConfigValue::Text(value.into()));
+        };
+        let effort = |info: &DriverInfo| {
+            info.details
+                .config_options
+                .iter()
+                .find(|o| o.id.as_str() == "effort")
+                .map(|o| o.current.clone())
+        };
+        select(&mut info, "model", "p/a");
+        sync_effort(&mut info, &variants);
+        assert_eq!(effort(&info), Some(None));
+        select(&mut info, "effort", "high");
+        // A model that still offers `high` keeps it; one that doesn't drops it.
+        select(&mut info, "model", "p/b");
+        sync_effort(&mut info, &variants);
+        assert_eq!(effort(&info), Some(Some(ConfigValue::Text("high".into()))));
+        select(&mut info, "model", "p/c");
+        sync_effort(&mut info, &variants);
+        assert_eq!(effort(&info), None);
+        assert!(
+            !info
+                .configuration
+                .options
+                .contains_key(&ConfigId::new("effort"))
+        );
     }
 
     #[test]

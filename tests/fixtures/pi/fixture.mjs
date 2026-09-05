@@ -50,6 +50,7 @@ const sessionArg = process.argv[process.argv.indexOf('--session') + 1];
 let model = flag('--logged-out') ? UNKNOWN : MODELS[0];
 let thinking = 'medium';
 let sessionFile = process.argv.includes('--session') ? sessionArg : join(agentDir, 'sessions', 's1.jsonl');
+if (flag('--no-session')) sessionFile = undefined;
 let streaming = false;
 let messageN = 0, dialogN = 0, rejected = false;
 const dialogs = {}; // extension dialog id -> resolver
@@ -91,6 +92,14 @@ async function onCommand(cmd) {
       ok();
       return run(cmd.message);
     }
+    // Like pi 0.84.4: a session with nothing worth summarizing is refused
+    // (probed live). The success path is modelled, not recorded: pi cannot
+    // reach a provider on the machine this was written on.
+    case 'compact':
+      if (flag('--compact-refuses')) return no('Nothing to compact (session too small)');
+      send({ type: 'compaction_start' });
+      send({ type: 'compaction_end' });
+      return ok();
     case 'steer':
       if (!streaming) return no('nothing is streaming');
       steered.push(cmd.message);
@@ -162,13 +171,16 @@ async function turn(message) {
 
   if (scenario.includes('ask')) await dialog('select');
   if (scenario.includes('confirm')) await dialog('confirm');
-  if (scenario.includes('tool') || scenario.includes('sleep')) {
+  if ((!flag('--no-tools') || flag('--ignore-no-tools')) && (scenario.includes('tool') || scenario.includes('sleep'))) {
     await toolCall(scenario.includes('sleep'));
     if (aborting) return end('error', 'This operation was aborted');
   }
   if (scenario.includes('fail')) return end('error', 'the provider refused');
 
   update({ type: 'text_start', contentIndex: 1 });
+  if (scenario.includes('launch-flags')) {
+    update({ type: 'text_delta', contentIndex: 1, delta: `no-tools=${flag('--no-tools')} ephemeral=${sessionFile === undefined} ` });
+  }
   for (const chunk of ['ready ', `[${id}]`]) {
     update({ type: 'text_delta', contentIndex: 1, delta: chunk });
     await sleep(5);

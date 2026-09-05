@@ -56,6 +56,7 @@ That's the whole core flow. Everything else is the same few objects:
 |---|---|
 | Discover installed agents and check login status | `runtime.discover()`, `runtime.probe(agent)` |
 | Plan quota for the logged-in account | `runtime.plan_usage(agent)` |
+| One-shot text (titles, commit messages) with no session to manage | `runtime.generate(agent, options, prompt)` |
 | Send text, images, slash commands | `session.prompt(input)` |
 | Steer or interrupt a running turn | `session.prompt(..)` mid-turn, `session.cancel()` |
 | Answer a permission or question the agent raised | `session.answer(id, answer)` |

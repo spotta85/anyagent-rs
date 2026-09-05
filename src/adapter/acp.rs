@@ -85,7 +85,7 @@ impl Adapter for AcpAdapter {
             HANDSHAKE_TIMEOUT,
             handshake(&mut wire, &request, open_auth_kind),
         );
-        let (info, session_id, login, first_class_model) = match handshake.await {
+        let (info, session_id, login, first_class_model, kiro) = match handshake.await {
             Ok(Ok(ok)) => ok,
             Ok(Err(e)) => {
                 // Shutdown first: it joins the stderr reader, so the tail is
@@ -121,6 +121,10 @@ impl Adapter for AcpAdapter {
                 steer_id: None,
                 configs: Vec::new(),
                 first_class_model,
+                kiro,
+                effort_id: None,
+                pending_effort: None,
+                held_prompt: None,
                 login,
             }
             .run(cmd_rx),
@@ -140,7 +144,7 @@ async fn handshake(
     wire: &mut Wire,
     request: &ConnectRequest,
     open_auth_kind: Option<AuthKind>,
-) -> Result<(DriverInfo, String, Vec<LoginMethod>, bool), AgentError> {
+) -> Result<(DriverInfo, String, Vec<LoginMethod>, bool, bool), AgentError> {
     let init = wire
         .roundtrip(
             "initialize",
@@ -205,11 +209,21 @@ async fn handshake(
     };
     let first_class_model =
         first_class_models.is_some_and(|models| apply_first_class_models(&mut info, &models));
+    let kiro = is_kiro(&init);
     info.resume_token = Some(ResumeToken::new(&session_id));
     // Creation-time config: apply each requested option before the first
     // turn; a refusal fails the open instead of silently running misconfigured.
+    // Kiro's effort waits for the model, since its choices depend on it.
+    let mut effort = None;
     for (id, value) in &request.options.configure {
-        let (method, params) = config_call(&session_id, id, value, first_class_model);
+        if kiro && id.as_str() == "effort" {
+            effort = Some(value);
+            continue;
+        }
+        let first_class = first_class_model
+            .then(|| selected(&info, "model"))
+            .flatten();
+        let (method, params) = config_call(&session_id, id, value, first_class.as_deref());
         wire.roundtrip(method, params).await.map_err(|e| match e {
             WireError::Rpc { message, .. } => {
                 AgentError::InvalidConfiguration(format!("agent rejected `{id}`: {message}"))
@@ -218,37 +232,140 @@ async fn handshake(
         })?;
         crate::adapter::apply_selection(&mut info, id, value);
     }
+    if kiro {
+        sync_effort(&mut info);
+    }
+    if let Some(value) = effort {
+        if !offers(&info, "effort", value) {
+            return Err(AgentError::InvalidConfiguration(
+                "effort is not supported by the selected model".into(),
+            ));
+        }
+        // The ack chunk is skipped with the other handshake noise.
+        wire.roundtrip("session/prompt", effort_prompt(&session_id, value))
+            .await
+            .map_err(|e| e.into_error(&init.auth_methods, &request.installation.executable_path))?;
+        crate::adapter::apply_selection(&mut info, &ConfigId::new("effort"), value);
+    }
     let login = init
         .auth_methods
         .iter()
         .filter_map(|m| login_method(m, &request.installation.executable_path))
         .collect();
-    Ok((info, session_id, login, first_class_model))
+    Ok((info, session_id, login, first_class_model, kiro))
+}
+
+/// Kiro is the one ACP agent with a prompt-driven effort switch.
+fn is_kiro(init: &acp::InitializeResponse) -> bool {
+    init.agent_info
+        .as_ref()
+        .is_some_and(|i| i.name.starts_with("Kiro"))
+}
+
+/// Makes kiro's `effort` option match the selected model: the shared
+/// levels for models that have effort, no option for the ones that don't.
+/// Kiro advertises nothing for it on the wire (probed 2.20.1).
+fn sync_effort(info: &mut DriverInfo) {
+    let model = selected(info, "model").unwrap_or_default();
+    let choices = crate::adapter::effort_choices(&model).unwrap_or_default();
+    let current = selected(info, "effort")
+        .map(ConfigValue::Text)
+        .filter(|c| offers_choice(&choices, c));
+    replace_select(info, "effort", choices, current);
+}
+
+/// The selected text value of option `id`.
+fn selected(info: &DriverInfo, id: &str) -> Option<String> {
+    match info.configuration.options.get(&ConfigId::new(id)) {
+        Some(ConfigValue::Text(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+/// Replaces the `model` or `effort` select with these choices and current
+/// value; no choices means no option.
+fn replace_select(
+    info: &mut DriverInfo,
+    id: &str,
+    choices: Vec<ConfigChoice>,
+    current: Option<ConfigValue>,
+) {
+    let (name, category) = match id {
+        "model" => ("Model", "model"),
+        _ => ("Reasoning effort", "thought_level"),
+    };
+    let id = ConfigId::new(id);
+    info.details.config_options.retain(|o| o.id != id);
+    info.configuration.options.remove(&id);
+    if choices.is_empty() {
+        return;
+    }
+    if let Some(current) = &current {
+        info.configuration
+            .options
+            .insert(id.clone(), current.clone());
+    }
+    info.details.config_options.push(ConfigOption {
+        id,
+        name: name.into(),
+        category: Some(category.into()),
+        kind: ConfigKind::Select { choices },
+        current,
+        live: true,
+    });
+}
+
+/// Whether the advertised option `id` offers `value`.
+fn offers(info: &DriverInfo, id: &str, value: &ConfigValue) -> bool {
+    info.details.config_options.iter().any(|o| {
+        o.id.as_str() == id
+            && matches!(&o.kind, ConfigKind::Select { choices } if offers_choice(choices, value))
+    })
+}
+
+fn offers_choice(choices: &[ConfigChoice], value: &ConfigValue) -> bool {
+    matches!(value, ConfigValue::Text(v) if choices.iter().any(|c| &c.value == v))
+}
+
+/// Kiro has no wire call for effort: `/effort <level>` runs as its own
+/// prompt (probed 2026-09-05: replies "Effort set to <level>", end_turn).
+fn effort_prompt(session_id: &str, value: &ConfigValue) -> Value {
+    let level = match value {
+        ConfigValue::Text(level) => level.clone(),
+        ConfigValue::Bool(on) => on.to_string(),
+    };
+    json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": format!("/effort {level}") }] })
 }
 
 /// One config selection as its wire call: the well-known `mode` id maps to
-/// session/set_mode, `model` to session/set_model on agents with the
-/// first-class surface (grok), anything else to session/set_config_option.
+/// session/set_mode; with the first-class models surface (`first_class` is
+/// the selected model), `model` maps to session/set_model and `effort` to
+/// the same call carrying grok's `_meta.reasoningEffort` (verified live,
+/// 2026-09-05); anything else to session/set_config_option.
 fn config_call(
     session_id: &str,
     id: &ConfigId,
     value: &ConfigValue,
-    first_class_model: bool,
+    first_class: Option<&str>,
 ) -> (&'static str, Value) {
-    match value {
-        ConfigValue::Text(mode) if id.as_str() == "mode" => (
+    match (id.as_str(), value, first_class) {
+        ("mode", ConfigValue::Text(mode), _) => (
             "session/set_mode",
             json!({ "sessionId": session_id, "modeId": mode }),
         ),
-        ConfigValue::Text(model) if id.as_str() == "model" && first_class_model => (
+        ("model", ConfigValue::Text(model), Some(_)) => (
             "session/set_model",
             json!({ "sessionId": session_id, "modelId": model }),
         ),
-        ConfigValue::Text(chosen) => (
+        ("effort", ConfigValue::Text(effort), Some(model)) => (
+            "session/set_model",
+            json!({ "sessionId": session_id, "modelId": model, "_meta": { "reasoningEffort": effort } }),
+        ),
+        (_, ConfigValue::Text(chosen), _) => (
             "session/set_config_option",
             json!({ "sessionId": session_id, "configId": id.as_str(), "value": chosen }),
         ),
-        ConfigValue::Bool(on) => (
+        (_, ConfigValue::Bool(on), _) => (
             "session/set_config_option",
             json!({ "sessionId": session_id, "configId": id.as_str(), "type": "boolean", "value": on }),
         ),
@@ -261,46 +378,72 @@ fn config_call(
 /// so it is read raw (shape verified against grok by comet and T3 Code).
 /// Skipped when the agent already advertises a `model` config option.
 fn apply_first_class_models(info: &mut DriverInfo, models: &Value) -> bool {
-    let choices: Vec<ConfigChoice> = models["availableModels"]
-        .as_array()
-        .map(|list| {
-            list.iter()
-                .filter_map(|m| {
-                    let id = m["modelId"].as_str()?;
-                    Some(ConfigChoice {
-                        value: id.to_owned(),
-                        label: m["name"].as_str().unwrap_or(id).to_owned(),
-                        description: m["description"].as_str().map(str::to_owned),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
     let already_advertised = info
         .details
         .config_options
         .iter()
         .any(|o| o.id.as_str() == "model");
-    if choices.is_empty() || already_advertised {
+    let empty = models["availableModels"]
+        .as_array()
+        .is_none_or(|list| list.is_empty());
+    if already_advertised || empty {
         return false;
     }
-    let current = models["currentModelId"]
-        .as_str()
-        .map(|c| ConfigValue::Text(c.to_owned()));
-    if let Some(current) = &current {
-        info.configuration
-            .options
-            .insert(ConfigId::new("model"), current.clone());
-    }
-    info.details.config_options.push(ConfigOption {
-        id: ConfigId::new("model"),
-        name: "Model".into(),
-        category: Some("model".into()),
-        kind: ConfigKind::Select { choices },
-        current,
-        live: true,
-    });
+    sync_first_class_models(info, models);
     true
+}
+
+/// Rebuilds `model` from a first-class models state, and `effort` from the
+/// current model's `_meta.reasoningEfforts` when the agent reports them
+/// (grok). The `_x.ai/models/update` notification repeats the shape before
+/// every turn with a stale `reasoningEffort`, so a selection the model still
+/// offers wins over the reported one; `model_changed` carries the truth.
+fn sync_first_class_models(info: &mut DriverInfo, models: &Value) {
+    let list = models["availableModels"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let current_id = models["currentModelId"].as_str();
+    let choices = list
+        .iter()
+        .filter_map(|m| {
+            let id = m["modelId"].as_str()?;
+            Some(ConfigChoice {
+                value: id.to_owned(),
+                label: m["name"].as_str().unwrap_or(id).to_owned(),
+                description: m["description"].as_str().map(str::to_owned),
+            })
+        })
+        .collect();
+    let current = list.iter().find(|m| m["modelId"].as_str() == current_id);
+    let efforts: Vec<ConfigChoice> = current
+        .and_then(|m| m["_meta"]["reasoningEfforts"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|e| {
+            let value = e["value"].as_str().or(e["id"].as_str())?;
+            Some(ConfigChoice {
+                value: value.to_owned(),
+                label: e["label"].as_str().unwrap_or(value).to_owned(),
+                description: e["description"].as_str().map(str::to_owned),
+            })
+        })
+        .collect();
+    let effort = selected(info, "effort")
+        .map(ConfigValue::Text)
+        .filter(|e| offers_choice(&efforts, e))
+        .or_else(|| {
+            current
+                .and_then(|m| m["_meta"]["reasoningEffort"].as_str())
+                .map(|e| ConfigValue::Text(e.to_owned()))
+        });
+    replace_select(
+        info,
+        "model",
+        choices,
+        current_id.map(|c| ConfigValue::Text(c.to_owned())),
+    );
+    replace_select(info, "effort", efforts, effort);
 }
 
 /// What `initialize` tells us, folded into the engine's vocabulary.
@@ -536,6 +679,14 @@ struct Drive {
     /// The agent advertises the first-class `models` state (grok): `model`
     /// selections ride `session/set_model`.
     first_class_model: bool,
+    /// The agent is kiro: `effort` selections ride a `/effort` prompt.
+    kiro: bool,
+    /// Wire id of an in-flight `/effort` prompt; its chunks stay internal.
+    effort_id: Option<u64>,
+    /// An effort switch requested mid-turn, sent once the turn ends.
+    pending_effort: Option<ConfigValue>,
+    /// A turn (params, prompt id) that arrived mid-switch, sent once it ends.
+    held_prompt: Option<(Value, String)>,
     /// Runnable login methods from `initialize`, for mid-session auth loss.
     login: Vec<LoginMethod>,
 }
@@ -582,8 +733,13 @@ impl Drive {
                     "prompt": self.prompt_blocks(&input).await?,
                     "_meta": { "promptId": pid, "requestId": pid },
                 });
-                self.prompt_id = Some(self.wire.request("session/prompt", params).await?);
-                self.prompt_meta = Some(pid);
+                // One prompt on the wire at a time: a turn that lands while
+                // an effort switch runs waits for it.
+                if self.effort_id.is_some() {
+                    self.held_prompt = Some((params, pid));
+                } else {
+                    self.send_prompt(params, pid).await?;
+                }
             }
             DriverCommand::Steer { input } => {
                 let params = json!({
@@ -594,6 +750,13 @@ impl Drive {
             }
             DriverCommand::Answer { request, answer } => self.answer(request, answer).await?,
             DriverCommand::Cancel => {
+                // A turn still waiting behind an effort switch never reached
+                // the agent; it just ends here.
+                if self.held_prompt.take().is_some() {
+                    return self
+                        .emit(DriverEvent::TurnEnded(StopReason::Cancelled))
+                        .await;
+                }
                 // Cancel first, then unblock pending wire requests: an agent
                 // parked on a permission resumes only after its response, and
                 // it must already know the turn is cancelled by then.
@@ -615,10 +778,50 @@ impl Drive {
                 }
             }
             DriverCommand::Configure(id, value) => {
+                if self.kiro && id.as_str() == "effort" {
+                    // The `/effort` prompt is a turn of its own: it waits for
+                    // the running turn (or switch) to end. Latest wins.
+                    if self.prompt_id.is_some() || self.effort_id.is_some() {
+                        self.pending_effort = Some(value);
+                    } else {
+                        self.send_effort(value).await?;
+                    }
+                    return Ok(());
+                }
+                let first_class = self
+                    .first_class_model
+                    .then(|| {
+                        // An effort change must target the latest requested model,
+                        // even when its receipt has not reached us yet.
+                        self.configs
+                            .iter()
+                            .rev()
+                            .find_map(|(_, id, value)| match (id.as_str(), value) {
+                                ("model", ConfigValue::Text(model)) => Some(model.clone()),
+                                _ => None,
+                            })
+                            .or_else(|| selected(&self.info, "model"))
+                    })
+                    .flatten();
                 let (method, params) =
-                    config_call(&self.session_id, &id, &value, self.first_class_model);
+                    config_call(&self.session_id, &id, &value, first_class.as_deref());
                 let wire_id = self.wire.request(method, params).await?;
                 self.configs.push((wire_id, id, value));
+            }
+            // Never advertised: ACP keeps compaction unstable in schema 1.7,
+            // and the one agent with a `/compact` command (kiro) runs it
+            // asynchronously with no completion the caller can wait on
+            // (probed 2026-09-04).
+            DriverCommand::Compact => {
+                self.diagnostic(
+                    DiagnosticLevel::Warning,
+                    "compaction is not supported by the ACP adapter",
+                )
+                .await?;
+                self.emit(DriverEvent::TurnEnded(StopReason::Failed {
+                    message: "compaction is not supported by the ACP adapter".into(),
+                }))
+                .await?;
             }
             DriverCommand::Rollback(turns, _) => {
                 self.diagnostic(
@@ -646,9 +849,16 @@ impl Drive {
                 self.on_question(frame).await
             }
             Some("_x.ai/session/prompt_complete") => self.on_prompt_complete(&frame).await,
+            Some("_x.ai/models/update") => self.on_models_update(&frame).await,
+            Some("_x.ai/session_notification")
+                if frame["params"]["update"]["sessionUpdate"] == "model_changed" =>
+            {
+                self.on_model_changed(&frame["params"]["update"]).await
+            }
             // Kiro ships its slash commands here instead of in an
             // `availableCommandsUpdate` (probed 2.20.1).
             Some("_kiro.dev/commands/available") => self.on_kiro_commands(&frame).await,
+            Some("_kiro.dev/metadata") => self.on_kiro_metadata(&frame).await,
             Some(other) => {
                 if frame.get("id").is_some() {
                     let other = other.to_owned();
@@ -682,6 +892,11 @@ impl Drive {
     /// A typed session update, or a raw fallback that loses nothing.
     async fn on_update(&mut self, frame: Value) -> Result<(), Gone> {
         let params = frame.get("params").cloned().unwrap_or_default();
+        // Kiro's "Effort set to <level>" chunk is the switch's ack, not
+        // content; every other update still flows.
+        if self.effort_id.is_some() && params["update"]["sessionUpdate"] == "agent_message_chunk" {
+            return Ok(());
+        }
         match serde_json::from_value::<acp::SessionNotification>(params.clone()) {
             Ok(notification) => self.translate(notification).await,
             Err(e) => {
@@ -733,7 +948,7 @@ impl Drive {
                 cost_usd: usage.cost.as_ref().map(|c| c.amount),
             }),
             U::AvailableCommandsUpdate(update) => {
-                self.info.details.commands = update
+                let commands = update
                     .available_commands
                     .into_iter()
                     .map(|c| SlashCommand {
@@ -742,7 +957,7 @@ impl Drive {
                         input_hint: None,
                     })
                     .collect();
-                return self.emit(DriverEvent::InfoChanged(self.info.clone())).await;
+                return self.set_commands(commands).await;
             }
             U::CurrentModeUpdate(update) => {
                 let changed = crate::adapter::apply_selection(
@@ -889,7 +1104,7 @@ impl Drive {
         let Some(commands) = params["commands"].as_array() else {
             return Ok(());
         };
-        self.info.details.commands = commands
+        let commands = commands
             .iter()
             .filter_map(|c| {
                 Some(SlashCommand {
@@ -902,6 +1117,60 @@ impl Drive {
                 })
             })
             .collect();
+        self.set_commands(commands).await
+    }
+
+    /// Grok republishes its models state after a switch, with the new
+    /// model's effort levels.
+    async fn on_models_update(&mut self, frame: &Value) -> Result<(), Gone> {
+        if !self.first_class_model {
+            return Ok(());
+        }
+        sync_first_class_models(&mut self.info, &frame["params"]);
+        self.emit(DriverEvent::InfoChanged(self.info.clone())).await
+    }
+
+    /// Grok confirms a model or effort switch with `model_changed`; it is
+    /// the one frame that reports the effort actually in force.
+    async fn on_model_changed(&mut self, update: &Value) -> Result<(), Gone> {
+        let mut changed = false;
+        for (id, key) in [("model", "model_id"), ("effort", "reasoning_effort")] {
+            if let Some(value) = update[key].as_str() {
+                let value = ConfigValue::Text(value.to_owned());
+                changed |=
+                    crate::adapter::apply_selection(&mut self.info, &ConfigId::new(id), &value);
+            }
+        }
+        if changed {
+            return self.emit(DriverEvent::InfoChanged(self.info.clone())).await;
+        }
+        Ok(())
+    }
+
+    /// Kiro's per-turn metadata carries the current effort level.
+    async fn on_kiro_metadata(&mut self, frame: &Value) -> Result<(), Gone> {
+        let params = &frame["params"];
+        if params["sessionId"].as_str() != Some(self.session_id.as_str()) {
+            return Ok(());
+        }
+        let Some(effort) = params["effort"].as_str() else {
+            return Ok(());
+        };
+        let value = ConfigValue::Text(effort.to_owned());
+        if !offers(&self.info, "effort", &value) {
+            return Ok(());
+        }
+        let changed =
+            crate::adapter::apply_selection(&mut self.info, &ConfigId::new("effort"), &value);
+        if changed {
+            return self.emit(DriverEvent::InfoChanged(self.info.clone())).await;
+        }
+        Ok(())
+    }
+
+    /// Adopts a new command list and republishes the advertised details.
+    async fn set_commands(&mut self, commands: Vec<SlashCommand>) -> Result<(), Gone> {
+        self.info.details.commands = commands;
         self.emit(DriverEvent::InfoChanged(self.info.clone())).await
     }
 
@@ -913,6 +1182,12 @@ impl Drive {
         if Some(id) == self.prompt_id {
             self.prompt_id = None;
             self.tools.clear();
+            // A switch queued behind this turn goes out before the turn is
+            // reported over, however it ended, so the next prompt lines up
+            // behind it.
+            if let Some(value) = self.pending_effort.take() {
+                self.send_effort(value).await?;
+            }
             // An errored prompt fails the turn; the auth code means the
             // credentials died and the engine should close the session.
             if let Some(error) = frame.get("error") {
@@ -943,16 +1218,50 @@ impl Drive {
             let (_, config_id, value) = self.configs.remove(at);
             if let Some(error) = frame.get("error") {
                 let message = error["message"].as_str().unwrap_or("rejected");
-                return self
-                    .diagnostic(
-                        DiagnosticLevel::Warning,
-                        format!("agent rejected configure `{config_id}`: {message}"),
-                    )
-                    .await;
+                self.diagnostic(
+                    DiagnosticLevel::Warning,
+                    format!("agent rejected configure `{config_id}`: {message}"),
+                )
+                .await?;
+            } else if crate::adapter::apply_selection(&mut self.info, &config_id, &value) {
+                // Kiro's effort choices follow the model.
+                if self.kiro && config_id.as_str() == "model" {
+                    sync_effort(&mut self.info);
+                }
+                self.emit(DriverEvent::InfoChanged(self.info.clone()))
+                    .await?;
             }
-            if crate::adapter::apply_selection(&mut self.info, &config_id, &value) {
-                return self.emit(DriverEvent::InfoChanged(self.info.clone())).await;
+            if Some(id) == self.effort_id {
+                self.effort_id = None;
+                return self.after_effort().await;
             }
+        }
+        Ok(())
+    }
+
+    /// Sends a prompt as the running turn.
+    async fn send_prompt(&mut self, params: Value, pid: String) -> Result<(), Gone> {
+        self.prompt_id = Some(self.wire.request("session/prompt", params).await?);
+        self.prompt_meta = Some(pid);
+        Ok(())
+    }
+
+    /// Runs kiro's `/effort <level>` prompt as a configure in flight.
+    async fn send_effort(&mut self, value: ConfigValue) -> Result<(), Gone> {
+        let params = effort_prompt(&self.session_id, &value);
+        let wire_id = self.wire.request("session/prompt", params).await?;
+        self.effort_id = Some(wire_id);
+        self.configs.push((wire_id, ConfigId::new("effort"), value));
+        Ok(())
+    }
+
+    /// After an effort switch: a newer switch goes first, then any held turn.
+    async fn after_effort(&mut self) -> Result<(), Gone> {
+        if let Some(value) = self.pending_effort.take() {
+            return self.send_effort(value).await;
+        }
+        if let Some((params, pid)) = self.held_prompt.take() {
+            return self.send_prompt(params, pid).await;
         }
         Ok(())
     }

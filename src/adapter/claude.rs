@@ -37,6 +37,9 @@ const OUTPUT_CAP: usize = 16 * 1024;
 /// Gateway credential: the CLI accepts it but never names it in `account`.
 const GATEWAY_TOKEN_ENV: &str = "ANTHROPIC_AUTH_TOKEN";
 
+/// The CLI's own compaction command, sent as a user message.
+const COMPACT_COMMAND: &str = "/compact";
+
 /// Puts the CLI in stream-json mode with a stdio control channel.
 const BASE_ARGS: [&str; 10] = [
     "-p",
@@ -67,7 +70,7 @@ impl Adapter for ClaudeAdapter {
     async fn connect(&self, request: ConnectRequest) -> Result<DriverConnection, AgentError> {
         let (ev_tx, ev_rx) = mpsc::channel(FRAME_BUFFER);
         let recorder = WireRecorder::for_session(&request.options, &ev_tx).await;
-        let (child, wire, info) =
+        let (child, wire, info, models) =
             launch(&request, &request.options.start, recorder.clone()).await?;
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
         tokio::spawn(
@@ -76,6 +79,8 @@ impl Adapter for ClaudeAdapter {
                 child,
                 events: ev_tx,
                 info: info.clone(),
+                models,
+                launched_fast: requested_fast(&request),
                 tools: HashMap::new(),
                 requests: HashMap::new(),
                 messages: HashMap::new(),
@@ -134,7 +139,7 @@ async fn launch(
     request: &ConnectRequest,
     start: &SessionStart,
     recorder: Option<WireRecorder>,
-) -> Result<(process::Child, Wire, DriverInfo), AgentError> {
+) -> Result<(process::Child, Wire, DriverInfo, Value), AgentError> {
     let mut args: Vec<String> = BASE_ARGS.iter().map(|s| (*s).to_owned()).collect();
     // Mint the session id so the resume token exists at open; the CLI only
     // reports its own — and a fork's — with the first prompt's `system/init`.
@@ -177,11 +182,11 @@ async fn launch(
     .await?;
     let mut wire = Wire::over(&mut child, recorder);
     match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut wire, request)).await {
-        Ok(Ok(mut info)) => {
+        Ok(Ok((mut info, models))) => {
             if let Some(uuid) = minted {
                 info.resume_token = Some(ResumeToken::new(&uuid));
             }
-            Ok((child, wire, info))
+            Ok((child, wire, info, models))
         }
         Ok(Err(e)) => {
             let e = with_stderr(e, &child);
@@ -207,7 +212,10 @@ fn map_resume(start: &SessionStart, e: AgentError) -> AgentError {
 }
 
 /// `initialize` then `get_binary_version`, both over the control channel.
-async fn handshake(wire: &mut Wire, request: &ConnectRequest) -> Result<DriverInfo, AgentError> {
+async fn handshake(
+    wire: &mut Wire,
+    request: &ConnectRequest,
+) -> Result<(DriverInfo, Value), AgentError> {
     let init = wire
         .roundtrip(json!({ "subtype": "initialize", "hooks": {} }))
         .await
@@ -217,7 +225,18 @@ async fn handshake(wire: &mut Wire, request: &ConnectRequest) -> Result<DriverIn
         .await
         .ok()
         .and_then(|v| v["version"].as_str().map(str::to_owned));
-    Ok(driver_info(&init, version, request))
+    let info = driver_info(&init, version, request);
+    if requested_fast(request)
+        && !info
+            .configuration
+            .options
+            .contains_key(&ConfigId::new("fast"))
+    {
+        return Err(AgentError::InvalidConfiguration(
+            "the selected model does not support fast mode".into(),
+        ));
+    }
+    Ok((info, init["models"].clone()))
 }
 
 /// MCP declarations and creation-time config as launch flags.
@@ -237,15 +256,13 @@ fn option_args(options: &crate::agent::SessionOptions) -> Result<Vec<String>, Ag
                 args.push("--model".into());
                 args.push(model.clone());
             }
+            ("fast", ConfigValue::Bool(fast)) => {
+                args.push("--settings".into());
+                args.push(json!({ "fastMode": fast }).to_string());
+            }
             ("effort", ConfigValue::Text(effort)) => {
                 args.push("--effort".into());
                 args.push(effort.clone());
-            }
-            // Fast mode is a settings flag; passing it is also the SDK opt-in
-            // (without it the wire reports `sdk_opt_in_required`).
-            ("fastMode", ConfigValue::Bool(fast)) => {
-                args.push("--settings".into());
-                args.push(json!({ "fastMode": fast }).to_string());
             }
             _ => {
                 return Err(AgentError::InvalidConfiguration(format!(
@@ -263,6 +280,24 @@ fn creation_option(request: &ConnectRequest, id: &str) -> Option<String> {
         ConfigValue::Text(text) if i.as_str() == id => Some(text.clone()),
         _ => None,
     })
+}
+
+/// Fast mode is an explicit launch opt-in, separate from reasoning effort.
+fn requested_fast(request: &ConnectRequest) -> bool {
+    request
+        .options
+        .configure
+        .iter()
+        .any(|(id, value)| id.as_str() == "fast" && value == &ConfigValue::Bool(true))
+}
+
+/// The CLI resolves aliases such as `default` in its model catalog.
+fn supports_fast(models: &Value, model: &str) -> bool {
+    models
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|entry| entry["value"].as_str() == Some(model) && entry["supportsFastMode"] == true)
 }
 
 /// The current model's effort levels as a creation-only option; `None` when
@@ -450,42 +485,19 @@ fn driver_info(init: &Value, version: Option<String>, request: &ConnectRequest) 
     // `/effort` command runs as its own synthetic turn (probed 2026-08-24).
     // A live change is a reopen with the resume token.
     let effort_option = effort_option(&init["models"], &model, creation_option(request, "effort"));
-    // Fast mode is creation-only too (a `--settings` flag, no live toggle on
-    // this wire). Offered when the catalog supports it; `fast_mode_state`
-    // reports the outcome — the account or org can still keep it off.
-    let fast_option = init["models"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .any(|m| m["supportsFastMode"].as_bool() == Some(true))
-        .then(|| ConfigOption {
-            id: ConfigId::new("fastMode"),
-            name: "Fast mode".into(),
-            category: Some("service_tier".into()),
-            kind: ConfigKind::Boolean,
-            current: Some(ConfigValue::Bool(
-                init["fast_mode_state"].as_str() == Some("on"),
-            )),
-            live: false,
-        });
     let mut configuration = SessionConfiguration::default();
     configuration
         .options
         .insert(ConfigId::new("mode"), ConfigValue::Text(mode));
     configuration
         .options
-        .insert(ConfigId::new("model"), ConfigValue::Text(model));
+        .insert(ConfigId::new("model"), ConfigValue::Text(model.clone()));
     if let Some(current) = effort_option.as_ref().and_then(|o| o.current.clone()) {
         configuration
             .options
             .insert(ConfigId::new("effort"), current);
     }
-    if let Some(current) = fast_option.as_ref().and_then(|o| o.current.clone()) {
-        configuration
-            .options
-            .insert(ConfigId::new("fastMode"), current);
-    }
-    DriverInfo {
+    let mut info = DriverInfo {
         details: AgentDetails {
             version,
             auth,
@@ -502,6 +514,7 @@ fn driver_info(init: &Value, version: Option<String>, request: &ConnectRequest) 
                     Capability::Rollback,
                     Capability::RollbackFiles,
                     Capability::Fork,
+                    Capability::Compact,
                     Capability::SlashCommands,
                     Capability::Resume,
                 ]);
@@ -509,15 +522,10 @@ fn driver_info(init: &Value, version: Option<String>, request: &ConnectRequest) 
                     vec![McpTransport::Stdio, McpTransport::Http, McpTransport::Sse];
                 capabilities
             },
-            config_options: [
-                Some(mode_option),
-                Some(model_option),
-                effort_option,
-                fast_option,
-            ]
-            .into_iter()
-            .flatten()
-            .collect(),
+            config_options: [Some(mode_option), Some(model_option), effort_option]
+                .into_iter()
+                .flatten()
+                .collect(),
             commands,
         },
         configuration,
@@ -531,7 +539,13 @@ fn driver_info(init: &Value, version: Option<String>, request: &ConnectRequest) 
         // Every turn shape ends with its own `result` frame.
         deterministic_turn_end: true,
         deterministic_agent_turn_end: true,
-    }
+    };
+    crate::adapter::set_fast_option(
+        &mut info,
+        supports_fast(&init["models"], &model).then_some(requested_fast(request)),
+        true,
+    );
+    info
 }
 
 // ---------------------------------------------------------------------------
@@ -563,6 +577,9 @@ struct Drive {
     events: mpsc::Sender<DriverEvent>,
     /// Current advertised state; mutated and re-sent as `InfoChanged`.
     info: DriverInfo,
+    models: Value,
+    /// The running process's speed; a changed preference resumes before a turn.
+    launched_fast: bool,
     /// Tool snapshots by `tool_use_id`, completed by `tool_result` frames.
     tools: HashMap<String, ToolUpdate>,
     requests: HashMap<RequestId, PendingRequest>,
@@ -586,7 +603,7 @@ struct Drive {
     /// The files scope rewinds at the first *dropped* turn's user uuid, the
     /// CLI's checkpoint key (probed 2026-08-27).
     history: Vec<Turn>,
-    /// The original connect request: the relaunch recipe for rollback.
+    /// Launch options, kept current for resume and rollback.
     request: ConnectRequest,
     /// Kept so a rollback respawn keeps teeing to the same recording file.
     recorder: Option<WireRecorder>,
@@ -625,6 +642,7 @@ impl Drive {
     async fn handle_command(&mut self, cmd: DriverCommand) -> Result<(), Gone> {
         match cmd {
             DriverCommand::StartTurn { input } => {
+                self.resume_for_fast().await?;
                 self.emit(DriverEvent::TurnAck).await?;
                 self.turn_uuid = Some(self.send_user(&input).await?);
             }
@@ -651,6 +669,13 @@ impl Drive {
                         .await?;
                 }
             }
+            DriverCommand::Configure(id, value) if id.as_str() == "fast" => {
+                if crate::adapter::apply_selection(&mut self.info, &id, &value) {
+                    self.remember_option(id, value);
+                    self.emit(DriverEvent::InfoChanged(self.info.clone()))
+                        .await?;
+                }
+            }
             DriverCommand::Configure(id, value) => {
                 let request = match (id.as_str(), &value) {
                     ("mode", ConfigValue::Text(mode)) => {
@@ -663,6 +688,13 @@ impl Drive {
                 };
                 let wire_id = self.wire.control(request).await?;
                 self.configs.push((wire_id, id, value));
+            }
+            // The CLI's own `/compact`: the control protocol has no
+            // compaction request, and the command is advertised to SDK hosts
+            // (probed 2026-09-04, claude 2.1.260).
+            DriverCommand::Compact => {
+                self.resume_for_fast().await?;
+                self.send_user(&Input::text(COMPACT_COMMAND)).await?;
             }
             DriverCommand::Rollback(turns, scope) => self.rollback(turns, scope).await?,
             DriverCommand::Close => unreachable!("handled in run"),
@@ -922,6 +954,14 @@ impl Drive {
                     .await;
             }
             if crate::adapter::apply_selection(&mut self.info, &config_id, &value) {
+                if let ("model", ConfigValue::Text(model)) = (config_id.as_str(), &value) {
+                    crate::adapter::set_fast_option(
+                        &mut self.info,
+                        supports_fast(&self.models, model).then_some(requested_fast(&self.request)),
+                        true,
+                    );
+                }
+                self.remember_option(config_id, value);
                 return self.emit(DriverEvent::InfoChanged(self.info.clone())).await;
             }
         }
@@ -930,10 +970,15 @@ impl Drive {
 
     /// Exactly one `result` per turn.
     async fn on_result(&mut self, frame: &Value) -> Result<(), Gone> {
-        self.history.push(Turn {
+        // A turn with neither uuid — a compaction that said nothing — can
+        // anchor no rollback and is nobody's turn to rewind to.
+        let turn = Turn {
             user: self.turn_uuid.take(),
             assistant: self.turn_assistant.take(),
-        });
+        };
+        if turn.user.is_some() || turn.assistant.is_some() {
+            self.history.push(turn);
+        }
         // Backgrounded tools stay tracked; `task_notification` finishes them.
         self.tools.retain(|_, tool| tool.status.is_active());
         if let Some(used) = self.last_usage.take() {
@@ -950,6 +995,76 @@ impl Drive {
         // `PlanUsageUpdated` in `on_control_response`.
         self.usage_request = Some(self.wire.control(json!({ "subtype": "get_usage" })).await?);
         Ok(())
+    }
+
+    /// Saves confirmed choices so a relaunch keeps model and permission changes.
+    fn remember_option(&mut self, id: ConfigId, value: ConfigValue) {
+        self.request.options.configure.retain(|(key, _)| key != &id);
+        self.request.options.configure.push((id, value));
+    }
+
+    /// Applies speed changes before a new turn, preserving the provider transcript.
+    async fn resume_for_fast(&mut self) -> Result<(), Gone> {
+        if requested_fast(&self.request) == self.launched_fast {
+            return Ok(());
+        }
+        // Finish pending model/mode receipts before copying the launch settings.
+        let settled = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+            while !self.configs.is_empty() {
+                let frame = self.wire.frames.recv().await.ok_or(Gone)?;
+                self.handle_frame(frame).await?;
+            }
+            Ok::<_, Gone>(())
+        })
+        .await;
+        if !matches!(settled, Ok(Ok(()))) {
+            self.diagnostic(
+                DiagnosticLevel::Error,
+                "fast mode change failed while waiting for settings",
+            )
+            .await?;
+            return Err(Gone);
+        }
+        // A background tool must finish before its process can be replaced.
+        if self.tools.values().any(|tool| tool.status.is_active())
+            || !self
+                .info
+                .configuration
+                .options
+                .contains_key(&ConfigId::new("fast"))
+        {
+            return Ok(());
+        }
+        let start = if self.history.is_empty() {
+            self.request.options.start.clone()
+        } else if let Some(token) = &self.info.resume_token {
+            SessionStart::Resume(token.clone())
+        } else {
+            return Ok(());
+        };
+        self.child.shutdown(CLOSE_GRACE).await;
+        match launch(&self.request, &start, self.recorder.clone()).await {
+            Ok((child, wire, info, models)) => {
+                self.child = child;
+                self.wire = wire;
+                self.info = info;
+                self.models = models;
+                self.launched_fast = requested_fast(&self.request);
+                self.messages.clear();
+                self.tools.clear();
+                self.usage_request = None;
+                self.emit(DriverEvent::InfoChanged(self.info.clone())).await
+            }
+            Err(error) => {
+                self.diagnostic(
+                    DiagnosticLevel::Error,
+                    format!("fast mode resume failed: {error}"),
+                )
+                .await?;
+                self.report_exit().await;
+                Err(Gone)
+            }
+        }
     }
 
     /// Emulated rollback (the CLI has none in place): respawn forked at the
@@ -1041,9 +1156,23 @@ impl Drive {
             from: token.clone(),
             at: Some(MessageId::new(cut)),
         };
-        let (child, wire, _) = launch(&self.request, &start, self.recorder.clone()).await?;
+        let mut request = self.request.clone();
+        if !self
+            .info
+            .configuration
+            .options
+            .contains_key(&ConfigId::new("fast"))
+        {
+            request
+                .options
+                .configure
+                .retain(|(id, _)| id.as_str() != "fast");
+        }
+        let (child, wire, _, models) = launch(&request, &start, self.recorder.clone()).await?;
         self.child = child;
         self.wire = wire;
+        self.models = models;
+        self.launched_fast = requested_fast(&request);
         Ok(())
     }
 
@@ -1103,6 +1232,17 @@ impl Drive {
             "status" if frame["status"].as_str() == Some("compacting") => {
                 self.emit(DriverEvent::event(EventKind::ContextCompacted))
                     .await
+            }
+            // The compaction receipt trails the status frame. Only a refusal
+            // carries `compact_error` (probed 2026-09-04, 2.1.260), so a
+            // successful or unknown receipt stays silent.
+            "status" if frame["compact_error"].as_str().is_some() => {
+                let reason = frame["compact_error"].as_str().unwrap_or_default();
+                self.diagnostic(
+                    DiagnosticLevel::Warning,
+                    format!("compaction refused: {reason}"),
+                )
+                .await
             }
             // A background task finished: complete the tool it ran under.
             "task_notification" => {

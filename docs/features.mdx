@@ -130,7 +130,11 @@ so your turn boundaries stay clean.
 how much of the account's subscription is used.
 
 **How:** `ContextUsage` events stream tokens-used / window / cost as the
-session runs, and `ContextCompacted` marks the drop after compaction.
+session runs, and `ContextCompacted` marks the drop after compaction —
+whether the agent compacted on its own or you asked it to with
+`session.compact()` (capability `Compact`). A compaction occupies the agent,
+so it runs as an agent-originated turn: prompts queue behind it, and a
+refusal ("nothing to compact") arrives as a diagnostic.
 `runtime.plan_usage(agent)` reads account quota windows (session, weekly,
 plan name) from the agent itself — no HTTP endpoints, no token handling —
 and `plan_usage_all()` fills a whole usage page in one call.
@@ -161,7 +165,7 @@ ordinary `ToolUpdated` events with `ToolKind::Mcp { server, tool }`.
 
 **How:** `details.capabilities.supports(Capability::Fork)` — reported by the
 live connection, never assumed. The full set: `Images`, `Resume`, `Steer`,
-`Permissions`, `Questions`, `Rollback`, `RollbackFiles`, `Fork`,
+`Permissions`, `Questions`, `Rollback`, `RollbackFiles`, `Fork`, `Compact`,
 `SlashCommands`, `Plan`, `Subagents`, `ContextUsage`, `PlanUsage`.
 
 ## Wire recording

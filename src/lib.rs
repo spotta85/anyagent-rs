@@ -5,7 +5,8 @@
 //! or ACP), and exposes them all through three objects:
 //!
 //! - [`Runtime`] — find agents and open sessions: [`Runtime::discover`],
-//!   [`Runtime::probe`], [`Runtime::open`], [`Runtime::plan_usage`].
+//!   [`Runtime::probe`], [`Runtime::open`], [`Runtime::generate`],
+//!   [`Runtime::plan_usage`].
 //! - [`Session`] — one live conversation: [`Session::prompt`],
 //!   [`Session::answer`], [`Session::configure`], [`Session::cancel`],
 //!   [`Session::rollback`], [`Session::close`].
@@ -60,6 +61,11 @@
 //! needing input, idle — is pushed as `StatusChanged` on every flip and
 //! read on demand with [`Session::status`], so thread lists and "needs
 //! you" badges need no event reducer.
+//!
+//! **One-shot generation.** [`Runtime::generate`] is prompt in, string out:
+//! it opens a throwaway session, declines every tool request, and returns
+//! the reply text. Thread titles, commit messages, branch names, and PR
+//! bodies need this, not a conversation.
 //!
 //! **Prompting.** [`Session::prompt`] takes text or an [`Input`] with file
 //! attachments (images inline when the wire supports them). A prompt sent

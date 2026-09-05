@@ -82,6 +82,41 @@ fn text_of(kinds: &[EventKind]) -> String {
         .collect()
 }
 
+#[tokio::test]
+async fn generate_disables_tools_and_session_persistence() {
+    let agent = AgentInstallation::at("pi", wrapper("generate-flags", ""));
+    let text = Runtime::new()
+        .generate(
+            &agent,
+            SessionOptions::in_dir(std::env::temp_dir()),
+            "use a tool; report launch-flags",
+        )
+        .await
+        .unwrap();
+    assert_eq!(text, "no-tools=true ephemeral=true ready [m1]");
+}
+
+#[tokio::test]
+async fn generate_cancels_extension_tools_and_choice_questions() {
+    for (name, flags, prompt) in [
+        ("generate-extension", "--ignore-no-tools", "tool"),
+        ("generate-question", "", "ask"),
+        ("generate-confirmation", "", "confirm"),
+    ] {
+        let agent = AgentInstallation::at("pi", wrapper(name, flags));
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            Runtime::new().generate(&agent, SessionOptions::in_dir(std::env::temp_dir()), prompt),
+        )
+        .await
+        .expect("generate did not settle");
+        assert!(
+            matches!(result, Err(AgentError::ProtocolFailed(_))),
+            "{result:?}"
+        );
+    }
+}
+
 /// Handshake advertises version, auth, capabilities (!Permissions/Rollback), model/thinking selects and commands.
 #[tokio::test]
 async fn handshake_advertises_state_models_levels_and_commands() {
@@ -143,10 +178,10 @@ async fn handshake_advertises_state_models_levels_and_commands() {
     let thinking = details
         .config_options
         .iter()
-        .find(|o| o.id.as_str() == "thinking")
-        .expect("a thinking option");
+        .find(|o| o.id.as_str() == "effort")
+        .expect("an effort option");
     let ConfigKind::Select { choices } = &thinking.kind else {
-        panic!("thinking is a select")
+        panic!("effort is a select")
     };
     assert_eq!(
         choices.iter().map(|c| c.value.as_str()).collect::<Vec<_>>(),
@@ -416,7 +451,7 @@ async fn a_model_change_applies_and_re_reads_the_new_model_levels() {
             .details
             .config_options
             .iter()
-            .find(|o| o.id.as_str() == "thinking")
+            .find(|o| o.id.as_str() == "effort")
         {
             Some(option) => match &option.kind {
                 ConfigKind::Select { choices } => choices.iter().map(|c| c.value.clone()).collect(),
@@ -437,10 +472,10 @@ async fn a_model_change_applies_and_re_reads_the_new_model_levels() {
         .details
         .config_options
         .iter()
-        .find(|o| o.id.as_str() == "thinking")
-        .expect("a thinking option");
+        .find(|o| o.id.as_str() == "effort")
+        .expect("an effort option");
     assert_eq!(thinking.current, None);
-    assert_eq!(info.configuration.options.get(&"thinking".into()), None);
+    assert_eq!(info.configuration.options.get(&"effort".into()), None);
 }
 
 /// Failed model turn ends as Failed with provider refused message.
@@ -566,4 +601,42 @@ async fn unsupported_starts_and_declarations_are_refused_typed() {
             "`{bad}` was accepted"
         );
     }
+}
+
+/// pi compacts on its own `compact` command; the receipt ends the turn, and
+/// a refusal ("session too small") is a diagnostic, not a silent no-op.
+#[tokio::test]
+async fn compact_reports_the_compaction_and_its_refusal() {
+    let (session, mut events) = open("compact", "").await;
+    assert!(
+        session
+            .info()
+            .details
+            .capabilities
+            .supports(Capability::Compact)
+    );
+    session.compact().await.unwrap();
+    let mut kinds = Vec::new();
+    while !matches!(kinds.last(), Some(EventKind::TurnEnded { .. })) {
+        kinds.push(next(&mut events).await.kind);
+    }
+    assert!(
+        kinds
+            .iter()
+            .any(|k| matches!(k, EventKind::ContextCompacted)),
+        "{kinds:?}"
+    );
+
+    let (session, mut events) = open("compact-refused", "--compact-refuses").await;
+    session.compact().await.unwrap();
+    let mut kinds = Vec::new();
+    while !matches!(kinds.last(), Some(EventKind::TurnEnded { .. })) {
+        kinds.push(next(&mut events).await.kind);
+    }
+    assert!(
+        kinds.iter().any(
+            |k| matches!(k, EventKind::Diagnostic(d) if d.message.contains("Nothing to compact"))
+        ),
+        "{kinds:?}"
+    );
 }

@@ -9,7 +9,7 @@
 // --echo-config-home (echo the CLAUDE_CONFIG_DIR the child received),
 // --rewind-fails (rewind_files answers with an error envelope).
 import { createInterface } from 'node:readline';
-import { writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 
 const flag = (name) => process.argv.includes(name);
 const send = (m) => process.stdout.write(JSON.stringify(m) + '\n');
@@ -18,6 +18,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // is a fresh process with a new session id, like the real CLI (recording 09).
 const FORK_AT = (process.argv.find((a) => a.startsWith('--resume-session-at=')) ?? '').slice(20) || null;
 const S = flag('--fork-session') ? 'sess-fork-1' : 'sess-c1';
+if (flag('--echo-relaunch')) appendFileSync('launches.jsonl', JSON.stringify(process.argv) + '\n');
+let recalled = flag('--echo-relaunch') && flag('--resume') ? JSON.parse(readFileSync('history.json', 'utf8')) : [];
 let n = 0;
 const uid = () => `f${n++}`;
 const USAGE = { input_tokens: 2, cache_creation_input_tokens: 198, cache_read_input_tokens: 1000, output_tokens: 0 };
@@ -29,7 +31,7 @@ const life = (cu, state) => send({ type: 'command_lifecycle', command_uuid: cu, 
 const assistantTool = (id, name, input, frameUuid) => send({ type: 'assistant', message: { id: 'msg_1', model: 'claude-sonnet-5', role: 'assistant', content: [{ type: 'tool_use', id, name, input }], usage: USAGE }, session_id: S, uuid: frameUuid ?? uid(), parent_tool_use_id: null });
 const resultFrame = (extra) => send({ type: 'result', session_id: S, uuid: uid(), subtype: 'success', is_error: false, stop_reason: 'end_turn', terminal_reason: 'completed', num_turns: 1, total_cost_usd: 0.01, usage: {}, modelUsage: { 'claude-sonnet-5': { contextWindow: 200000 } }, result: 'done', ...extra });
 
-let ctrlWaiters = {}, turn = null, inited = false, reqN = 0, queue = [];
+let ctrlWaiters = {}, turn = null, inited = false, reqN = 0, queue = [], woke = false;
 
 const rl = createInterface({ input: process.stdin });
 rl.on('line', (line) => {
@@ -54,6 +56,7 @@ function onControl(m) {
   const reply = (response) => send({ type: 'control_response', response: { subtype: 'success', request_id: m.request_id, response } });
   switch (m.request.subtype) {
     case 'initialize': {
+      if (flag('--resume-fails') && flag('--resume')) return send({ type: 'control_response', response: { subtype: 'error', request_id: m.request_id, error: 'resume refused' } });
       // `--permission-mode` at launch decides the starting mode, like the CLI.
       const pm = process.argv.indexOf('--permission-mode');
       // Fast mode turns on only via the `--settings` flag, like the real CLI.
@@ -63,7 +66,7 @@ function onControl(m) {
         fast_mode_state: fast ? 'on' : 'off',
         commands: [{ name: 'compact', description: 'Compact context', argumentHint: '' }],
         models: [
-          { value: 'default', displayName: 'Default (recommended)', description: 'Opus 5 with 1M context', supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'], supportsFastMode: true },
+          { value: 'default', displayName: 'Default (recommended)', description: 'Opus 5 with 1M context', supportsFastMode: !flag('--no-fast-metadata'), supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'] },
           { value: 'sonnet', displayName: 'Sonnet', description: 'Fast for everyday tasks', supportedEffortLevels: ['low', 'high'] },
         ],
         // Logged out, the real CLI still sends an account object — it just
@@ -147,6 +150,28 @@ async function runTurn(m) {
     turn = null;
     return;
   }
+  // `/compact` (probed 2026-09-04, 2.1.260). Success is silent: status
+  // frames, a fresh init, a compact boundary, and a result naming no user
+  // message. A refusal answers out loud like any other turn.
+  if (prompt.startsWith('/compact')) {
+    send({ type: 'system', subtype: 'status', status: 'compacting', session_id: S, uuid: uid() });
+    if (flag('--compact-refuses')) {
+      send({ type: 'system', subtype: 'status', status: null, compact_result: 'failed', compact_error: 'Not enough messages to compact.', session_id: S, uuid: uid() });
+      msgStart('msg_c');
+      delta({ type: 'text_delta', text: 'Not enough messages to compact.' });
+      ev({ type: 'message_stop' });
+      resultFrame({ user_message_uuid: u });
+    } else {
+      send({ type: 'system', subtype: 'status', status: null, compact_result: 'success', session_id: S, uuid: uid() });
+      send({ type: 'system', subtype: 'init', cwd: process.cwd(), session_id: S, model: 'claude-sonnet-5', permissionMode: 'default', tools: ['Write', 'Task'], apiKeySource: 'none', claude_code_version: '2.1.260', uuid: uid() });
+      send({ type: 'system', subtype: 'compact_boundary', session_id: S, uuid: uid(), compact_metadata: { trigger: 'manual' } });
+      resultFrame({ user_message_uuid: null, result: '' });
+    }
+    life(u, 'completed');
+    turn = null;
+    return;
+  }
+
   const aborted = () => {
     send({ type: 'result', session_id: S, uuid: uid(), user_message_uuid: null, subtype: 'error_during_execution', is_error: true, stop_reason: 'tool_use', terminal_reason: 'aborted_streaming', num_turns: 1, result: null, total_cost_usd: 0.005, usage: {}, modelUsage: { 'claude-sonnet-5': { contextWindow: 200000 } } });
     life(u, 'cancelled');
@@ -166,7 +191,8 @@ async function runTurn(m) {
     return;
   }
 
-  if (flag('--wake')) {
+  if (flag('--wake') || (flag('--wake-once') && !woke)) {
+    woke = true;
     msgStart('msg_1');
     delta({ type: 'text_delta', text: 'started' });
     // A backgrounded Bash: its tool_result closes the wire call while the
@@ -178,6 +204,7 @@ async function runTurn(m) {
     life(u, 'completed');
     turn = null;
     await sleep(150);
+    while (flag('--hold-background') && !existsSync('release-background')) await sleep(5);
     // The background task finishes and wakes the agent with no user frame.
     send({ type: 'system', subtype: 'task_notification', task_id: 'bg1', tool_use_id: 'toolu_bg', status: 'completed', uuid: uid(), session_id: S });
     turn = { interrupted: false };
@@ -210,12 +237,19 @@ async function runTurn(m) {
   msgStart('msg_1');
   delta({ type: 'thinking_delta', thinking: 'thinking…' });
   delta({ type: 'text_delta', text: 'Hello ' });
+  if (flag('--echo-relaunch')) {
+    delta({ type: 'text_delta', text: `recalled=${recalled.join('|')} ` });
+    recalled.push(prompt);
+    writeFileSync('history.json', JSON.stringify(recalled));
+  }
   // Echo identity so rollback tests can assert the fork cut point.
   if (flag('--echo-uuid')) delta({ type: 'text_delta', text: `uuid=${u} ` });
   if (FORK_AT) delta({ type: 'text_delta', text: `fork=${FORK_AT} ` });
   // Echo the config-home env var so tests can assert isolation reached the
   // child (set by SessionOptions::config_home).
   if (flag('--echo-config-home')) delta({ type: 'text_delta', text: `cfg=${process.env.CLAUDE_CONFIG_DIR ?? 'unset'} ` });
+  const settingsIndex = process.argv.indexOf('--settings');
+  if (settingsIndex > -1) delta({ type: 'text_delta', text: `fast=${JSON.parse(process.argv[settingsIndex + 1]).fastMode} ` });
   // Echo --mcp-config so tests can assert the launch shape.
   const mi = process.argv.indexOf('--mcp-config');
   if (mi > -1) {
