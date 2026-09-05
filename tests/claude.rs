@@ -1245,6 +1245,42 @@ async fn fast_mode_is_live_and_follows_the_model() {
     session.close().await.unwrap();
 }
 
+/// Toggling Fast mid-session applies on the next turn: the adapter relaunches
+/// the CLI with the new settings while the transcript survives.
+#[tokio::test]
+async fn fast_mode_toggle_relaunches_with_new_settings() {
+    let agent = AgentInstallation::at("claude", wrapper("fast-toggle", ""));
+    let (session, mut events) = Runtime::new()
+        .open(
+            &agent,
+            SessionOptions::in_dir(std::env::temp_dir()).configure("fast", false),
+        )
+        .await
+        .unwrap();
+    session.prompt("hi").await.unwrap();
+    assert!(
+        complete_turn(&session, &mut events).await.contains("fast=false"),
+        "first turn should run without fast mode"
+    );
+    session.configure("fast", true).await.unwrap();
+    assert_eq!(
+        session.info().configuration.options.get(&ConfigId::new("fast")),
+        Some(&ConfigValue::Bool(true))
+    );
+    session.prompt("hi again").await.unwrap();
+    assert!(
+        complete_turn(&session, &mut events).await.contains("fast=true"),
+        "turn after enabling should relaunch with fast mode"
+    );
+    session.configure("fast", false).await.unwrap();
+    session.prompt("once more").await.unwrap();
+    assert!(
+        complete_turn(&session, &mut events).await.contains("fast=false"),
+        "turn after disabling should relaunch without fast mode"
+    );
+    session.close().await.unwrap();
+}
+
 /// Sonnet and catalogs without a Fast capability cannot silently accept opt-in.
 #[tokio::test]
 async fn fast_mode_rejects_unsupported_models_and_wrong_types() {
