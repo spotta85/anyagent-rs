@@ -12,6 +12,14 @@ const send = (m) => process.stdout.write(JSON.stringify(m) + '\n');
 const notify = (sessionId, update) => send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId, update } });
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 let nextId = 100, pending = {}, turn = null, mcpDecl = [], effort = 'high';
+// --grok-models: per-model reasoning efforts in `_meta`. As on grok 1.0.4,
+// `reasoningEffort` there is a static default; the effort in force is only
+// reported by the `model_changed` session notification.
+let grokModel = 'grok-4.5', grokEffort = 'high';
+const grokModels = () => ({ currentModelId: grokModel, availableModels: [
+  { modelId: 'grok-4.5', name: 'Grok 4.5', description: 'fast', _meta: { reasoningEffort: 'high', reasoningEfforts: [{ value: 'low', label: 'Low Effort' }, { value: 'high', label: 'High Effort', description: 'default' }] } },
+  { modelId: 'grok-4.6', name: 'Grok 4.6', _meta: { reasoningEffort: 'high', reasoningEfforts: [{ value: 'low', label: 'Low Effort' }, { value: 'high', label: 'High Effort' }, { value: 'xhigh', label: 'Extra High' }] } },
+] });
 const kiroMetadata = (sessionId) => send({ jsonrpc: '2.0', method: '_kiro.dev/metadata', params: { sessionId, contextUsagePercentage: 0.5, effort } });
 
 // --die-not-logged-in: the kiro shape — complain on stderr and exit before
@@ -48,7 +56,7 @@ async function onRequest(m) {
       mcpDecl = m.params.mcpServers ?? [];
       // --grok-models: the first-class models state (no model configOption);
       // switching must ride session/set_model.
-      if (flag('--grok-models')) return reply({ sessionId: 'sess-1', models: { currentModelId: 'grok-4.5', availableModels: [{ modelId: 'grok-4.5', name: 'Grok 4.5', description: 'fast' }, { modelId: 'grok-4.6', name: 'Grok 4.6' }] } });
+      if (flag('--grok-models')) return reply({ sessionId: 'sess-1', models: grokModels() });
       // --kiro adds a model without effort levels.
       const models = [{ value: 'sonnet', name: 'Sonnet' }, { value: 'opus', name: 'Opus' }, ...(flag('--kiro') ? [{ value: 'claude-haiku-4.5', name: 'Haiku' }] : [])];
       reply({ sessionId: 'sess-1', modes: { currentModeId: 'default', availableModes: [{ id: 'default', name: 'Default' }, { id: 'plan', name: 'Plan' }] }, configOptions: [{ id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'sonnet', options: models }], _meta: { claude: { sessionId: 'uuid-1' } } });
@@ -71,7 +79,12 @@ async function onRequest(m) {
     case 'session/set_model':
       if (!flag('--grok-models')) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32601, message: 'method not found' } });
       if (!['grok-4.5', 'grok-4.6'].includes(m.params.modelId)) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32602, message: `unknown model ${m.params.modelId}` } });
-      return reply({});
+      grokModel = m.params.modelId;
+      if (m.params._meta?.reasoningEffort) grokEffort = m.params._meta.reasoningEffort;
+      reply({});
+      send({ jsonrpc: '2.0', method: '_x.ai/session_notification', params: { sessionId: m.params.sessionId, update: { sessionUpdate: 'model_changed', model_id: grokModel, reasoning_effort: grokEffort } } });
+      // The republished models state carries the stale default effort.
+      return send({ jsonrpc: '2.0', method: '_x.ai/models/update', params: grokModels() });
     case 'session/prompt': return runTurn(m);
     case 'session/cancel': if (turn) { turn.cancelled = true; } return;
     case '_session/steering': return reply({ accepted: true });
@@ -87,6 +100,8 @@ async function runTurn(m) {
   // every later metadata frame.
   if (flag('--kiro') && ptext.startsWith('/effort ')) {
     effort = ptext.slice('/effort '.length);
+    // An unrelated update lands mid-switch; only the ack chunk is internal.
+    notify(sid, { sessionUpdate: 'usage_update', used: 7, size: 100 });
     notify(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `Effort set to ${effort}` } });
     done('end_turn');
     return;
@@ -130,6 +145,8 @@ async function runTurn(m) {
   const perm = await request('session/request_permission', { sessionId: sid, toolCall: { toolCallId: 'call_2', title: 'Run tests' }, options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }, { optionId: 'reject', name: 'Reject', kind: 'reject_once' }] });
   const outcome = perm.result?.outcome?.outcome ?? 'error';
   notify(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `perm=${outcome} ` } });
+  // "die-late": a plain RPC failure after the permission exchange.
+  if (ptext.includes('die-late')) { send({ jsonrpc: '2.0', id: m.id, error: { code: -32603, message: 'kaput' } }); turn = null; return; }
   if (flag('--eof')) { process.stderr.write('boom: fixture died\n'); process.exit(3); }
   const flood = num('--flood', 0);
   for (let i = 0; i < flood; i++) notify(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'x'.repeat(100) } });

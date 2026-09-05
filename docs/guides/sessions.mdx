@@ -146,28 +146,36 @@ provider cooldowns still apply; the boolean records the selected setting.
 
 ### Reasoning effort
 
-The `effort` option is the same id everywhere; only how it can be set differs:
-
-| Agent | Values | At open | Live (`configure`) |
-|---|---|---|---|
-| Claude | from the model's `supportedEffortLevels` | yes | no (creation-only) |
-| Codex | from the model catalog | yes | yes, sent with the next turn |
-| Kiro | `low`, `medium`, `high`, `xhigh`, `max`; absent on models without effort (haiku 4.5, sonnet 4.5 and older, deepseek, minimax, glm, qwen, auto) | yes | yes |
+The `effort` option is the same everywhere it exists: a live select whose
+choices follow the selected model. Set it at open or mid-session, and read the
+result from `SessionUpdated`.
 
 ```rust
 // At open
 let options = SessionOptions::in_dir("/path/to/repo").configure("effort", "low");
 
-// Mid-session (Codex, Kiro)
+// Mid-session
 session.configure("effort", "high").await?;
 ```
+
+| Agent | Where the choices come from | Live |
+|---|---|---|
+| Claude | the model's `supportedEffortLevels` | no, creation-only |
+| Codex | its model catalog, sent with the next turn | yes |
+| opencode | the model's `variants`, sent as `variant` with every prompt | yes |
+| grok | the model's `reasoningEfforts`, with grok's labels, set through `set_model` | yes |
+| pi | the model's thinking levels | yes |
+| Kiro | `low`, `medium`, `high`, `xhigh`, `max`; absent on models without effort (haiku 4.5, sonnet 4.5 and older, deepseek, minimax, glm, qwen, auto) | yes |
+
+Switching the model rebuilds the choices, and a model without any drops the
+option; a `SessionUpdated` carries either change. Hermes and qwen expose no
+levels and no way to set one, so they have no `effort` option.
 
 Kiro has no wire call for effort: anyagent runs its `/effort <level>` command
 as a hidden prompt. A `configure` made while a turn is running waits for that
 turn to end, and a prompt sent while the switch runs waits behind it, so
 `configure` never fails for being busy. The current level is read back from
-kiro's metadata after every turn. The option follows the model: switching to
-a model without effort removes it, and a `SessionUpdated` carries the change.
+kiro's metadata after every turn.
 
 ## Cancelling
 

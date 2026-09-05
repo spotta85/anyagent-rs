@@ -855,19 +855,68 @@ async fn grok_first_class_models_surface_as_the_model_option_and_switch_via_set_
     assert_eq!(choices[0].label, "Grok 4.5");
     assert_eq!(choices[0].description.as_deref(), Some("fast"));
 
+    // Effort comes from the current model's `_meta`, with grok's labels.
+    let effort_option = |session: &Session| {
+        session
+            .info()
+            .details
+            .config_options
+            .into_iter()
+            .find(|o| o.id.as_str() == "effort")
+    };
+    let effort = effort_option(&session).expect("effort from the model meta");
+    assert!(effort.live);
+    assert_eq!(effort.current, Some(ConfigValue::Text("high".into())));
+    let anyagent::ConfigKind::Select { choices } = &effort.kind else {
+        panic!("expected select");
+    };
+    assert_eq!(
+        choices.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(),
+        ["Low Effort", "High Effort"]
+    );
+    assert_eq!(choices[1].description.as_deref(), Some("default"));
+
+    // An effort switch rides session/set_model with `_meta.reasoningEffort`.
+    session.configure("effort", "low").await.unwrap();
+    while effort_option(&session).and_then(|o| o.current) != Some(ConfigValue::Text("low".into())) {
+        next(&mut events).await;
+    }
+
     // The fixture rejects session/set_config_option for models under
     // --grok-models, so this passing proves the session/set_model route.
+    // The models/update that follows brings the new model's effort levels.
     session.configure("model", "grok-4.6").await.unwrap();
     loop {
         let event = next(&mut events).await;
-        if let EventKind::SessionUpdated(info) = event.kind {
-            assert_eq!(
-                info.configuration.options.get(&ConfigId::new("model")),
-                Some(&ConfigValue::Text("grok-4.6".into()))
-            );
+        if let EventKind::SessionUpdated(info) = event.kind
+            && info.configuration.options.get(&ConfigId::new("model"))
+                == Some(&ConfigValue::Text("grok-4.6".into()))
+        {
             break;
         }
     }
+    let levels = |session: &Session| -> Vec<String> {
+        match effort_option(session).map(|o| o.kind) {
+            Some(anyagent::ConfigKind::Select { choices }) => {
+                choices.into_iter().map(|c| c.value).collect()
+            }
+            _ => Vec::new(),
+        }
+    };
+    while levels(&session) != ["low", "high", "xhigh"] {
+        next(&mut events).await;
+    }
+    // The stale default in that models state does not undo the switch.
+    assert_eq!(
+        effort_option(&session).and_then(|o| o.current),
+        Some(ConfigValue::Text("low".into()))
+    );
+    session.configure("effort", "xhigh").await.unwrap();
+    while effort_option(&session).and_then(|o| o.current) != Some(ConfigValue::Text("xhigh".into()))
+    {
+        next(&mut events).await;
+    }
+    session.close().await.unwrap();
 }
 
 /// Config_home on agent without known var refused typed InvalidConfiguration.
@@ -986,15 +1035,19 @@ async fn kiro_effort_is_a_live_option_backed_by_the_effort_prompt() {
         next(&mut events).await;
     }
 
-    // A live switch rides a `/effort` prompt; its ack chunk stays internal.
+    // A live switch rides a `/effort` prompt; its ack chunk stays internal
+    // while the unrelated update sent alongside it still arrives.
     session.configure("effort", "low").await.unwrap();
+    let mut usage_seen = false;
     while effort(&session) != Some(ConfigValue::Text("low".into())) {
         let event = next(&mut events).await;
         assert!(
             !matches!(event.kind, EventKind::TextDelta { .. }),
             "the effort ack leaked as text"
         );
+        usage_seen |= matches!(event.kind, EventKind::ContextUsage { used_tokens: 7, .. });
     }
+    assert!(usage_seen, "the usage update mid-switch was dropped");
 
     // A switch mid-turn waits for the turn, then applies.
     session.prompt("hi").await.unwrap();
@@ -1010,6 +1063,26 @@ async fn kiro_effort_is_a_live_option_backed_by_the_effort_prompt() {
         }
     }
     while effort(&session) != Some(ConfigValue::Text("medium".into())) {
+        next(&mut events).await;
+    }
+
+    // A switch queued behind a turn that fails still goes out.
+    session.prompt("hi die-late").await.unwrap();
+    loop {
+        let event = next(&mut events).await;
+        match event.kind {
+            EventKind::RequestOpened(Request::Permission(r)) => {
+                session.configure("effort", "xhigh").await.unwrap();
+                session.answer(r.id, allow()).await.unwrap();
+            }
+            EventKind::TurnEnded { stop, .. } => {
+                assert!(matches!(stop, StopReason::Failed { .. }), "{stop:?}");
+                break;
+            }
+            _ => {}
+        }
+    }
+    while effort(&session) != Some(ConfigValue::Text("xhigh".into())) {
         next(&mut events).await;
     }
 

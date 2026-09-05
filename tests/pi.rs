@@ -143,10 +143,10 @@ async fn handshake_advertises_state_models_levels_and_commands() {
     let thinking = details
         .config_options
         .iter()
-        .find(|o| o.id.as_str() == "thinking")
-        .expect("a thinking option");
+        .find(|o| o.id.as_str() == "effort")
+        .expect("an effort option");
     let ConfigKind::Select { choices } = &thinking.kind else {
-        panic!("thinking is a select")
+        panic!("effort is a select")
     };
     assert_eq!(
         choices.iter().map(|c| c.value.as_str()).collect::<Vec<_>>(),
@@ -416,7 +416,7 @@ async fn a_model_change_applies_and_re_reads_the_new_model_levels() {
             .details
             .config_options
             .iter()
-            .find(|o| o.id.as_str() == "thinking")
+            .find(|o| o.id.as_str() == "effort")
         {
             Some(option) => match &option.kind {
                 ConfigKind::Select { choices } => choices.iter().map(|c| c.value.clone()).collect(),
@@ -437,10 +437,10 @@ async fn a_model_change_applies_and_re_reads_the_new_model_levels() {
         .details
         .config_options
         .iter()
-        .find(|o| o.id.as_str() == "thinking")
-        .expect("a thinking option");
+        .find(|o| o.id.as_str() == "effort")
+        .expect("an effort option");
     assert_eq!(thinking.current, None);
-    assert_eq!(info.configuration.options.get(&"thinking".into()), None);
+    assert_eq!(info.configuration.options.get(&"effort".into()), None);
 }
 
 /// Failed model turn ends as Failed with provider refused message.

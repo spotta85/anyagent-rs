@@ -21,9 +21,9 @@ use std::time::Duration;
 use futures::StreamExt;
 
 use anyagent::{
-    AgentError, Answer, AuthStatus, Capability, ConfigId, ConfigKind, ConfigValue, DeliveryKind,
-    Event, EventKind, Events, MessageId, PermissionChoice, PromptId, QuestionAnswer, Request,
-    RequestId, RollbackScope, Runtime, Session, SessionOptions, StopReason, ToolStatus, TurnOrigin,
+    AgentError, Answer, AuthStatus, Capability, ConfigKind, ConfigValue, DeliveryKind, Event,
+    EventKind, Events, MessageId, PermissionChoice, PromptId, QuestionAnswer, Request, RequestId,
+    RollbackScope, Runtime, Session, SessionOptions, StopReason, ToolStatus, TurnOrigin,
 };
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -186,60 +186,79 @@ async fn open_reports_token_capabilities_and_options() {
     }
 }
 
-/// Kiro effort: advertised at open, synced from metadata, switched live via the `/effort` prompt with no ack leaking as text.
+/// Effort is one option everywhere it exists: `effort`, a live select whose choices follow the model, switched via `configure` and confirmed by `SessionUpdated`; verified on kiro, grok, opencode, pi.
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
-async fn effort_switches_live_on_kiro() {
-    for h in enabled().into_iter().filter(|h| *h == "kiro") {
+async fn effort_switches_live() {
+    // grok is not in the shared matrix (no modes, so other tests would
+    // fail on it); this test names its own harnesses.
+    let list = std::env::var("ANYAGENT_LIVE").unwrap_or_default();
+    let named = |h: &str| list == "all" || list.split(',').any(|p| p.trim() == h);
+    for h in ["kiro", "grok", "opencode", "pi"]
+        .into_iter()
+        .filter(|h| named(h))
+    {
+        let runtime = Runtime::new();
+        if runtime.discover().await.require(h).is_err() {
+            println!("SKIP {h}: not discovered");
+            continue;
+        }
         let (session, mut events, _dir) = open(h).await;
-        let effort = |session: &Session| {
-            session
-                .info()
-                .configuration
-                .options
-                .get(&ConfigId::new("effort"))
-                .cloned()
-        };
-        assert!(
+        let option = |session: &Session| {
             session
                 .info()
                 .details
                 .config_options
-                .iter()
-                .any(|o| o.id.as_str() == "effort" && o.live),
-            "{h}: no live `effort` option"
-        );
-        let levels: Vec<String> = session
-            .info()
-            .details
-            .config_options
-            .iter()
-            .find(|o| o.id.as_str() == "effort")
-            .map(|o| match &o.kind {
-                ConfigKind::Select { choices } => choices.iter().map(|c| c.value.clone()).collect(),
-                _ => Vec::new(),
-            })
-            .unwrap_or_default();
-        assert_eq!(
-            levels,
-            ["low", "medium", "high", "xhigh", "max"],
-            "{h}: levels"
-        );
-        // The metadata frame after session/new names the current level.
-        while effort(&session).is_none() {
-            next(&mut events, "effort sync").await;
-        }
-        let target = if effort(&session) == Some(ConfigValue::Text("low".into())) {
-            "medium"
-        } else {
-            "low"
+                .into_iter()
+                .find(|o| o.id.as_str() == "effort")
         };
+        // The pinned zen model has no variants; a free one with them also
+        // proves the option follows a live model switch.
+        if h == "opencode" {
+            session
+                .configure("model", "opencode/ling-3.0-flash-fin-free")
+                .await
+                .unwrap();
+            while option(&session).is_none() {
+                next(&mut events, "effort after model switch").await;
+            }
+        }
+        let Some(effort) = option(&session) else {
+            assert_ne!(h, "kiro", "kiro: no `effort` option");
+            println!("SKIP {h}: the selected model has no effort levels");
+            session.close().await.unwrap();
+            continue;
+        };
+        assert!(effort.live, "{h}: effort is not live");
+        let ConfigKind::Select { choices } = &effort.kind else {
+            panic!("{h}: effort is not a select");
+        };
+        let levels: Vec<&str> = choices.iter().map(|c| c.value.as_str()).collect();
+        if h == "kiro" {
+            assert_eq!(
+                levels,
+                ["low", "medium", "high", "xhigh", "max"],
+                "{h}: levels"
+            );
+        }
+        // kiro reports the current level in a metadata frame right after open.
+        if h == "kiro" {
+            while option(&session).is_some_and(|o| o.current.is_none()) {
+                next(&mut events, "effort sync").await;
+            }
+        }
+        let current = option(&session).and_then(|o| o.current);
+        let target = levels
+            .iter()
+            .find(|l| Some(ConfigValue::Text((**l).to_owned())) != current)
+            .copied()
+            .expect("a level other than the current one");
         session.configure("effort", target).await.unwrap();
-        while effort(&session) != Some(ConfigValue::Text(target.into())) {
+        while option(&session).and_then(|o| o.current) != Some(ConfigValue::Text(target.into())) {
             let event = next(&mut events, "effort switch").await;
             assert!(
                 !matches!(event.kind, EventKind::TextDelta { .. }),
-                "{h}: the effort ack leaked as text"
+                "{h}: a switch leaked text"
             );
         }
         session
@@ -249,12 +268,15 @@ async fn effort_switches_live_on_kiro() {
         let text = drain_to_turn_end(&session, &mut events, "turn after switch").await;
         assert!(text.to_lowercase().contains("ok"), "{h}: got {text:?}");
         assert_eq!(
-            effort(&session),
+            option(&session).and_then(|o| o.current),
             Some(ConfigValue::Text(target.into())),
-            "{h}: metadata disagrees after the turn"
+            "{h}: effort changed under us after the turn"
         );
         session.close().await.unwrap();
-        pass(h, &format!("effort switched to {target}"));
+        pass(
+            h,
+            &format!("effort switched to {target} ({} levels)", levels.len()),
+        );
     }
 }
 
