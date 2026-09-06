@@ -854,6 +854,7 @@ async fn a_silent_agent_earns_a_stall_warning_but_not_while_it_waits_on_us() {
         panic!("expected a stall diagnostic, got {:?}", warning.kind)
     };
     assert!(d.message.contains("no activity"), "{}", d.message);
+    assert_eq!(warning.extensions["anyagent/stalled"], 120);
     assert!(
         warning.turn_info.is_some(),
         "the warning belongs to the turn"

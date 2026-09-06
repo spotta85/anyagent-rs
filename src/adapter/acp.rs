@@ -126,6 +126,7 @@ impl Adapter for AcpAdapter {
                 effort_id: None,
                 pending_effort: None,
                 held_prompt: None,
+                retry: None,
                 login,
             }
             .run(cmd_rx),
@@ -665,6 +666,10 @@ struct Drive {
     pending_effort: Option<ConfigValue>,
     /// A turn (params, prompt id) that arrived mid-switch, sent once it ends.
     held_prompt: Option<(Value, String)>,
+    /// Kiro: the running prompt, re-sent once if it comes back `cancelled`
+    /// with nothing said and no cancel of ours — its cancel races the next
+    /// prompt (probed 2026-08-27, kiro 2.19.1). Cleared by any content.
+    retry: Option<Value>,
     /// Runnable login methods from `initialize`, for mid-session auth loss.
     login: Vec<LoginMethod>,
 }
@@ -740,6 +745,7 @@ impl Drive {
                 // Cancel first, then unblock pending wire requests: an agent
                 // parked on a permission resumes only after its response, and
                 // it must already know the turn is cancelled by then.
+                self.retry = None;
                 self.wire
                     .notify("session/cancel", json!({ "sessionId": self.session_id }))
                     .await?;
@@ -875,6 +881,13 @@ impl Drive {
     /// A typed session update, or a raw fallback that loses nothing.
     async fn on_update(&mut self, frame: Value) -> Result<(), Gone> {
         let params = frame.get("params").cloned().unwrap_or_default();
+        // Content proves the turn ran: a cancel after it is real.
+        if matches!(
+            params["update"]["sessionUpdate"].as_str(),
+            Some("agent_message_chunk" | "agent_thought_chunk" | "tool_call")
+        ) {
+            self.retry = None;
+        }
         // Kiro's "Effort set to <level>" chunk is the switch's ack, not
         // content; every other update still flows.
         if self.effort_id.is_some() && params["update"]["sessionUpdate"] == "agent_message_chunk" {
@@ -1225,6 +1238,13 @@ impl Drive {
             return Ok(());
         };
         if Some(id) == self.prompt_id {
+            // Kiro's spurious cancel: the same prompt goes out once more.
+            if frame["result"]["stopReason"] == "cancelled"
+                && let Some(params) = self.retry.take()
+            {
+                self.prompt_id = Some(self.wire.request("session/prompt", params).await?);
+                return Ok(());
+            }
             self.prompt_id = None;
             self.tools.clear();
             // A switch queued behind this turn goes out before the turn is
@@ -1291,6 +1311,7 @@ impl Drive {
 
     /// Sends a prompt as the running turn.
     async fn send_prompt(&mut self, params: Value, pid: String) -> Result<(), Gone> {
+        self.retry = self.kiro.then(|| params.clone());
         self.prompt_id = Some(self.wire.request("session/prompt", params).await?);
         self.prompt_meta = Some(pid);
         Ok(())

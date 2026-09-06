@@ -877,21 +877,14 @@ async fn cancel_ends_the_turn_in_every_queue_shape() {
             wait_for_content(&mut events, &format!("{h}: count streaming rep {rep}")).await;
             session.cancel(false).await.unwrap();
             expect_cancelled(&mut events, &format!("{h}: queued cancel rep {rep}")).await;
-            let mut text = drain_to_turn_end(
+            // kiro's cancel can race the next prompt (2.19.1); the adapter
+            // re-sends once, so the queued turn still answers.
+            let text = drain_to_turn_end(
                 &session,
                 &mut events,
                 &format!("{h}: queued prompt rep {rep}"),
             )
             .await;
-            // KNOWN (kiro 2.19.1): the agent's cancel races the next prompt —
-            // the queued turn can come back spuriously cancelled and empty
-            // (probed 2026-08-27). An app's recourse is to re-send; do that.
-            if h == "kiro" && text.is_empty() {
-                println!("KNOWN kiro: queued turn spuriously cancelled; re-sending");
-                session.prompt("Say only PEAR. No tools.").await.unwrap();
-                text =
-                    drain_to_turn_end(&session, &mut events, &format!("{h}: PEAR re-send")).await;
-            }
             assert!(text.contains("PEAR"), "{h}: queued turn said {text:?}");
         }
 

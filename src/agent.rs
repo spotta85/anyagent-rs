@@ -386,6 +386,7 @@ pub struct SessionOptions {
     pub(crate) permission_mode: PermissionMode,
     pub(crate) no_tools: bool,
     pub(crate) quiet_window: Option<Duration>,
+    pub(crate) stall_after: Option<Duration>,
     pub(crate) mcp_servers: Vec<McpServer>,
     pub(crate) configure: Vec<(ConfigId, ConfigValue)>,
     pub(crate) config_home: Option<PathBuf>,
@@ -413,6 +414,7 @@ impl SessionOptions {
             permission_mode: PermissionMode::Ask,
             no_tools: false,
             quiet_window: None,
+            stall_after: None,
             mcp_servers: Vec::new(),
             configure: Vec::new(),
             config_home: None,
@@ -485,6 +487,14 @@ impl SessionOptions {
     /// wire does not end turns deterministically. Diagnostics only.
     pub fn quiet_window(mut self, window: Duration) -> Self {
         self.quiet_window = Some(window);
+        self
+    }
+
+    /// How long the agent may stay silent mid-turn before a stall warning
+    /// `Diagnostic` (default 120 s). It warns once per silence; never ends
+    /// the turn.
+    pub fn stall_after(mut self, after: Duration) -> Self {
+        self.stall_after = Some(after);
         self
     }
 

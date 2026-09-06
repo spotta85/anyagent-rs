@@ -11,7 +11,7 @@ const num = (name, dflt) => +(process.argv.find(a => a.startsWith(name + '='))?.
 const send = (m) => process.stdout.write(JSON.stringify(m) + '\n');
 const notify = (sessionId, update) => send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId, update } });
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-let nextId = 100, pending = {}, turn = null, mcpDecl = [], effort = 'high';
+let nextId = 100, pending = {}, turn = null, mcpDecl = [], effort = 'high', spurious = false;
 // --grok-models: per-model reasoning efforts in `_meta`. As on grok 1.0.4,
 // `reasoningEffort` there is a static default; the effort in force is only
 // reported by the `model_changed` session notification.
@@ -89,7 +89,7 @@ async function onRequest(m) {
       // The republished models state carries the stale default effort.
       return send({ jsonrpc: '2.0', method: '_x.ai/models/update', params: grokModels() });
     case 'session/prompt': return runTurn(m);
-    case 'session/cancel': if (turn) { turn.cancelled = true; } return;
+    case 'session/cancel': if (turn) { turn.cancelled = true; } spurious = flag('--spurious-cancel'); return;
     case '_session/steering': return reply({ accepted: true });
     default: return send({ jsonrpc: '2.0', id: m.id, error: { code: -32601, message: 'method not found' } });
   }
@@ -99,6 +99,9 @@ async function runTurn(m) {
   const sid = m.params.sessionId; turn = { cancelled: false };
   const done = (stopReason) => { send({ jsonrpc: '2.0', id: m.id, result: { stopReason, _meta: { usage: { inputTokens: 1 } } } }); turn = null; };
   const ptext = m.params.prompt.find(b => b.type === 'text')?.text ?? '';
+  // --spurious-cancel: the first prompt after a cancel dies "cancelled" with
+  // nothing said (the kiro race).
+  if (spurious) { spurious = false; done('cancelled'); return; }
   if (flag('--grok-models') && ptext === 'model-state') {
     notify(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `${grokModel}:${grokEffort}` } });
     done('end_turn');

@@ -37,8 +37,8 @@ const EVENT_BUFFER: usize = 1024;
 const CLOSE_GRACE: Duration = Duration::from_secs(5);
 const QUIET_USER_TURN: Duration = Duration::from_secs(120);
 const QUIET_AGENT_TURN: Duration = Duration::from_secs(20);
-/// Silence from the agent mid-turn that earns a warning diagnostic. Never
-/// ends the turn: a slow tool and a hung agent look the same from here.
+/// Default `SessionOptions::stall_after`: mid-turn silence that earns a
+/// warning. Never ends the turn: a slow tool and a hung agent look the same.
 const STALL_WARNING: Duration = Duration::from_secs(120);
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
@@ -260,6 +260,7 @@ pub(crate) fn start(
         closing: None,
         auto_approve: matches!(options.permission_mode, PermissionMode::AutoApprove),
         stall: None,
+        stall_after: options.stall_after.unwrap_or(STALL_WARNING),
         exit: None,
         noise_reported: false,
         awaiting_ack: false,
@@ -433,6 +434,7 @@ struct Engine {
     /// When mid-turn silence becomes a warning; re-armed by every driver
     /// event, off while the agent waits on the caller.
     stall: Option<Instant>,
+    stall_after: Duration,
     /// Exit report from the adapter, delivered just before its channel closes.
     exit: Option<(String, String)>,
     noise_reported: bool,
@@ -933,21 +935,18 @@ impl Engine {
         }
     }
 
-    /// The agent has been silent mid-turn for `STALL_WARNING`: say so once,
-    /// and again only after it speaks and goes quiet again.
+    /// The agent has been silent mid-turn for `stall_after`: say so once,
+    /// and again only after it speaks and goes quiet again. The seconds ride
+    /// `extensions["anyagent/stalled"]` so apps can match without the text.
     async fn on_stall(&mut self) {
         self.stall = None;
-        self.emit(
-            EventKind::Diagnostic(Diagnostic {
-                level: DiagnosticLevel::Warning,
-                message: format!(
-                    "no activity from the agent for {} s; cancel if it is stuck",
-                    STALL_WARNING.as_secs()
-                ),
-            }),
-            true,
-        )
-        .await;
+        let secs = self.stall_after.as_secs();
+        let kind = EventKind::Diagnostic(Diagnostic {
+            level: DiagnosticLevel::Warning,
+            message: format!("no activity from the agent for {secs} s; cancel if it is stuck"),
+        });
+        let extensions = Extensions::from([("anyagent/stalled".to_owned(), secs.into())]);
+        self.emit_with(kind, true, extensions).await;
     }
 
     /// The quiet window elapsed, or the close grace expired.
@@ -1093,7 +1092,7 @@ impl Engine {
     fn arm_stall(&mut self) {
         self.stall = match &self.state {
             TurnState::Running { open_requests, .. } if open_requests.is_empty() => {
-                Some(Instant::now() + STALL_WARNING)
+                Some(Instant::now() + self.stall_after)
             }
             _ => None,
         };
@@ -1129,6 +1128,11 @@ impl Engine {
 
     /// Emits an engine-made event, attached to the running turn when asked.
     async fn emit(&mut self, kind: EventKind, in_turn: bool) {
+        self.emit_with(kind, in_turn, Extensions::new()).await;
+    }
+
+    /// `emit` with extensions.
+    async fn emit_with(&mut self, kind: EventKind, in_turn: bool, extensions: Extensions) {
         let turn = match (&self.state, in_turn) {
             (TurnState::Running { turn, .. }, true) => Some(TurnContext {
                 id: turn.clone(),
@@ -1136,7 +1140,7 @@ impl Engine {
             }),
             _ => None,
         };
-        self.push(turn, kind, Extensions::new()).await;
+        self.push(turn, kind, extensions).await;
     }
 
     /// Assigns the sequence number and delivers. `try_send` never parks the
