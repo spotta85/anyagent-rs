@@ -937,11 +937,10 @@ async fn resume_recalls_without_replaying() {
         let runtime = Runtime::new();
         let report = runtime.discover().await;
         let agent = report.require(h).unwrap();
-        let mut options = SessionOptions::in_dir(dir.path()).resume(token);
-        if h == "opencode" {
-            options = options.configure("model", OPENCODE_MODEL);
-        }
-        let (session, mut events) = runtime.open(agent, options).await.unwrap();
+        let (session, mut events) = runtime
+            .open(agent, options(h, dir.path()).resume(token))
+            .await
+            .unwrap();
         // No replay: 3s of pre-prompt drain must carry zero content events.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         while let Ok(Some(event)) = tokio::time::timeout_at(deadline, events.next()).await {
@@ -1250,8 +1249,7 @@ async fn fork_from_branches_at_a_point_and_at_the_tip() {
         let (forked, mut fork_events) = runtime
             .open(
                 agent,
-                SessionOptions::in_dir(dir.path())
-                    .fork_from(token.clone(), Some(MessageId::new(&anchors[0]))),
+                options(h, dir.path()).fork_from(token.clone(), Some(MessageId::new(&anchors[0]))),
             )
             .await
             .unwrap();
@@ -1272,10 +1270,7 @@ async fn fork_from_branches_at_a_point_and_at_the_tip() {
         // Fork at the tip: the branch knows both — which also proves the
         // original transcript survived the first fork untouched.
         let (tip, mut tip_events) = runtime
-            .open(
-                agent,
-                SessionOptions::in_dir(dir.path()).fork_from(token.clone(), None),
-            )
+            .open(agent, options(h, dir.path()).fork_from(token.clone(), None))
             .await
             .unwrap();
         tip.prompt(recall).await.unwrap();
@@ -1483,6 +1478,7 @@ fn options(harness: &str, dir: &std::path::Path) -> SessionOptions {
         // escalates past the read-only sandbox and asks.
         options = options
             .configure("model", CODEX_MODEL)
+            .configure("effort", "low")
             .configure("sandbox", "read-only")
             .configure("mode", "on-request");
     }
