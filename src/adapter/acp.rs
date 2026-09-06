@@ -1,20 +1,22 @@
-//! ACP adapter: drives any ACP v1 agent over stdio. Owns a small JSON-RPC
-//! reader (S0 decision: bounded channel, raw frames, typed parsing per frame
-//! with raw fallback); the engine owns all turn rules.
+//! ACP adapter: drives any ACP v1 agent over stdio, with typed parsing per
+//! frame and a raw fallback; the engine owns all turn rules.
+//!
+//! High level: `connect` → spawn + `handshake` (`initialize`, `session/new`
+//! or `session/load`, creation-time config) → `driver_info`; then
+//! `Drive::run` turns commands into requests (`handle_command`) and
+//! notifications into events (`handle_frame`, `translate`, `on_*`).
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use agent_client_protocol_schema::v1 as acp;
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::ChildStdin;
 use tokio::sync::mpsc;
 
 use crate::adapter::{
-    Adapter, ConnectRequest, DriverCommand, DriverConnection, DriverEvent, DriverInfo,
-    WireRecorder, attach,
+    Adapter, CLOSE_GRACE, ConnectRequest, DriverCommand, DriverConnection, DriverEvent, DriverInfo,
+    Emitter, FRAME_BUFFER, Gone, HANDSHAKE_TIMEOUT, LineWire, WireRecorder, attach, level_choices,
+    offers, selected, set_effort_option, set_select_option,
 };
 use crate::agent::{
     AgentDetails, AuthKind, AuthStatus, Capabilities, Capability, ConfigChoice, ConfigId,
@@ -30,9 +32,6 @@ use crate::event::{
 };
 use crate::process::{self, Spawn};
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
-const CLOSE_GRACE: Duration = Duration::from_secs(2);
-const FRAME_BUFFER: usize = 64;
 const AUTH_REQUIRED_CODE: i64 = -32000;
 
 /// One instance per ACP agent; `args` put the CLI in protocol mode.
@@ -44,6 +43,7 @@ pub(crate) struct AcpAdapter {
 }
 
 impl AcpAdapter {
+    /// An ad-hoc ACP agent: protocol args only, no catalog facts.
     pub(crate) fn new(args: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self {
             args: args.into_iter().map(Into::into).collect(),
@@ -70,7 +70,8 @@ impl Adapter for AcpAdapter {
     async fn connect(&self, request: ConnectRequest) -> Result<DriverConnection, AgentError> {
         let env = crate::adapter::config_home_env(&request.installation, &request.options)?;
         let (ev_tx, ev_rx) = mpsc::channel(FRAME_BUFFER);
-        let recorder = WireRecorder::for_session(&request.options, &ev_tx).await;
+        let events = Emitter::new(ev_tx);
+        let recorder = WireRecorder::for_session(&request.options, &events).await;
         let mut child = process::spawn(Spawn {
             exec_path: request.installation.executable_path.clone(),
             args: self.args.clone(),
@@ -104,13 +105,13 @@ impl Adapter for AcpAdapter {
             }
         };
 
-        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         tokio::spawn(
             Drive {
                 wire,
                 child,
                 session_id,
-                events: ev_tx,
+                events,
                 info: info.clone(),
                 tools: HashMap::new(),
                 permissions: HashMap::new(),
@@ -137,6 +138,10 @@ impl Adapter for AcpAdapter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// LAUNCH AND HANDSHAKE
+// ---------------------------------------------------------------------------
+
 /// `initialize`, then `session/new` or `session/load`. A `session/new` error
 /// with the auth code becomes `AuthRequired` with runnable login methods;
 /// the same methods ride along for auth failures later in the session.
@@ -148,7 +153,11 @@ async fn handshake(
     let init = wire
         .roundtrip(
             "initialize",
-            json!({ "protocolVersion": 1, "clientCapabilities": {} }),
+            json!({
+                "protocolVersion": 1,
+                "clientCapabilities": {},
+                "clientInfo": { "name": "anyagent", "version": env!("CARGO_PKG_VERSION") },
+            }),
         )
         .await
         .map_err(|e| e.into_error(&[], &request.installation.executable_path))?;
@@ -193,11 +202,8 @@ async fn handshake(
         apply_session_config(&mut info, new.modes.as_ref(), new.config_options.as_deref());
         new.session_id.0.to_string()
     } else {
-        // A resumed session reports its modes and options the same way a new
-        // one does (probed against opencode 1.18: `session/load` answers with
-        // the full `configOptions`). Skipping this left a reattached thread
-        // with no model or mode to switch. Parsing is best-effort: an agent
-        // that answers `null` still resumes, just without the surface.
+        // A loaded session reports modes and options like a new one (probed
+        // opencode 1.18); an agent answering `null` still resumes.
         if let Ok(loaded) = parse::<acp::LoadSessionResponse>(response, "session/load response") {
             apply_session_config(
                 &mut info,
@@ -262,69 +268,31 @@ fn is_kiro(init: &acp::InitializeResponse) -> bool {
         .is_some_and(|i| i.name.starts_with("Kiro"))
 }
 
-/// Makes kiro's `effort` option match the selected model: the shared
-/// levels for models that have effort, no option for the ones that don't.
-/// Kiro advertises nothing for it on the wire (probed 2.20.1).
+/// Makes kiro's `effort` option match the selected model; kiro advertises
+/// nothing for it on the wire (probed 2.20.1).
 fn sync_effort(info: &mut DriverInfo) {
     let model = selected(info, "model").unwrap_or_default();
-    let choices = crate::adapter::effort_choices(&model).unwrap_or_default();
-    let current = selected(info, "effort")
-        .map(ConfigValue::Text)
-        .filter(|c| offers_choice(&choices, c));
-    replace_select(info, "effort", choices, current);
+    set_effort_option(info, kiro_effort_choices(&model), selected(info, "effort"));
 }
 
-/// The selected text value of option `id`.
-fn selected(info: &DriverInfo, id: &str) -> Option<String> {
-    match info.configuration.options.get(&ConfigId::new(id)) {
-        Some(ConfigValue::Text(value)) => Some(value.clone()),
-        _ => None,
+/// The effort levels kiro's models share; empty for the models without
+/// effort (kiro-cli 2.20.1's list, probed 2026-09-05).
+fn kiro_effort_choices(model: &str) -> Vec<ConfigChoice> {
+    const NO_EFFORT: [&str; 9] = [
+        "auto",
+        "claude-sonnet-4.5",
+        "claude-sonnet-4",
+        "claude-haiku-4.5",
+        "deepseek-3.2",
+        "minimax-m2.5",
+        "minimax-m2.1",
+        "glm-5",
+        "qwen3-coder-next",
+    ];
+    if NO_EFFORT.contains(&model) {
+        return Vec::new();
     }
-}
-
-/// Replaces the `model` or `effort` select with these choices and current
-/// value; no choices means no option.
-fn replace_select(
-    info: &mut DriverInfo,
-    id: &str,
-    choices: Vec<ConfigChoice>,
-    current: Option<ConfigValue>,
-) {
-    let (name, category) = match id {
-        "model" => ("Model", "model"),
-        _ => ("Reasoning effort", "thought_level"),
-    };
-    let id = ConfigId::new(id);
-    info.details.config_options.retain(|o| o.id != id);
-    info.configuration.options.remove(&id);
-    if choices.is_empty() {
-        return;
-    }
-    if let Some(current) = &current {
-        info.configuration
-            .options
-            .insert(id.clone(), current.clone());
-    }
-    info.details.config_options.push(ConfigOption {
-        id,
-        name: name.into(),
-        category: Some(category.into()),
-        kind: ConfigKind::Select { choices },
-        current,
-        live: true,
-    });
-}
-
-/// Whether the advertised option `id` offers `value`.
-fn offers(info: &DriverInfo, id: &str, value: &ConfigValue) -> bool {
-    info.details.config_options.iter().any(|o| {
-        o.id.as_str() == id
-            && matches!(&o.kind, ConfigKind::Select { choices } if offers_choice(choices, value))
-    })
-}
-
-fn offers_choice(choices: &[ConfigChoice], value: &ConfigValue) -> bool {
-    matches!(value, ConfigValue::Text(v) if choices.iter().any(|c| &c.value == v))
+    level_choices(["low", "medium", "high", "xhigh", "max"])
 }
 
 /// Kiro has no wire call for effort: `/effort <level>` runs as its own
@@ -430,20 +398,21 @@ fn sync_first_class_models(info: &mut DriverInfo, models: &Value) {
         })
         .collect();
     let effort = selected(info, "effort")
-        .map(ConfigValue::Text)
-        .filter(|e| offers_choice(&efforts, e))
+        .filter(|e| efforts.iter().any(|c| &c.value == e))
         .or_else(|| {
             current
                 .and_then(|m| m["_meta"]["reasoningEffort"].as_str())
-                .map(|e| ConfigValue::Text(e.to_owned()))
+                .map(str::to_owned)
         });
-    replace_select(
+    set_select_option(
         info,
         "model",
+        "Model",
+        "model",
         choices,
-        current_id.map(|c| ConfigValue::Text(c.to_owned())),
+        current_id.map(str::to_owned),
     );
-    replace_select(info, "effort", efforts, effort);
+    set_effort_option(info, efforts, effort);
 }
 
 /// What `initialize` tells us, folded into the engine's vocabulary.
@@ -452,7 +421,14 @@ fn driver_info(
     auth: &Option<AuthStatus>,
     open_auth_kind: Option<AuthKind>,
 ) -> DriverInfo {
-    let mut features = vec![Capability::Permissions];
+    // Plan and slash commands (sent as prompt text) are core ACP;
+    // ContextUsage and Questions are added on first sight, since the
+    // handshake does not say whether an agent sends them.
+    let mut features = vec![
+        Capability::Permissions,
+        Capability::Plan,
+        Capability::SlashCommands,
+    ];
     if init.agent_capabilities.prompt_capabilities.image {
         features.push(Capability::Images);
     }
@@ -489,6 +465,7 @@ fn driver_info(
         // The prompt response ends prompted turns; nothing ends unprompted ones.
         deterministic_turn_end: true,
         deterministic_agent_turn_end: false,
+        tools_disabled: false,
     }
 }
 
@@ -621,6 +598,7 @@ fn config_category(category: &acp::SessionConfigOptionCategory) -> String {
     }
 }
 
+/// Select options, grouped or not, as flat choices.
 fn select_choices(options: &acp::SessionConfigSelectOptions) -> Vec<ConfigChoice> {
     let flat: Vec<&acp::SessionConfigSelectOption> = match options {
         acp::SessionConfigSelectOptions::Ungrouped(o) => o.iter().collect(),
@@ -639,7 +617,7 @@ fn select_choices(options: &acp::SessionConfigSelectOptions) -> Vec<ConfigChoice
 }
 
 // ---------------------------------------------------------------------------
-// Drive task: engine commands out, wire frames in
+// DRIVE TASK: engine commands out, wire frames in
 // ---------------------------------------------------------------------------
 
 /// A permission request waiting for `answer`: its wire id and the offered
@@ -660,7 +638,7 @@ struct Drive {
     wire: Wire,
     child: process::Child,
     session_id: String,
-    events: mpsc::Sender<DriverEvent>,
+    events: Emitter,
     /// Current advertised state; mutated and re-sent as `InfoChanged`.
     info: DriverInfo,
     /// Cumulative tool snapshots, merged from partial wire updates.
@@ -693,7 +671,7 @@ struct Drive {
 
 impl Drive {
     /// Main loop until the engine or the agent goes away.
-    async fn run(mut self, mut commands: mpsc::Receiver<DriverCommand>) {
+    async fn run(mut self, mut commands: mpsc::UnboundedReceiver<DriverCommand>) {
         loop {
             tokio::select! {
                 cmd = commands.recv() => match cmd {
@@ -704,14 +682,14 @@ impl Drive {
                         }
                     }
                 },
-                frame = self.wire.frames.recv() => match frame {
+                frame = self.wire.line.frames.recv() => match frame {
                     Some(frame) => {
                         if self.handle_frame(frame).await.is_err() {
                             break;
                         }
                     }
                     None => {
-                        self.report_exit().await;
+                        self.events.exited(&mut self.child).await;
                         break;
                     }
                 },
@@ -720,10 +698,11 @@ impl Drive {
         self.child.shutdown(CLOSE_GRACE).await;
     }
 
+    /// One engine command as JSON-RPC requests.
     async fn handle_command(&mut self, cmd: DriverCommand) -> Result<(), Gone> {
         match cmd {
             DriverCommand::StartTurn { input } => {
-                self.emit(DriverEvent::TurnAck).await?;
+                self.events.send(DriverEvent::TurnAck).await?;
                 // `_meta.promptId` lets grok's prompt-complete extension name
                 // this exact prompt; spec-conformant agents ignore `_meta`.
                 self.prompt_seq += 1;
@@ -754,7 +733,8 @@ impl Drive {
                 // the agent; it just ends here.
                 if self.held_prompt.take().is_some() {
                     return self
-                        .emit(DriverEvent::TurnEnded(StopReason::Cancelled))
+                        .events
+                        .send(DriverEvent::TurnEnded(StopReason::Cancelled))
                         .await;
                 }
                 // Cancel first, then unblock pending wire requests: an agent
@@ -808,27 +788,28 @@ impl Drive {
                 let wire_id = self.wire.request(method, params).await?;
                 self.configs.push((wire_id, id, value));
             }
-            // Never advertised: ACP keeps compaction unstable in schema 1.7,
-            // and the one agent with a `/compact` command (kiro) runs it
-            // asynchronously with no completion the caller can wait on
-            // (probed 2026-09-04).
+            // Never advertised: schema 1.7 keeps compaction unstable, and
+            // kiro's `/compact` runs with no completion to wait on.
             DriverCommand::Compact => {
-                self.diagnostic(
-                    DiagnosticLevel::Warning,
-                    "compaction is not supported by the ACP adapter",
-                )
-                .await?;
-                self.emit(DriverEvent::TurnEnded(StopReason::Failed {
-                    message: "compaction is not supported by the ACP adapter".into(),
-                }))
-                .await?;
+                self.events
+                    .diagnostic(
+                        DiagnosticLevel::Warning,
+                        "compaction is not supported by the ACP adapter",
+                    )
+                    .await?;
+                self.events
+                    .send(DriverEvent::TurnEnded(StopReason::Failed {
+                        message: "compaction is not supported by the ACP adapter".into(),
+                    }))
+                    .await?;
             }
             DriverCommand::Rollback(turns, _) => {
-                self.diagnostic(
-                    DiagnosticLevel::Warning,
-                    format!("rollback({turns}) is not supported by the ACP adapter"),
-                )
-                .await?;
+                self.events
+                    .diagnostic(
+                        DiagnosticLevel::Warning,
+                        format!("rollback({turns}) is not supported by the ACP adapter"),
+                    )
+                    .await?;
             }
             DriverCommand::Close => unreachable!("handled in run"),
         }
@@ -865,24 +846,26 @@ impl Drive {
                     self.wire
                         .respond_error(frame["id"].clone(), -32601, "method not found")
                         .await?;
-                    self.diagnostic(
-                        DiagnosticLevel::Warning,
-                        format!("declined agent request {other}"),
-                    )
-                    .await
+                    self.events
+                        .diagnostic(
+                            DiagnosticLevel::Warning,
+                            format!("declined agent request {other}"),
+                        )
+                        .await
                 } else {
                     // Extension notification: surfaced, not interpreted.
                     let mut extensions = Extensions::new();
                     extensions.insert(other.to_owned(), frame["params"].clone());
-                    self.emit(DriverEvent::Event {
-                        kind: EventKind::Diagnostic(Diagnostic {
-                            level: DiagnosticLevel::Info,
-                            message: format!("extension notification {other}"),
-                        }),
-                        parent_tool_id: None,
-                        extensions,
-                    })
-                    .await
+                    self.events
+                        .send(DriverEvent::Event {
+                            kind: EventKind::Diagnostic(Diagnostic {
+                                level: DiagnosticLevel::Info,
+                                message: format!("extension notification {other}"),
+                            }),
+                            parent_tool_id: None,
+                            extensions,
+                        })
+                        .await
                 }
             }
             None => self.on_response(frame).await,
@@ -897,7 +880,8 @@ impl Drive {
         if self.effort_id.is_some() && params["update"]["sessionUpdate"] == "agent_message_chunk" {
             return Ok(());
         }
-        match serde_json::from_value::<acp::SessionNotification>(params.clone()) {
+        // Parsed by reference: the raw value is still needed for the fallback.
+        match <acp::SessionNotification as serde::Deserialize>::deserialize(&params) {
             Ok(notification) => self.translate(notification).await,
             Err(e) => {
                 let kind = params["update"]["sessionUpdate"]
@@ -906,15 +890,16 @@ impl Drive {
                     .to_owned();
                 let mut extensions = Extensions::new();
                 extensions.insert("acp/raw_update".into(), params["update"].clone());
-                self.emit(DriverEvent::Event {
-                    kind: EventKind::Diagnostic(Diagnostic {
-                        level: DiagnosticLevel::Info,
-                        message: format!("unrecognized ACP update `{kind}`: {e}"),
-                    }),
-                    parent_tool_id: None,
-                    extensions,
-                })
-                .await
+                self.events
+                    .send(DriverEvent::Event {
+                        kind: EventKind::Diagnostic(Diagnostic {
+                            level: DiagnosticLevel::Info,
+                            message: format!("unrecognized ACP update `{kind}`: {e}"),
+                        }),
+                        parent_tool_id: None,
+                        extensions,
+                    })
+                    .await
             }
         }
     }
@@ -938,15 +923,29 @@ impl Drive {
                 self.tools.insert(tool.id.as_str().to_owned(), tool.clone());
                 Some(EventKind::ToolUpdated(tool))
             }
-            U::ToolCallUpdate(update) => Some(EventKind::ToolUpdated(self.merge_tool(update))),
+            U::ToolCallUpdate(update) => {
+                let (tool, appended) = self.merge_tool(update);
+                if !appended.is_empty() {
+                    self.events
+                        .event(EventKind::ToolOutputDelta {
+                            tool_id: tool.id.clone(),
+                            text: appended,
+                        })
+                        .await?;
+                }
+                Some(EventKind::ToolUpdated(tool))
+            }
             U::Plan(plan) => Some(EventKind::PlanUpdated {
                 entries: plan.entries.into_iter().map(plan_entry).collect(),
             }),
-            U::UsageUpdate(usage) => Some(EventKind::ContextUsage {
-                used_tokens: usage.used,
-                window_tokens: Some(usage.size),
-                cost_usd: usage.cost.as_ref().map(|c| c.amount),
-            }),
+            U::UsageUpdate(usage) => {
+                self.advertise(Capability::ContextUsage).await?;
+                Some(EventKind::ContextUsage {
+                    used_tokens: usage.used,
+                    window_tokens: Some(usage.size),
+                    cost_usd: usage.cost.as_ref().map(|c| c.amount),
+                })
+            }
             U::AvailableCommandsUpdate(update) => {
                 let commands = update
                     .available_commands
@@ -966,19 +965,39 @@ impl Drive {
                     &ConfigValue::Text(update.current_mode_id.0.to_string()),
                 );
                 if changed {
-                    return self.emit(DriverEvent::InfoChanged(self.info.clone())).await;
+                    return self
+                        .events
+                        .send(DriverEvent::InfoChanged(self.info.clone()))
+                        .await;
                 }
                 return Ok(());
             }
             U::ConfigOptionUpdate(update) => {
-                self.info.details.config_options.clear();
-                self.info.configuration.options.clear();
+                // The wire replaces its own options; `mode` (from the mode
+                // state) and kiro's synthesized `effort` are ours to keep.
+                self.info
+                    .details
+                    .config_options
+                    .retain(|o| o.id.as_str() == "mode");
+                self.info
+                    .configuration
+                    .options
+                    .retain(|id, _| id.as_str() == "mode");
                 apply_session_config(&mut self.info, None, Some(&update.config_options));
-                return self.emit(DriverEvent::InfoChanged(self.info.clone())).await;
+                if self.kiro {
+                    sync_effort(&mut self.info);
+                }
+                return self
+                    .events
+                    .send(DriverEvent::InfoChanged(self.info.clone()))
+                    .await;
             }
             U::SessionInfoUpdate(update) => {
                 update.title.update_to(&mut self.info.title);
-                return self.emit(DriverEvent::InfoChanged(self.info.clone())).await;
+                return self
+                    .events
+                    .send(DriverEvent::InfoChanged(self.info.clone()))
+                    .await;
             }
             _ => Some(EventKind::Diagnostic(Diagnostic {
                 level: DiagnosticLevel::Info,
@@ -986,12 +1005,13 @@ impl Drive {
             })),
         };
         if let Some(kind) = kind {
-            self.emit(DriverEvent::Event {
-                kind,
-                parent_tool_id: None,
-                extensions,
-            })
-            .await?;
+            self.events
+                .send(DriverEvent::Event {
+                    kind,
+                    parent_tool_id: None,
+                    extensions,
+                })
+                .await?;
         }
         Ok(())
     }
@@ -1008,6 +1028,7 @@ impl Drive {
                         .respond_error(wire_id, -32602, "unparseable request")
                         .await?;
                     return self
+                        .events
                         .diagnostic(
                             DiagnosticLevel::Warning,
                             format!("bad permission request: {e}"),
@@ -1022,7 +1043,7 @@ impl Drive {
             .iter()
             .map(|o| (permission_choice(&o.kind), o.option_id.0.to_string()))
             .collect();
-        let tool = self.merge_tool(request.tool_call);
+        let (tool, _) = self.merge_tool(request.tool_call);
         self.permissions.insert(
             id.clone(),
             PendingPermission {
@@ -1030,15 +1051,16 @@ impl Drive {
                 options: options.clone(),
             },
         );
-        self.emit(DriverEvent::event(EventKind::RequestOpened(
-            Request::Permission(PermissionRequest {
-                id,
-                tool,
-                options: options.into_iter().map(|(choice, _)| choice).collect(),
-                detail: None,
-            }),
-        )))
-        .await
+        self.events
+            .send(DriverEvent::event(EventKind::RequestOpened(
+                Request::Permission(PermissionRequest {
+                    id,
+                    tool,
+                    options: options.into_iter().map(|(choice, _)| choice).collect(),
+                    detail: None,
+                }),
+            )))
+            .await
     }
 
     /// Grok's `_x.ai/ask_user_question` extension request: typed questions
@@ -1053,9 +1075,11 @@ impl Drive {
                 .respond_error(wire_id, -32602, "unparseable request")
                 .await?;
             return self
+                .events
                 .diagnostic(DiagnosticLevel::Warning, "bad ask_user_question request")
                 .await;
         };
+        self.advertise(Capability::Questions).await?;
         let questions = list.iter().map(typed_question).collect();
         let id = RequestId::new(format!("r{wire_id}"));
         self.questions.insert(
@@ -1065,17 +1089,16 @@ impl Drive {
                 questions: list,
             },
         );
-        self.emit(DriverEvent::event(EventKind::RequestOpened(
-            Request::Question(QuestionRequest { id, questions }),
-        )))
-        .await
+        self.events
+            .send(DriverEvent::event(EventKind::RequestOpened(
+                Request::Question(QuestionRequest { id, questions }),
+            )))
+            .await
     }
 
-    /// Grok's AUTHORITATIVE turn end: its `session/prompt` RPC can hang after
-    /// the turn really finished. Guards: session match, an outstanding
-    /// prompt, and (when present) an exact promptId echo — a stale replay of
-    /// an earlier prompt must never end a newer turn. The abandoned RPC
-    /// response arrives later and is ignored (its id no longer matches).
+    /// Grok's authoritative turn end (its `session/prompt` RPC can hang after
+    /// the turn finished). Guarded by session, an outstanding prompt, and
+    /// the promptId echo, so a stale replay never ends a newer turn.
     async fn on_prompt_complete(&mut self, frame: &Value) -> Result<(), Gone> {
         let params = &frame["params"];
         let session_matches = params["sessionId"].as_str() == Some(self.session_id.as_str());
@@ -1088,10 +1111,11 @@ impl Drive {
         self.prompt_meta = None;
         self.tools.clear();
         let stop = params["stopReason"].as_str().unwrap_or("end_turn");
-        self.emit(DriverEvent::TurnEnded(stop_reason(
-            &json!({ "result": { "stopReason": stop } }),
-        )))
-        .await
+        self.events
+            .send(DriverEvent::TurnEnded(stop_reason(
+                &json!({ "result": { "stopReason": stop } }),
+            )))
+            .await
     }
 
     /// Kiro's command list, in the same place a standard `availableCommands`
@@ -1127,7 +1151,9 @@ impl Drive {
             return Ok(());
         }
         sync_first_class_models(&mut self.info, &frame["params"]);
-        self.emit(DriverEvent::InfoChanged(self.info.clone())).await
+        self.events
+            .send(DriverEvent::InfoChanged(self.info.clone()))
+            .await
     }
 
     /// Grok confirms a model or effort switch with `model_changed`; it is
@@ -1142,7 +1168,10 @@ impl Drive {
             }
         }
         if changed {
-            return self.emit(DriverEvent::InfoChanged(self.info.clone())).await;
+            return self
+                .events
+                .send(DriverEvent::InfoChanged(self.info.clone()))
+                .await;
         }
         Ok(())
     }
@@ -1163,15 +1192,31 @@ impl Drive {
         let changed =
             crate::adapter::apply_selection(&mut self.info, &ConfigId::new("effort"), &value);
         if changed {
-            return self.emit(DriverEvent::InfoChanged(self.info.clone())).await;
+            return self
+                .events
+                .send(DriverEvent::InfoChanged(self.info.clone()))
+                .await;
         }
         Ok(())
+    }
+
+    /// Adds a capability the wire just proved, republishing the details.
+    async fn advertise(&mut self, cap: Capability) -> Result<(), Gone> {
+        if self.info.details.capabilities.supports(cap.clone()) {
+            return Ok(());
+        }
+        self.info.details.capabilities.add(cap);
+        self.events
+            .send(DriverEvent::InfoChanged(self.info.clone()))
+            .await
     }
 
     /// Adopts a new command list and republishes the advertised details.
     async fn set_commands(&mut self, commands: Vec<SlashCommand>) -> Result<(), Gone> {
         self.info.details.commands = commands;
-        self.emit(DriverEvent::InfoChanged(self.info.clone())).await
+        self.events
+            .send(DriverEvent::InfoChanged(self.info.clone()))
+            .await
     }
 
     /// The prompt response ends the turn; the steering response reports back.
@@ -1205,30 +1250,35 @@ impl Drive {
                         message: format!("{message} ({code})"),
                     })
                 };
-                return self.emit(ev).await;
+                return self.events.send(ev).await;
             }
-            return self.emit(DriverEvent::TurnEnded(stop_reason(&frame))).await;
+            return self
+                .events
+                .send(DriverEvent::TurnEnded(stop_reason(&frame)))
+                .await;
         }
         if Some(id) == self.steer_id {
             self.steer_id = None;
             let accepted = frame["result"]["accepted"].as_bool().unwrap_or(false);
-            return self.emit(DriverEvent::Steered(accepted)).await;
+            return self.events.send(DriverEvent::Steered(accepted)).await;
         }
         if let Some(at) = self.configs.iter().position(|(c, _, _)| *c == id) {
             let (_, config_id, value) = self.configs.remove(at);
             if let Some(error) = frame.get("error") {
                 let message = error["message"].as_str().unwrap_or("rejected");
-                self.diagnostic(
-                    DiagnosticLevel::Warning,
-                    format!("agent rejected configure `{config_id}`: {message}"),
-                )
-                .await?;
+                self.events
+                    .diagnostic(
+                        DiagnosticLevel::Warning,
+                        format!("agent rejected configure `{config_id}`: {message}"),
+                    )
+                    .await?;
             } else if crate::adapter::apply_selection(&mut self.info, &config_id, &value) {
                 // Kiro's effort choices follow the model.
                 if self.kiro && config_id.as_str() == "model" {
                     sync_effort(&mut self.info);
                 }
-                self.emit(DriverEvent::InfoChanged(self.info.clone()))
+                self.events
+                    .send(DriverEvent::InfoChanged(self.info.clone()))
                     .await?;
             }
             if Some(id) == self.effort_id {
@@ -1298,14 +1348,15 @@ impl Drive {
         Ok(())
     }
 
-    /// Applies a partial wire update to the cumulative snapshot.
-    fn merge_tool(&mut self, update: acp::ToolCallUpdate) -> ToolUpdate {
+    /// Applies a partial wire update to the cumulative snapshot; also returns
+    /// the output text this update appended.
+    fn merge_tool(&mut self, update: acp::ToolCallUpdate) -> (ToolUpdate, String) {
         let tool = self
             .tools
             .entry(update.tool_call_id.0.to_string())
             .or_insert_with(|| blank_tool(update.tool_call_id.0.as_ref()));
-        apply_fields(tool, update.fields);
-        tool.clone()
+        let appended = apply_fields(tool, update.fields);
+        (tool.clone(), appended)
     }
 
     /// Content blocks for one prompt: inlined images first (when the agent
@@ -1313,7 +1364,8 @@ impl Drive {
     async fn prompt_blocks(&mut self, input: &Input) -> Result<Value, Gone> {
         let loaded = attach::load(&input.attachments).await;
         for problem in loaded.iter().filter_map(|l| l.problem.as_deref()) {
-            self.diagnostic(DiagnosticLevel::Warning, problem.to_owned())
+            self.events
+                .diagnostic(DiagnosticLevel::Warning, problem.to_owned())
                 .await?;
         }
         let mut blocks = Vec::new();
@@ -1332,45 +1384,13 @@ impl Drive {
         }));
         Ok(Value::Array(blocks))
     }
-
-    /// The agent went away: report how it died before the stream closes.
-    async fn report_exit(&mut self) {
-        let status = self.child.exit_status(CLOSE_GRACE).await;
-        let stderr = self.child.stderr_tail();
-        self.emit(DriverEvent::Exited { status, stderr }).await.ok();
-    }
-
-    async fn diagnostic(
-        &mut self,
-        level: DiagnosticLevel,
-        message: impl Into<String>,
-    ) -> Result<(), Gone> {
-        self.emit(DriverEvent::event(EventKind::Diagnostic(Diagnostic {
-            level,
-            message: message.into(),
-        })))
-        .await
-    }
-
-    async fn emit(&mut self, event: DriverEvent) -> Result<(), Gone> {
-        self.events.send(event).await.map_err(|_| Gone)
-    }
-}
-
-/// The engine or the agent is gone; the drive task unwinds.
-struct Gone;
-
-impl From<std::io::Error> for Gone {
-    fn from(_: std::io::Error) -> Self {
-        Gone
-    }
 }
 
 // ---------------------------------------------------------------------------
-// Translation helpers
+// FRAME DECODING
 // ---------------------------------------------------------------------------
 
-/// Text-bearing chunk to an event; non-text content is dropped for now (P1).
+/// Text-bearing chunk to an event; non-text content is dropped.
 fn text_kind(
     chunk: acp::ContentChunk,
     make: impl FnOnce(MessageId, String) -> EventKind,
@@ -1385,6 +1405,7 @@ fn text_kind(
     }
 }
 
+/// A `tool_call` notification as a full snapshot.
 fn fresh_tool(call: acp::ToolCall) -> ToolUpdate {
     let mut tool = blank_tool(call.tool_call_id.0.as_ref());
     tool.kind = tool_kind(call.kind);
@@ -1396,6 +1417,7 @@ fn fresh_tool(call: acp::ToolCall) -> ToolUpdate {
     tool
 }
 
+/// An empty snapshot for a tool the wire updates before it announces.
 fn blank_tool(id: &str) -> ToolUpdate {
     ToolUpdate {
         id: ToolId::new(id),
@@ -1410,7 +1432,9 @@ fn blank_tool(id: &str) -> ToolUpdate {
     }
 }
 
-fn apply_fields(tool: &mut ToolUpdate, fields: acp::ToolCallUpdateFields) {
+/// Merges a partial update's present fields into the snapshot; returns the
+/// output text it appended.
+fn apply_fields(tool: &mut ToolUpdate, fields: acp::ToolCallUpdateFields) -> String {
     if let Some(kind) = fields.kind {
         tool.kind = tool_kind(kind);
     }
@@ -1423,14 +1447,18 @@ fn apply_fields(tool: &mut ToolUpdate, fields: acp::ToolCallUpdateFields) {
     if let Some(locations) = fields.locations {
         tool.locations = locations.into_iter().map(|l| l.path).collect();
     }
-    if let Some(content) = fields.content {
-        apply_content(tool, content);
-    }
+    let appended = match fields.content {
+        Some(content) => apply_content(tool, content),
+        None => String::new(),
+    };
     apply_raw_input(tool, fields.raw_input);
+    appended
 }
 
-/// Diff items become `diffs`; text items append to `output`.
-fn apply_content(tool: &mut ToolUpdate, content: Vec<acp::ToolCallContent>) {
+/// Diff items become `diffs`; text items append to `output`. Returns the
+/// text appended.
+fn apply_content(tool: &mut ToolUpdate, content: Vec<acp::ToolCallContent>) -> String {
+    let mut appended = String::new();
     for item in content {
         match item {
             acp::ToolCallContent::Diff(diff) => tool.diffs.push(FileDiff {
@@ -1441,13 +1469,16 @@ fn apply_content(tool: &mut ToolUpdate, content: Vec<acp::ToolCallContent>) {
             acp::ToolCallContent::Content(content) => {
                 if let acp::ContentBlock::Text(text) = content.content {
                     tool.output.get_or_insert_default().push_str(&text.text);
+                    appended.push_str(&text.text);
                 }
             }
             _ => {}
         }
     }
+    appended
 }
 
+/// Keeps the agent's own input when the wire carries it.
 fn apply_raw_input(tool: &mut ToolUpdate, raw_input: Option<Value>) {
     if let Some(input) = raw_input {
         tool.raw = Some(RawTool {
@@ -1457,6 +1488,7 @@ fn apply_raw_input(tool: &mut ToolUpdate, raw_input: Option<Value>) {
     }
 }
 
+/// ACP tool kinds to ours.
 fn tool_kind(kind: acp::ToolKind) -> ToolKind {
     use acp::ToolKind as K;
     match kind {
@@ -1472,6 +1504,7 @@ fn tool_kind(kind: acp::ToolKind) -> ToolKind {
     }
 }
 
+/// ACP tool statuses to ours.
 fn tool_status(status: acp::ToolCallStatus) -> ToolStatus {
     use acp::ToolCallStatus as S;
     match status {
@@ -1483,6 +1516,7 @@ fn tool_status(status: acp::ToolCallStatus) -> ToolStatus {
     }
 }
 
+/// One ACP plan entry to ours.
 fn plan_entry(entry: acp::PlanEntry) -> PlanEntry {
     use acp::PlanEntryStatus as S;
     PlanEntry {
@@ -1496,6 +1530,7 @@ fn plan_entry(entry: acp::PlanEntry) -> PlanEntry {
     }
 }
 
+/// ACP permission option kinds to ours.
 fn permission_choice(kind: &acp::PermissionOptionKind) -> PermissionChoice {
     use acp::PermissionOptionKind as K;
     match kind {
@@ -1585,6 +1620,7 @@ fn question_response(questions: &[Value], answers: &[QuestionAnswer]) -> Option<
     Some(json!({ "outcome": "accepted", "answers": map }))
 }
 
+/// The prompt response's `stopReason` as ours.
 fn stop_reason(frame: &Value) -> StopReason {
     match frame["result"]["stopReason"].as_str().unwrap_or_default() {
         "end_turn" => StopReason::Completed {
@@ -1598,52 +1634,31 @@ fn stop_reason(frame: &Value) -> StopReason {
     }
 }
 
+/// A notification's `_meta` as extensions.
 fn ext(meta: Option<acp::Meta>) -> Extensions {
     meta.map(|m| m.into_iter().collect()).unwrap_or_default()
 }
 
+/// Typed parse of a handshake response; a mismatch is a protocol failure.
 fn parse<T: serde::de::DeserializeOwned>(value: Value, what: &str) -> Result<T, AgentError> {
     serde_json::from_value(value).map_err(|e| AgentError::ProtocolFailed(format!("{what}: {e}")))
 }
 
 // ---------------------------------------------------------------------------
-// Wire: line-delimited JSON-RPC over the child's stdio
+// WIRE: JSON-RPC requests, responses, and notifications
 // ---------------------------------------------------------------------------
 
 struct Wire {
-    stdin: ChildStdin,
-    /// All frames the reader task saw, bounded; pipe backpressure beyond.
-    frames: mpsc::Receiver<Value>,
+    line: LineWire,
     next_id: u64,
-    recorder: Option<WireRecorder>,
 }
 
 impl Wire {
     /// Takes the child's stdio and starts the line-reader task.
     fn over(child: &mut process::Child, recorder: Option<WireRecorder>) -> Self {
-        let stdin = child.stdin.take().expect("piped stdin");
-        let stdout = child.stdout.take().expect("piped stdout");
-        let (tx, frames) = mpsc::channel(FRAME_BUFFER);
-        let reader_recorder = recorder.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(frame) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                if let Some(recorder) = &reader_recorder {
-                    recorder.record("in", &frame);
-                }
-                if tx.send(frame).await.is_err() {
-                    break;
-                }
-            }
-        });
         Self {
-            stdin,
-            frames,
+            line: LineWire::over(child, recorder),
             next_id: 1,
-            recorder,
         }
     }
 
@@ -1651,23 +1666,29 @@ impl Wire {
     async fn request(&mut self, method: &str, params: Value) -> std::io::Result<u64> {
         let id = self.next_id;
         self.next_id += 1;
-        self.write(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
+        self.line
+            .write(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
             .await?;
         Ok(id)
     }
 
+    /// A notification (no id, no response).
     async fn notify(&mut self, method: &str, params: Value) -> std::io::Result<()> {
-        self.write(json!({ "jsonrpc": "2.0", "method": method, "params": params }))
+        self.line
+            .write(json!({ "jsonrpc": "2.0", "method": method, "params": params }))
             .await
     }
 
+    /// Answers one of the agent's requests; the raw id keeps its type.
     async fn respond(&mut self, id: Value, result: Value) -> std::io::Result<()> {
-        self.write(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+        self.line
+            .write(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
             .await
     }
 
+    /// Declines one of the agent's requests.
     async fn respond_error(&mut self, id: Value, code: i64, message: &str) -> std::io::Result<()> {
-        self.write(
+        self.line.write(
             json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }),
         )
         .await
@@ -1681,7 +1702,7 @@ impl Wire {
             .await
             .map_err(|_| WireError::Closed)?;
         loop {
-            let frame = self.frames.recv().await.ok_or(WireError::Closed)?;
+            let frame = self.line.frames.recv().await.ok_or(WireError::Closed)?;
             if frame.get("method").is_none() && frame.get("id").and_then(Value::as_u64) == Some(id)
             {
                 if let Some(error) = frame.get("error") {
@@ -1701,15 +1722,6 @@ impl Wire {
                 return Ok(frame.get("result").cloned().unwrap_or_default());
             }
         }
-    }
-
-    async fn write(&mut self, frame: Value) -> std::io::Result<()> {
-        if let Some(recorder) = &self.recorder {
-            recorder.record("out", &frame);
-        }
-        let mut line = frame.to_string();
-        line.push('\n');
-        self.stdin.write_all(line.as_bytes()).await
     }
 }
 
@@ -1733,10 +1745,9 @@ impl WireError {
                     .filter_map(|m| login_method(m, exe))
                     .collect();
                 if login.is_empty() {
-                    // No runnable method to offer (agent-driven auth is P2, and
-                    // seen in the field: gemini's untyped methods, or a shutdown
-                    // notice behind the auth code) — the agent's own words are
-                    // more useful than a bare "needs login".
+                    // No runnable method to offer (agent-driven auth, or a
+                    // shutdown notice behind the auth code): the agent's own
+                    // words beat a bare "needs login".
                     AgentError::ProtocolFailed(message)
                 } else {
                     AgentError::AuthRequired { login }
@@ -1788,10 +1799,9 @@ fn auth_hinted(
     AgentError::AuthRequired { login }
 }
 
-/// A terminal auth method becomes a runnable command; agent-driven auth
-/// belongs to `Runtime::login` (P2). Qwen predates the typed variant and
-/// advertises `{type: "terminal", args}` inside `_meta` (probed 0.22.0) —
-/// read that shape too.
+/// A terminal auth method becomes a runnable command; agent-driven auth is
+/// not offered. Qwen advertises `{type: "terminal", args}` inside `_meta`
+/// (probed 0.22.0), so that shape is read too.
 fn login_method(method: &acp::AuthMethod, exe: &std::path::Path) -> Option<LoginMethod> {
     let (name, args, env) = match method {
         acp::AuthMethod::Terminal(terminal) => (

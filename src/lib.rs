@@ -111,11 +111,17 @@
 //! `PlanUsage`, … — so the UI can gate features per agent instead of
 //! special-casing agent names.
 //!
+//! **Testing your app.** With the `mock` feature, [`Runtime::with_mock`]
+//! runs the real engine over a scripted agent ([`mock::Script`]): your UI and
+//! routing tests need no subprocess.
+//!
 //! Your application keeps what is rightfully its own: the transcript store,
 //! titles, worktrees, and UI. anyagent owns the processes, the wires, and
 //! the turn rules.
 
 mod adapter;
+#[cfg(any(test, feature = "mock"))]
+pub use adapter::mock;
 mod agent;
 mod catalog;
 mod discovery;

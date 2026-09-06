@@ -36,8 +36,8 @@ const PI_MODEL: &str = "openrouter/nvidia/nemotron-3-super-120b-a12b:free";
 const COUNT: &str = "Count from 1 to 400, one number per line. No other text. No tools.";
 const TITLE: &str = "Title this conversation in at most six words: the user asked how to rename \
 a git branch. Reply with only the title. No tools.";
-/// `generate` pins claude to Opus 4.8 so the one-shot path is checked on a real model choice.
-const CLAUDE_GENERATE_MODEL: &str = "claude-opus-4-8";
+/// The cheap claude alias; the CLI resolves it to the current Haiku.
+const CLAUDE_MODEL: &str = "haiku";
 
 // -- gate -------------------------------------------------------------------
 
@@ -345,7 +345,7 @@ async fn probe_reports_details_without_a_session() {
     }
 }
 
-/// `generate` is prompt in, text out, with no session to manage; claude runs it on Opus 4.8.
+/// `generate` is prompt in, text out, with no session to manage.
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn generate_returns_text_without_a_session() {
@@ -356,12 +356,8 @@ async fn generate_returns_text_without_a_session() {
         let agent = report
             .require(h)
             .unwrap_or_else(|_| panic!("{h}: not discovered"));
-        let mut opts = options(h, dir.path());
-        if h == "claude" {
-            opts = opts.configure("model", CLAUDE_GENERATE_MODEL);
-        }
         let text = runtime
-            .generate(agent, opts, TITLE)
+            .generate(agent, options(h, dir.path()), TITLE)
             .await
             .unwrap_or_else(|e| panic!("{h}: generate failed: {e}"));
         assert!(text.to_lowercase().contains("branch"), "{h}: got {text:?}");
@@ -628,9 +624,19 @@ async fn an_unknown_slash_prompt_is_plain_text() {
             .await
             .unwrap();
         let text = drain_to_turn_end(&session, &mut events, &format!("{h}: slash text")).await;
-        assert!(text.contains("KUMQUAT"), "{h}: text was {text:?}");
+        // claude owns the `/` namespace: since 2.1.261 the CLI answers an
+        // unknown command itself, in a synthetic message we surface as text.
+        if h == "claude" {
+            assert!(text.contains("Unknown command"), "{h}: text was {text:?}");
+            pass(
+                h,
+                "unknown slash command answered by the CLI, text surfaced",
+            );
+        } else {
+            assert!(text.contains("KUMQUAT"), "{h}: text was {text:?}");
+            pass(h, "unknown slash text stayed plain text");
+        }
         session.close().await.unwrap();
-        pass(h, "unknown slash text stayed plain text");
     }
 }
 
@@ -856,8 +862,12 @@ async fn cancel_ends_the_turn_in_every_queue_shape() {
         drain_to_turn_end(&session, &mut events, &format!("{h}: post-cancel prompt")).await;
 
         // (a) cancel(false) with a queued prompt: it runs next and answers.
-        for rep in 0..reps {
-            session.prompt(COUNT).await.unwrap();
+        // Repeating COUNT here trips the API's reasoning-extraction
+        // safeguard on the third interrupted copy (claude 2.1.261, probed
+        // 2026-09-05), so each raced turn streams a different long prompt.
+        let topics = ["a lighthouse keeper", "a bus driver", "a mountain guide"];
+        for (rep, topic) in topics.iter().enumerate().take(reps) {
+            session.prompt(long_prompt(topic)).await.unwrap();
             // Queue immediately: a fast model can finish COUNT inside a fixed
             // sleep (kiro did), which would make this `Started`, not `Queued`.
             // On a steering harness the follow-up would fold instead, so the
@@ -886,7 +896,7 @@ async fn cancel_ends_the_turn_in_every_queue_shape() {
         }
 
         // (b) cancel(true): the queued prompt must never run.
-        session.prompt(COUNT).await.unwrap();
+        session.prompt(long_prompt("a baker")).await.unwrap();
         queue_one(&session, "Say only PLUM. No tools.").await;
         wait_for_content(&mut events, &format!("{h}: count streaming (b)")).await;
         session.cancel(true).await.unwrap();
@@ -1466,6 +1476,9 @@ async fn open(harness: &str) -> (Session, Events, tempfile::TempDir) {
 /// and deterministic approvals.
 fn options(harness: &str, dir: &std::path::Path) -> SessionOptions {
     let mut options = SessionOptions::in_dir(dir);
+    if harness == "claude" {
+        options = options.configure("model", CLAUDE_MODEL);
+    }
     if harness == "opencode" {
         options = options.configure("model", OPENCODE_MODEL);
     }
@@ -1554,6 +1567,11 @@ async fn drain_to_compaction(session: &Session, events: &mut Events, step: &str)
             _ => {}
         }
     }
+}
+
+/// A prompt that streams long enough to cancel mid-turn, distinct per topic.
+fn long_prompt(topic: &str) -> String {
+    format!("Write an 800 word story about {topic}. No tools.")
 }
 
 /// Waits until the turn is visibly streaming (first in-turn content), so a

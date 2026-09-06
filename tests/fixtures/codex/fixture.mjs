@@ -8,6 +8,7 @@
 // "subagent" (a child thread runs a whole turn before the parent's ends,
 // "subagent-fails" for a child turn that fails), "end-failed"/"end-aborted"
 // (the turn ends via turn/failed / turn/aborted instead of turn/completed).
+// --rename: the server renames the thread after the first turn.
 import { createInterface } from 'node:readline';
 
 const flag = (name) => process.argv.includes(name);
@@ -16,8 +17,14 @@ const notify = (method, params) => send({ method, params });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const THREAD = { id: 'th-1', name: null };
-let turnN = 0, serverReqN = 0, itemN = 0;
+let turnN = 0, serverReqN = 0, itemN = 0, rolled = 0, experimental = false;
+// `-c mcp_servers.<name>.<key>=…` launch overrides, as the real CLI takes them.
+const MCP_NAMES = [...new Set(process.argv
+  .flatMap((a, i) => (a === '-c' ? [process.argv[i + 1] ?? ''] : []))
+  .map((kv) => kv.match(/^mcp_servers\.([^.]+)\./)?.[1])
+  .filter(Boolean))];
 let turn = null; // { id, started, interrupted, steered: [] }
+const turnIds = []; // completed turns, oldest first
 const waiters = {}; // server request id -> resolver
 
 const MODELS = [
@@ -72,6 +79,9 @@ async function onRequest(m) {
   const refuse = (message) => send({ id: m.id, error: { code: -32600, message } });
   switch (m.method) {
     case 'initialize':
+      // requestUserInput only fires for clients that opt into the
+      // experimental API, like the real server.
+      experimental = m.params?.capabilities?.experimentalApi === true;
       return reply({ userAgent: 'anyagent/0.147.0 (Mac OS 26.5.1; arm64)', codexHome: process.env.CODEX_HOME ?? '', platformOs: 'macos' });
     case 'account/read':
       return reply(flag('--logged-out')
@@ -136,6 +146,13 @@ async function onRequest(m) {
       reply({});
       return;
     }
+    case 'thread/revert': {
+      if (turn) return refuse('cannot revert while a turn is running');
+      const at = turnIds.indexOf(m.params.beforeTurnId);
+      if (at < 0) return refuse(`unknown turn \`${m.params.beforeTurnId}\``);
+      rolled += turnIds.splice(at).length;
+      return reply({ thread: THREAD, turnsBackwardsCursor: null, itemsBackwardsCursor: null });
+    }
     default:
       return refuse(`Invalid request: unknown variant \`${m.method}\``);
   }
@@ -185,11 +202,19 @@ async function runTurn(params) {
   if (flag('--echo-config-home')) delta(msg.id, `cfg=${process.env.CODEX_HOME ?? 'unset'} `);
   if (THREAD.forkPoint !== undefined) delta(msg.id, `fork=${THREAD.forkPoint} `);
   if (prompt.includes('Attached files:')) delta(msg.id, 'ref=1 ');
+  // Per-turn policy, sandbox, images, launch MCP servers, and rollbacks so
+  // far, each visible to the tests.
+  const images = (params.input ?? []).filter((i) => i.type === 'localImage').length;
+  delta(msg.id, `policy=${params.approvalPolicy ?? 'unset'} sandbox=${params.sandboxPolicy?.type ?? 'unset'} images=${images} mcp=${MCP_NAMES.join(',') || 'none'} rolled=${rolled} `);
 
   if (flag('--question')) {
-    const resp = await ask('item/tool/requestUserInput', { itemId: 'it-q', questions: [{ id: 'q1', header: 'Color', question: 'Which color?', options: [{ label: 'Red', description: 'Prefer red' }, { label: 'Blue', description: 'Prefer blue' }], isOther: false }] });
-    if (turn.interrupted) return endTurn('interrupted');
-    delta(msg.id, `answer=${resp?.answers?.q1?.answers?.[0] ?? 'none'} `);
+    if (!experimental) {
+      delta(msg.id, 'answer=noapi ');
+    } else {
+      const resp = await ask('item/tool/requestUserInput', { itemId: 'it-q', questions: [{ id: 'q1', header: 'Color', question: 'Which color?', options: [{ label: 'Red', description: 'Prefer red' }, { label: 'Blue', description: 'Prefer blue' }], isOther: false }] });
+      if (turn.interrupted) return endTurn('interrupted');
+      delta(msg.id, `answer=${resp?.answers?.q1?.answers?.[0] ?? 'none'} `);
+    }
   }
 
   const exec = item({ type: 'commandExecution', command: '/bin/zsh -lc "echo PEAR"', cwd: process.cwd(), status: 'inProgress', aggregatedOutput: null, exitCode: null });
@@ -220,10 +245,15 @@ async function runTurn(params) {
   notify('account/rateLimits/updated', { rateLimits: RATE_LIMITS });
   if (turn.interrupted) return endTurn('interrupted');
   endTurn('completed');
+  if (flag('--rename') && THREAD.name === null) {
+    THREAD.name = 'Pear talk';
+    notify('thread/name/updated', { threadId: THREAD.id, name: THREAD.name });
+  }
 }
 
 function endTurn(status, error = null, method = 'turn/completed') {
   notify(method, { threadId: THREAD.id, turn: { id: turn.id, status, error, items: [] } });
+  turnIds.push(turn.id);
   turn = null;
 }
 

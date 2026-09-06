@@ -1076,13 +1076,21 @@ async fn kiro_effort_is_a_live_option_backed_by_the_effort_prompt() {
     // while the unrelated update sent alongside it still arrives.
     session.configure("effort", "low").await.unwrap();
     let mut usage_seen = false;
-    while effort(&session) != Some(ConfigValue::Text("low".into())) {
+    // Read the stream, not the snapshot: the snapshot can already be
+    // updated while earlier events are still queued.
+    loop {
         let event = next(&mut events).await;
         assert!(
             !matches!(event.kind, EventKind::TextDelta { .. }),
             "the effort ack leaked as text"
         );
         usage_seen |= matches!(event.kind, EventKind::ContextUsage { used_tokens: 7, .. });
+        if let EventKind::SessionUpdated(info) = &event.kind
+            && info.configuration.options.get(&ConfigId::new("effort"))
+                == Some(&ConfigValue::Text("low".into()))
+        {
+            break;
+        }
     }
     assert!(usage_seen, "the usage update mid-switch was dropped");
 

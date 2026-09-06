@@ -50,6 +50,15 @@ a prompt sent while the switch runs waits behind it.
 </Note>
 
 <Note>
+Codex opts into the app-server's experimental API, which is what unlocks its
+questions (`requestUserInput`). Approval policy and sandbox switch live (they
+ride every `turn/start`), images ride as `localImage` items, client MCP servers
+ride `-c mcp_servers.…` launch overrides (stdio and HTTP; no SSE), and
+`rollback` maps to `thread/revert` (a cut before a kept turn). Files are
+never restored.
+</Note>
+
+<Note>
 Hermes gates only its file tools behind permission requests — its terminal
 tool runs without asking, so a denied write does not stop the agent from
 writing via shell. Sandbox accordingly if that matters to your app.
@@ -59,7 +68,8 @@ writing via shell. Sandbox accordingly if that matters to your app.
 opencode runs native: anyagent starts `opencode serve` on a private localhost
 port per session, gated by a per-session secret, and drives its HTTP + SSE
 wire. This adds permissions, questions, rollback, fork, slash commands, plans,
-and context usage over the ACP path. It does not steer (the engine queues
+and context usage over the ACP path, and task-tool child sessions nest under
+their spawning tool as subagents. It does not steer (the engine queues
 mid-turn prompts instead), and it has no plan quota. Pass a model with
 `configure("model", "provider/id")`; opencode's own free `opencode/…` models
 need no extra key. To drive it over ACP instead, build it with

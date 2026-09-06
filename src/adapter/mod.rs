@@ -3,17 +3,22 @@
 //! An adapter connects to one agent and translates its wire into the driver
 //! vocabulary below. It never decides turn rules: the engine owns start,
 //! steer-or-queue, request lifetimes, completion, and cleanup.
+//!
+//! High level: the `Adapter` trait (`connect`, `plan_usage`), the
+//! `DriverCommand` / `DriverEvent` vocabulary, and the helpers every adapter
+//! shares: `Emitter` (events to the engine), option helpers, login methods,
+//! and error mapping.
 
 use std::num::NonZeroU32;
+use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
-use tokio::io::AsyncWriteExt;
+use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::agent::{
-    AgentDetails, AgentInstallation, ConfigChoice, ConfigId, ConfigValue, Input, ResumeToken,
-    RollbackScope, SessionConfiguration, SessionOptions,
+    AgentDetails, AgentInstallation, ConfigChoice, ConfigId, ConfigKind, ConfigOption, ConfigValue,
+    Input, ResumeToken, RollbackScope, SessionConfiguration, SessionOptions,
 };
 use crate::error::AgentError;
 use crate::event::{
@@ -26,10 +31,24 @@ pub(crate) mod claude;
 pub(crate) mod codex;
 #[cfg(test)]
 mod conformance;
-#[cfg(test)]
-pub(crate) mod mock;
+#[cfg(any(test, feature = "mock"))]
+pub mod mock;
 pub(crate) mod opencode;
 pub(crate) mod pi;
+pub(crate) mod wire;
+
+pub(crate) use wire::{FRAME_BUFFER, LineWire, WireRecorder};
+
+/// Launch plus handshake must finish within this.
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// SIGTERM grace before SIGKILL when a child is shut down.
+pub(crate) const CLOSE_GRACE: Duration = Duration::from_secs(2);
+/// Tool output kept per snapshot; the rest is truncated.
+pub(crate) const OUTPUT_CAP: usize = 16 * 1024;
+
+// ---------------------------------------------------------------------------
+// SEAM: what the engine sends and what adapters report
+// ---------------------------------------------------------------------------
 
 /// What the engine asks an adapter to do.
 #[derive(Debug)]
@@ -93,6 +112,7 @@ pub(crate) enum DriverEvent {
 }
 
 impl DriverEvent {
+    /// A content event with no parent and no extensions.
     pub(crate) fn event(kind: EventKind) -> Self {
         DriverEvent::Event {
             kind,
@@ -114,15 +134,119 @@ pub(crate) struct DriverInfo {
     pub deterministic_turn_end: bool,
     /// Same for agent-originated (background wake) turns.
     pub deterministic_agent_turn_end: bool,
+    /// The adapter honoured `SessionOptions::no_tools`: the agent cannot
+    /// run any tool this session.
+    pub tools_disabled: bool,
 }
+
+#[derive(Clone)]
+pub(crate) struct ConnectRequest {
+    pub installation: AgentInstallation,
+    pub options: SessionOptions,
+}
+
+pub(crate) struct DriverConnection {
+    pub info: DriverInfo,
+    /// Unbounded so the engine never parks on a busy adapter (commands are
+    /// app-driven and small; a full bounded channel could deadlock with the
+    /// adapter waiting on the event channel).
+    pub commands: mpsc::UnboundedSender<DriverCommand>,
+    pub events: mpsc::Receiver<DriverEvent>,
+}
+
+#[async_trait]
+pub(crate) trait Adapter: Send + Sync {
+    /// Launch, handshake, and create the provider session.
+    async fn connect(&self, request: ConnectRequest) -> Result<DriverConnection, AgentError>;
+
+    /// Plan quota for the logged-in account, from a short-lived process.
+    /// Default: this agent has no quota to report.
+    async fn plan_usage(
+        &self,
+        installation: &AgentInstallation,
+    ) -> Result<crate::event::PlanUsage, AgentError> {
+        let _ = installation;
+        Err(AgentError::UnsupportedFeature("plan usage".into()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DRIVE-TASK HELPERS: sending to the engine
+// ---------------------------------------------------------------------------
+
+/// The engine or the agent is gone; the drive task unwinds.
+pub(crate) struct Gone;
+
+impl From<std::io::Error> for Gone {
+    fn from(_: std::io::Error) -> Self {
+        Gone
+    }
+}
+
+/// A drive task's channel to the engine, with the shapes every adapter
+/// sends. Every send fails with `Gone` once the engine dropped its receiver.
+#[derive(Clone)]
+pub(crate) struct Emitter(mpsc::Sender<DriverEvent>);
+
+impl Emitter {
+    /// Wraps the sending half of the driver event channel.
+    pub(crate) fn new(events: mpsc::Sender<DriverEvent>) -> Self {
+        Self(events)
+    }
+
+    /// Any driver event, as is.
+    pub(crate) async fn send(&self, event: DriverEvent) -> Result<(), Gone> {
+        self.0.send(event).await.map_err(|_| Gone)
+    }
+
+    /// A content event with no parent and no extensions.
+    pub(crate) async fn event(&self, kind: EventKind) -> Result<(), Gone> {
+        self.send(DriverEvent::event(kind)).await
+    }
+
+    /// A content event attributed to a subagent tool, with extensions.
+    pub(crate) async fn content(
+        &self,
+        kind: EventKind,
+        parent_tool_id: Option<ToolId>,
+        extensions: Extensions,
+    ) -> Result<(), Gone> {
+        self.send(DriverEvent::Event {
+            kind,
+            parent_tool_id,
+            extensions,
+        })
+        .await
+    }
+
+    /// A diagnostic outside any tool or subagent.
+    pub(crate) async fn diagnostic(
+        &self,
+        level: DiagnosticLevel,
+        message: impl Into<String>,
+    ) -> Result<(), Gone> {
+        self.event(EventKind::Diagnostic(Diagnostic {
+            level,
+            message: message.into(),
+        }))
+        .await
+    }
+
+    /// The agent went away: report how it died before the stream closes.
+    pub(crate) async fn exited(&self, child: &mut crate::process::Child) {
+        let status = child.exit_status(CLOSE_GRACE).await;
+        let stderr = child.stderr_tail();
+        self.send(DriverEvent::Exited { status, stderr }).await.ok();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OPTION HELPERS: advertised config options and their current values
+// ---------------------------------------------------------------------------
 
 /// Applies a confirmed option change to the advertised state, returning
 /// whether anything actually changed (callers skip `InfoChanged` otherwise).
-pub(crate) fn apply_selection(
-    info: &mut DriverInfo,
-    id: &crate::agent::ConfigId,
-    value: &crate::agent::ConfigValue,
-) -> bool {
+pub(crate) fn apply_selection(info: &mut DriverInfo, id: &ConfigId, value: &ConfigValue) -> bool {
     let stored = info.configuration.options.get(id);
     if stored == Some(value) {
         return false;
@@ -134,30 +258,84 @@ pub(crate) fn apply_selection(
     true
 }
 
-/// The effort levels current models share, as choices; `None` for the
-/// models without effort (kiro-cli 2.20.1's list, probed 2026-09-05).
-/// For adapters whose wire does not list levels per model.
-pub(crate) fn effort_choices(model: &str) -> Option<Vec<ConfigChoice>> {
-    const NO_EFFORT: [&str; 9] = [
-        "auto",
-        "claude-sonnet-4.5",
-        "claude-sonnet-4",
-        "claude-haiku-4.5",
-        "deepseek-3.2",
-        "minimax-m2.5",
-        "minimax-m2.1",
-        "glm-5",
-        "qwen3-coder-next",
-    ];
-    if NO_EFFORT.contains(&model) {
-        return None;
+/// The selected text value of option `id`, if any.
+pub(crate) fn selected(info: &DriverInfo, id: &str) -> Option<String> {
+    match info.configuration.options.get(&ConfigId::new(id)) {
+        Some(ConfigValue::Text(value)) => Some(value.clone()),
+        _ => None,
     }
-    let choices = ["low", "medium", "high", "xhigh", "max"].map(|level| ConfigChoice {
-        value: level.to_owned(),
-        label: level.to_owned(),
-        description: None,
+}
+
+/// Whether the advertised select `id` offers `value`.
+pub(crate) fn offers(info: &DriverInfo, id: &str, value: &ConfigValue) -> bool {
+    info.details.config_options.iter().any(|o| {
+        o.id.as_str() == id
+            && matches!((&o.kind, value), (ConfigKind::Select { choices }, ConfigValue::Text(v))
+                if choices.iter().any(|c| &c.value == v))
+    })
+}
+
+/// Replaces the select option `id` with these choices and current value;
+/// no choices means no option. `current` is dropped unless offered.
+pub(crate) fn set_select_option(
+    info: &mut DriverInfo,
+    id: &str,
+    name: &str,
+    category: &str,
+    choices: Vec<ConfigChoice>,
+    current: Option<String>,
+) {
+    let id = ConfigId::new(id);
+    info.details.config_options.retain(|o| o.id != id);
+    info.configuration.options.remove(&id);
+    if choices.is_empty() {
+        return;
+    }
+    let current = current
+        .filter(|c| choices.iter().any(|choice| &choice.value == c))
+        .map(ConfigValue::Text);
+    if let Some(current) = &current {
+        info.configuration
+            .options
+            .insert(id.clone(), current.clone());
+    }
+    info.details.config_options.push(ConfigOption {
+        id,
+        name: name.into(),
+        category: Some(category.into()),
+        kind: ConfigKind::Select { choices },
+        current,
+        live: true,
     });
-    Some(choices.to_vec())
+}
+
+/// The `effort` option follows the selected model: these are the new
+/// model's levels, and the old selection survives only when still offered.
+pub(crate) fn set_effort_option(
+    info: &mut DriverInfo,
+    choices: Vec<ConfigChoice>,
+    current: Option<String>,
+) {
+    set_select_option(
+        info,
+        "effort",
+        "Reasoning effort",
+        "thought_level",
+        choices,
+        current,
+    );
+}
+
+/// Levels as plain choices (value = label), for wires that list them by name.
+pub(crate) fn level_choices<'a>(levels: impl IntoIterator<Item = &'a str>) -> Vec<ConfigChoice> {
+    levels
+        .into_iter()
+        .map(|level| ConfigChoice {
+            value: level.to_owned(),
+            label: level.to_owned(),
+            description: None,
+        })
+        .collect()
 }
 
 /// Shows Fast mode only for supported models, keeping its value in sync.
@@ -175,11 +353,11 @@ pub(crate) fn set_fast_option(info: &mut DriverInfo, current: Option<bool>, live
             .map_or(0, |index| index + 1);
         info.details.config_options.insert(
             position,
-            crate::agent::ConfigOption {
+            ConfigOption {
                 id: id.clone(),
                 name: "Fast mode".into(),
                 category: Some("speed".into()),
-                kind: crate::agent::ConfigKind::Boolean,
+                kind: ConfigKind::Boolean,
                 current: Some(value.clone()),
                 live,
             },
@@ -188,10 +366,32 @@ pub(crate) fn set_fast_option(info: &mut DriverInfo, current: Option<bool>, live
     }
 }
 
-/// The per-agent config-home environment override for this session, as
-/// `envs` for the child, or an empty set when `config_home` is unset. Fails
-/// typed for an agent with no known config-home variable (an ad-hoc ACP
-/// install), so an isolation request is never silently dropped.
+/// A `todos`-style array as plan entries; `key` names the text field
+/// (`content` for claude and opencode, `step` for codex).
+pub(crate) fn plan_entries(todos: &Value, key: &str) -> Vec<crate::event::PlanEntry> {
+    use crate::event::{PlanEntry, PlanStatus};
+    todos
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|todo| PlanEntry {
+            text: todo[key].as_str().unwrap_or_default().to_owned(),
+            status: match todo["status"].as_str().unwrap_or_default() {
+                "in_progress" | "inProgress" => PlanStatus::InProgress,
+                "completed" => PlanStatus::Completed,
+                _ => PlanStatus::Pending,
+            },
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// LAUNCH HELPERS: environment, login methods, error mapping
+// ---------------------------------------------------------------------------
+
+/// The per-agent config-home override for this session as child `envs`, or
+/// empty when `config_home` is unset. Fails typed for an agent with no known
+/// variable, so an isolation request is never silently dropped.
 pub(crate) fn config_home_env(
     installation: &AgentInstallation,
     options: &SessionOptions,
@@ -206,74 +406,6 @@ pub(crate) fn config_home_env(
             installation.id
         ))),
     }
-}
-
-/// Tees raw protocol frames to a JSONL file when `record_wire` is set: one
-/// `{"dir":"in"|"out","frame":<frame>}` per line, append-only and flushed per
-/// line so a crash keeps the tail. It is a plain local debug artifact — no
-/// buffering, rotation, or redaction. A write failure is reported once as a
-/// `Diagnostic` and then dropped; recording never fails a turn.
-#[derive(Clone)]
-pub(crate) struct WireRecorder {
-    lines: mpsc::UnboundedSender<Vec<u8>>,
-}
-
-impl WireRecorder {
-    /// The session's recorder when `record_wire` is set; `None` otherwise.
-    /// An open failure is surfaced as one diagnostic on `events` and recording
-    /// stays off, rather than failing the session.
-    pub(crate) async fn for_session(
-        options: &SessionOptions,
-        events: &mpsc::Sender<DriverEvent>,
-    ) -> Option<Self> {
-        let path = options.record_wire.as_deref()?;
-        let events = events.clone();
-        let file = match tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .await
-        {
-            Ok(file) => file,
-            Err(e) => {
-                warn(&events, format!("wire recording is off: {e}")).await;
-                return None;
-            }
-        };
-        let (lines, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        tokio::spawn(async move {
-            let mut file = file;
-            while let Some(bytes) = rx.recv().await {
-                if let Err(e) = append(&mut file, &bytes).await {
-                    warn(&events, format!("wire recording stopped: {e}")).await;
-                    break; // report once, then drop the rest silently
-                }
-            }
-        });
-        Some(Self { lines })
-    }
-
-    /// Records one frame in the given direction. Never blocks and never errors
-    /// the caller: a full or gone writer just loses the frame.
-    pub(crate) fn record(&self, dir: &'static str, frame: &Value) {
-        let mut line = json!({ "dir": dir, "frame": frame }).to_string();
-        line.push('\n');
-        let _ = self.lines.send(line.into_bytes());
-    }
-}
-
-async fn append(file: &mut tokio::fs::File, bytes: &[u8]) -> std::io::Result<()> {
-    file.write_all(bytes).await?;
-    file.flush().await
-}
-
-async fn warn(events: &mpsc::Sender<DriverEvent>, message: String) {
-    let _ = events
-        .send(DriverEvent::event(EventKind::Diagnostic(Diagnostic {
-            level: DiagnosticLevel::Warning,
-            message,
-        })))
-        .await;
 }
 
 /// Runnable login methods from the catalog, for a logged-out handshake and
@@ -308,51 +440,4 @@ pub(crate) fn cap(mut s: String, at: usize) -> String {
         s.truncate(end);
     }
     s
-}
-
-#[derive(Clone)]
-pub(crate) struct ConnectRequest {
-    pub installation: AgentInstallation,
-    pub options: SessionOptions,
-}
-
-pub(crate) struct DriverConnection {
-    pub info: DriverInfo,
-    pub commands: mpsc::Sender<DriverCommand>,
-    pub events: mpsc::Receiver<DriverEvent>,
-}
-
-#[async_trait]
-pub(crate) trait Adapter: Send + Sync {
-    /// Launch, handshake, and create the provider session.
-    async fn connect(&self, request: ConnectRequest) -> Result<DriverConnection, AgentError>;
-
-    /// Plan quota for the logged-in account, from a short-lived process.
-    /// Default: this agent has no quota to report.
-    async fn plan_usage(
-        &self,
-        installation: &AgentInstallation,
-    ) -> Result<crate::event::PlanUsage, AgentError> {
-        let _ = installation;
-        Err(AgentError::UnsupportedFeature("plan usage".into()))
-    }
-}
-
-/// A `todos` array (`{content, status}` items, the Claude/opencode shape) as
-/// plan entries.
-pub(crate) fn plan_entries(todos: &Value) -> Vec<crate::event::PlanEntry> {
-    use crate::event::{PlanEntry, PlanStatus};
-    todos
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|todo| PlanEntry {
-            text: todo["content"].as_str().unwrap_or_default().to_owned(),
-            status: match todo["status"].as_str().unwrap_or_default() {
-                "in_progress" => PlanStatus::InProgress,
-                "completed" => PlanStatus::Completed,
-                _ => PlanStatus::Pending,
-            },
-        })
-        .collect()
 }

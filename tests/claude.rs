@@ -452,14 +452,14 @@ async fn the_handshake_fills_details() {
         sonnet.description.as_deref(),
         Some("Fast for everyday tasks")
     );
-    // Effort: creation-only, levels from the current model's catalog entry,
-    // no current value until configured.
+    // Effort: live (`apply_flag_settings`), levels from the current model's
+    // catalog entry, no current value until configured.
     let effort = details
         .config_options
         .iter()
         .find(|o| o.id.as_str() == "effort")
         .unwrap();
-    assert!(!effort.live);
+    assert!(effort.live);
     assert_eq!(effort.current, None);
     let ConfigKind::Select { choices } = &effort.kind else {
         panic!("expected Select, got {:?}", effort.kind);
@@ -599,6 +599,27 @@ async fn cancel_reaches_the_agent_and_ends_the_turn() {
             break;
         }
     }
+    session.close().await.unwrap();
+}
+
+/// Two cancels before the turn starts send one interrupt: the first receipt
+/// names the cancelled prompt and ends the turn, and a second interrupt
+/// must not overwrite the id that receipt is matched on.
+#[tokio::test]
+async fn a_second_cancel_does_not_lose_the_first_interrupt_receipt() {
+    let (session, mut events) = open("double-cancel", "").await;
+    session.prompt("slow-start").await.unwrap();
+    session.cancel(false).await.unwrap();
+    session.cancel(false).await.unwrap();
+    loop {
+        if let EventKind::TurnEnded { stop, .. } = next(&mut events).await.kind {
+            assert_eq!(stop, StopReason::Cancelled);
+            break;
+        }
+    }
+    // The session is idle and usable: a plain prompt completes.
+    session.prompt("hi").await.unwrap();
+    complete_turn(&session, &mut events).await;
     session.close().await.unwrap();
 }
 
@@ -1206,6 +1227,30 @@ async fn compact_runs_the_cli_command_and_reports_the_compaction() {
     );
 }
 
+/// The CLI owns `/`: an unknown command comes back as its own synthetic
+/// message, which is surfaced as text and closed like any message.
+#[tokio::test]
+async fn an_unknown_slash_command_is_answered_by_the_cli() {
+    let (session, mut events) = open("slash", "").await;
+    session.prompt("/nope now").await.unwrap();
+    let mut text = String::new();
+    let mut ended = false;
+    loop {
+        match next(&mut events).await.kind {
+            EventKind::TextDelta { text: t, .. } => text.push_str(&t),
+            EventKind::MessageEnded { .. } => ended = true,
+            EventKind::TurnEnded { stop, .. } => {
+                assert!(matches!(stop, StopReason::Completed { .. }), "{stop:?}");
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(text, "Unknown command: /nope");
+    assert!(ended);
+    session.close().await.unwrap();
+}
+
 /// Claude advertises Fast for the catalog's Opus alias and sends a launch opt-in.
 #[tokio::test]
 async fn fast_mode_is_live_and_follows_the_model() {
@@ -1260,10 +1305,9 @@ async fn fast_mode_is_live_and_follows_the_model() {
     session.close().await.unwrap();
 }
 
-/// Toggling Fast mid-session applies on the next turn: the adapter relaunches
-/// the CLI with the new settings while the transcript survives.
+/// Fast and effort switch live over `apply_flag_settings`, `max` included.
 #[tokio::test]
-async fn fast_mode_toggle_relaunches_with_new_settings() {
+async fn fast_and_effort_switch_live_over_the_control_channel() {
     let agent = AgentInstallation::at("claude", wrapper("fast-toggle", ""));
     let (session, mut events) = Runtime::new()
         .open(
@@ -1280,29 +1324,47 @@ async fn fast_mode_toggle_relaunches_with_new_settings() {
         "first turn should run without fast mode"
     );
     session.configure("fast", true).await.unwrap();
-    assert_eq!(
-        session
-            .info()
-            .configuration
-            .options
-            .get(&ConfigId::new("fast")),
-        Some(&ConfigValue::Bool(true))
-    );
+    // The CLI's receipt confirms the change; the snapshot follows it.
+    loop {
+        if let EventKind::SessionUpdated(info) = next(&mut events).await.kind
+            && info.configuration.options.get(&ConfigId::new("fast"))
+                == Some(&ConfigValue::Bool(true))
+        {
+            break;
+        }
+    }
     session.prompt("hi again").await.unwrap();
     assert!(
         complete_turn(&session, &mut events)
             .await
             .contains("fast=true"),
-        "turn after enabling should relaunch with fast mode"
+        "turn after enabling should run in fast mode"
     );
     session.configure("fast", false).await.unwrap();
+    session.configure("effort", "high").await.unwrap();
+    loop {
+        if let EventKind::SessionUpdated(info) = next(&mut events).await.kind
+            && info.configuration.options.get(&ConfigId::new("effort"))
+                == Some(&ConfigValue::from("high"))
+        {
+            break;
+        }
+    }
     session.prompt("once more").await.unwrap();
-    assert!(
-        complete_turn(&session, &mut events)
-            .await
-            .contains("fast=false"),
-        "turn after disabling should relaunch without fast mode"
-    );
+    let text = complete_turn(&session, &mut events).await;
+    assert!(text.contains("fast=false effort=high"), "{text}");
+    session.configure("effort", "max").await.unwrap();
+    loop {
+        if let EventKind::SessionUpdated(info) = next(&mut events).await.kind
+            && info.configuration.options.get(&ConfigId::new("effort"))
+                == Some(&ConfigValue::from("max"))
+        {
+            break;
+        }
+    }
+    session.prompt("max out").await.unwrap();
+    let text = complete_turn(&session, &mut events).await;
+    assert!(text.contains("effort=max"), "{text}");
     session.close().await.unwrap();
 }
 
@@ -1362,9 +1424,10 @@ async fn fast_mode_defaults_off_and_can_be_explicitly_disabled() {
     session.close().await.unwrap();
 }
 
-/// A speed change waits for the current reply and resumes its conversation.
+/// A speed change lands mid-reply over the control channel: one process,
+/// the transcript intact, every other setting untouched.
 #[tokio::test]
-async fn fast_mode_resumes_after_the_current_turn_and_keeps_settings() {
+async fn fast_mode_changes_mid_turn_without_a_relaunch() {
     let dir = tempfile::tempdir().unwrap();
     let agent = AgentInstallation::at("claude", wrapper("fast-resume", "--echo-relaunch"));
     let (session, mut events) = Runtime::new()
@@ -1394,24 +1457,19 @@ async fn fast_mode_resumes_after_the_current_turn_and_keeps_settings() {
     let text = complete_turn(&session, &mut events).await;
     assert!(text.contains("recalled=remember-this"), "{text}");
     assert!(text.contains("fast=true"), "{text}");
+    assert!(text.contains("effort=high"), "{text}");
     assert_eq!(session.info().resume_token.unwrap().as_str(), "sess-c1");
-    let launches: Vec<serde_json::Value> =
-        std::fs::read_to_string(dir.path().join("launches.jsonl"))
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-    assert_eq!(launches.len(), 2);
-    let args = launches[1].as_array().unwrap();
-    for (key, expected) in [
-        ("--resume", "sess-c1"),
-        ("--model", "default"),
-        ("--permission-mode", "acceptEdits"),
-        ("--effort", "high"),
-    ] {
-        let index = args.iter().position(|arg| arg == key).unwrap();
-        assert_eq!(args[index + 1], expected);
-    }
+    let launches = std::fs::read_to_string(dir.path().join("launches.jsonl")).unwrap();
+    assert_eq!(launches.lines().count(), 1, "no relaunch: {launches}");
+    let info = session.info();
+    assert_eq!(
+        info.configuration.options.get(&ConfigId::new("mode")),
+        Some(&ConfigValue::from("acceptEdits"))
+    );
+    assert_eq!(
+        info.configuration.options.get(&ConfigId::new("model")),
+        Some(&ConfigValue::from("default"))
+    );
     session.configure("fast", false).await.unwrap();
     session.prompt("standard-again").await.unwrap();
     let text = complete_turn(&session, &mut events).await;
@@ -1420,7 +1478,7 @@ async fn fast_mode_resumes_after_the_current_turn_and_keeps_settings() {
     session.close().await.unwrap();
 }
 
-/// Before any transcript exists, Fast relaunches fresh; cancelled toggles do nothing.
+/// Toggles before the first prompt and cancelled toggles never spawn anything.
 #[tokio::test]
 async fn fast_mode_before_the_first_prompt_and_redundant_toggles() {
     let dir = tempfile::tempdir().unwrap();
@@ -1445,43 +1503,14 @@ async fn fast_mode_before_the_first_prompt_and_redundant_toggles() {
             .contains("recalled=first")
     );
     let launches = std::fs::read_to_string(dir.path().join("launches.jsonl")).unwrap();
-    assert_eq!(launches.lines().count(), 2);
-    assert!(!launches.contains("--resume"));
+    assert_eq!(launches.lines().count(), 1);
     session.close().await.unwrap();
 }
 
-/// A failed resume reports the cause and closes instead of losing the prompt silently.
+/// A speed change while a background tool runs applies at once, in the
+/// same process, and the tool still finishes.
 #[tokio::test]
-async fn fast_mode_resume_failure_closes_the_session() {
-    let (session, mut events) = open("fast-resume-failure", "--resume-fails").await;
-    session.prompt("hi").await.unwrap();
-    complete_turn(&session, &mut events).await;
-    session.configure("fast", true).await.unwrap();
-    session.prompt("resume-me").await.unwrap();
-    let mut reported = false;
-    while let Some(event) = tokio::time::timeout(Duration::from_secs(10), events.next())
-        .await
-        .unwrap()
-    {
-        if let Ok(Event {
-            kind: EventKind::Diagnostic(d),
-            ..
-        }) = event
-        {
-            reported |= d.message.contains("fast mode resume failed")
-                && d.message.contains("resume refused");
-        }
-    }
-    assert!(reported);
-    assert!(matches!(
-        session.prompt("again").await,
-        Err(AgentError::SessionClosed)
-    ));
-}
-
-/// Resuming must not terminate a background tool still owned by the old process.
-#[tokio::test]
-async fn fast_mode_waits_for_background_tools() {
+async fn fast_mode_changes_while_a_background_tool_runs() {
     let dir = tempfile::tempdir().unwrap();
     let agent = AgentInstallation::at(
         "claude",
@@ -1498,27 +1527,12 @@ async fn fast_mode_waits_for_background_tools() {
     assert_eq!(complete_turn(&session, &mut events).await, "started");
     session.configure("fast", true).await.unwrap();
     session.prompt("while-background-runs").await.unwrap();
-    complete_turn(&session, &mut events).await;
-    assert_eq!(
-        std::fs::read_to_string(dir.path().join("launches.jsonl"))
-            .unwrap()
-            .lines()
-            .count(),
-        1
-    );
+    let text = complete_turn(&session, &mut events).await;
+    assert!(text.contains("fast=true"), "{text}");
     std::fs::write(dir.path().join("release-background"), "").unwrap();
     assert_eq!(complete_turn(&session, &mut events).await, "BG-DONE");
-    session.prompt("after-background").await.unwrap();
-    complete_turn(&session, &mut events).await;
     let launches = std::fs::read_to_string(dir.path().join("launches.jsonl")).unwrap();
-    assert_eq!(launches.lines().count(), 2);
-    let args: Vec<String> = serde_json::from_str(launches.lines().last().unwrap()).unwrap();
-    let settings = args.iter().position(|arg| arg == "--settings").unwrap();
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&args[settings + 1]).unwrap()["fastMode"],
-        true
-    );
-    assert!(args.iter().any(|arg| arg == "--resume"));
+    assert_eq!(launches.lines().count(), 1, "no relaunch: {launches}");
     session.close().await.unwrap();
 }
 

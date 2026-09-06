@@ -725,6 +725,169 @@ async fn unknown_requests_and_prompts_are_rejected() {
     );
 }
 
+/// `cancel(true)` drops a steer still waiting for its verdict: the prompt
+/// fails instead of being requeued and run after the cancel.
+#[tokio::test]
+async fn cancel_with_clear_drops_a_pending_steer() {
+    let script = Script {
+        steer: true,
+        steer_ack: false,
+        ..Script::default()
+    }
+    .turn(parked_turn())
+    .turn(vec![Step::End(completed())]);
+    let (session, mut events) = open(MockAdapter::new(script), None).await;
+    session.prompt("one").await.unwrap();
+    let _started = next(&mut events).await;
+    let _request = next(&mut events).await;
+    let steer = tokio::spawn({
+        let session = session.clone();
+        async move { session.prompt("two").await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    session.cancel(true).await.unwrap();
+    assert!(matches!(
+        steer.await.unwrap(),
+        Err(crate::AgentError::InvalidRequest(_))
+    ));
+    let kinds = collect(&mut events, 2).await;
+    assert!(matches!(kinds[0], EventKind::RequestClosed { .. }));
+    assert!(matches!(
+        kinds[1],
+        EventKind::TurnEnded {
+            stop: StopReason::Cancelled,
+            ..
+        }
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), next(&mut events))
+            .await
+            .is_err(),
+        "the dropped steer must not start a turn"
+    );
+}
+
+/// AutoApprove only ever answers with a one-time allow; a request that
+/// does not offer one reaches the caller instead.
+#[tokio::test]
+async fn auto_approve_forwards_requests_without_a_one_time_allow() {
+    use crate::{PermissionRequest, Request};
+    let EventKind::ToolUpdated(pending) = tool("tool-1", ToolStatus::Pending) else {
+        unreachable!()
+    };
+    let request = EventKind::RequestOpened(Request::Permission(PermissionRequest {
+        id: RequestId::new("r1"),
+        tool: pending,
+        options: vec![PermissionChoice::AllowAlways, PermissionChoice::DenyOnce],
+        detail: None,
+    }));
+    let script = Script::default().turn(vec![
+        Step::Emit(request),
+        Step::AwaitAnswer,
+        Step::End(completed()),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let options =
+        SessionOptions::in_dir(dir.path()).permission_mode(crate::PermissionMode::AutoApprove);
+    let (session, mut events) = open(MockAdapter::new(script), Some(options)).await;
+    session.prompt("go").await.unwrap();
+    let _started = next(&mut events).await;
+    let EventKind::RequestOpened(request) = next(&mut events).await.kind else {
+        panic!("the request must reach the caller")
+    };
+    session
+        .answer(request.id(), Answer::Permission(PermissionChoice::DenyOnce))
+        .await
+        .unwrap();
+}
+
+/// A stalled consumer that overflows during the close itself still gets
+/// `close()` back within the grace period, even from a wedged adapter.
+#[tokio::test(start_paused = true)]
+async fn close_returns_within_grace_when_the_consumer_overflows_mid_close() {
+    // TurnStarted + StatusChanged + 1022 deltas fill the 1024 buffer exactly;
+    // the close's own MessageEnded is the first push to fail.
+    let steps: Vec<Step> = (0..1022)
+        .map(|i| Step::Emit(text("m1", &format!("{i} "))))
+        .collect();
+    let adapter = MockAdapter::new(
+        Script {
+            ignore_close: true,
+            ..Script::default()
+        }
+        .turn(steps),
+    );
+    let sent = adapter.sent();
+    let (session, _events) = open(adapter, None).await;
+    session.prompt("go").await.unwrap();
+    while sent.load(std::sync::atomic::Ordering::SeqCst) < 1023 {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::timeout(Duration::from_secs(6), session.close())
+        .await
+        .expect("close must return within the grace period")
+        .unwrap();
+}
+
+/// Mid-turn silence earns one warning diagnostic and never ends the turn;
+/// an agent waiting on the caller is not silent.
+#[tokio::test(start_paused = true)]
+async fn a_silent_agent_earns_a_stall_warning_but_not_while_it_waits_on_us() {
+    let script = Script::default()
+        .turn(vec![Step::Emit(text("m1", "working"))]) // then nothing
+        .turn(parked_turn());
+    let (session, mut events) = open(MockAdapter::new(script), None).await;
+    session.prompt("go").await.unwrap();
+    let _started = next(&mut events).await;
+    let _text = next(&mut events).await;
+    // Paused time jumps to the engine's 120 s timer; `next` would give up
+    // at 2 s first.
+    let warning = tokio::time::timeout(Duration::from_secs(300), events.next())
+        .await
+        .expect("the stall warning never came")
+        .unwrap()
+        .unwrap();
+    let EventKind::Diagnostic(d) = &warning.kind else {
+        panic!("expected a stall diagnostic, got {:?}", warning.kind)
+    };
+    assert!(d.message.contains("no activity"), "{}", d.message);
+    assert!(
+        warning.turn_info.is_some(),
+        "the warning belongs to the turn"
+    );
+    // One warning per silence: nothing more follows.
+    assert!(quiet_for(&mut events, 600).await);
+    session.cancel(false).await.unwrap();
+    loop {
+        if let EventKind::TurnEnded { .. } = next(&mut events).await.kind {
+            break;
+        }
+    }
+    // The next turn parks on a request: waiting on the caller is not a stall.
+    session.prompt("again").await.unwrap();
+    let kinds = collect(&mut events, 2).await;
+    assert!(matches!(kinds[0], EventKind::TurnStarted { .. }));
+    assert!(matches!(kinds[1], EventKind::RequestOpened(_)));
+    assert!(
+        quiet_for(&mut events, 600).await,
+        "a turn waiting on the caller must not warn"
+    );
+}
+
+/// Whether nothing but status flips arrives for `secs` (paused time).
+async fn quiet_for(events: &mut Events, secs: u64) -> bool {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(secs), events.next()).await {
+            Err(_) => return true,
+            Ok(Some(Ok(event))) if matches!(event.kind, EventKind::StatusChanged(_)) => {}
+            Ok(other) => panic!("unexpected {other:?}"),
+        }
+    }
+}
+
 /// Compaction reaches the agent only when it is advertised and the session
 /// is idle; `ContextCompacted` is the confirmation.
 #[tokio::test]

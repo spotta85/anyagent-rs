@@ -1,4 +1,9 @@
 //! Entry point: find agents, open sessions.
+//!
+//! High level: `Runtime::new` registers one adapter per catalog agent;
+//! `discover` scans offline, `probe`/`probe_auth` open a throwaway session,
+//! `open` connects and starts the engine, `generate` runs one prompt to text,
+//! `plan_usage` reads account quota.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -20,7 +25,8 @@ use crate::event::{
 use crate::session::{self, Events, Session};
 
 const USAGE_CACHE_TTL: Duration = Duration::from_secs(60);
-/// special case for acp probe.
+/// How long `probe` waits for a command list that arrives after the
+/// handshake (ACP `availableCommands`, codex skills).
 const PROBE_COMMANDS_WAIT: Duration = Duration::from_secs(2);
 
 /// The one object an application creates. Holds the adapter registry.
@@ -74,9 +80,17 @@ impl Runtime {
         }
     }
 
+    /// A runtime whose only agent plays `script`, registered as `mock`: the
+    /// real engine underneath, no subprocess. For testing an app's UI and
+    /// routing against a scripted agent.
+    #[cfg(any(test, feature = "mock"))]
+    pub fn with_mock(script: crate::mock::Script) -> Self {
+        Self::with_test_adapter(crate::mock::MockAdapter::new(script))
+    }
+
     /// A runtime whose only agent is the given adapter, registered as `mock`.
     /// The real catalog is not scanned.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "mock"))]
     pub(crate) fn with_test_adapter(adapter: impl Adapter + 'static) -> Self {
         use crate::agent::InstallationSource;
         let id = AgentId::new("mock");
@@ -112,7 +126,7 @@ impl Runtime {
     }
 
     /// Launches the agent, completes the handshake, and returns the command
-    /// handle plus the event stream. Used in probe and session open
+    /// handle plus the event stream.
     pub async fn open(
         &self,
         agent: &AgentInstallation,
@@ -139,11 +153,11 @@ impl Runtime {
         Ok(session::start(agent.clone(), connection, &options))
     }
     /// One-shot generation: prompt in, the agent's reply text out. Opens a
-    /// throwaway session, denies every tool permission, gathers the text
-    /// until the turn ends, and closes. Requires a new session; a tool event
-    /// or a question requiring a choice cancels generation. Native Pi disables
-    /// tools and session persistence at launch. Include its context inline:
-    /// path attachments cannot be opened without tools.
+    /// throwaway session with tools disabled where the wire allows (claude,
+    /// pi) and every permission declined elsewhere, gathers the text until
+    /// the turn ends, and closes. Requires a new session; a tool event or a
+    /// question requiring a choice cancels generation. Include context
+    /// inline: path attachments cannot be opened without tools.
     pub async fn generate(
         &self,
         agent: &AgentInstallation,
@@ -160,15 +174,15 @@ impl Runtime {
         let mut options = options.permission_mode(PermissionMode::Ask);
         options.no_tools = true;
         let (session, mut events) = self.open(agent, options).await?;
-        // Only native Pi enforces no_tools at launch; an ACP override does not.
-        let native_pi = agent.id.as_str() == "pi" && agent.acp_args.is_none();
-        if !session
-            .info()
-            .details
-            .capabilities
-            .supports(Capability::Permissions)
-            && !native_pi
-        {
+        // Hands-off needs one of: tools switched off at launch, or every
+        // tool gated by a permission request this loop can decline.
+        let hands_off = session.tools_disabled()
+            || session
+                .info()
+                .details
+                .capabilities
+                .supports(Capability::Permissions);
+        if !hands_off {
             session.close().await.ok();
             return Err(AgentError::UnsupportedFeature(
                 "generate requires tool permissions or launch-time tool disabling".into(),
@@ -179,7 +193,9 @@ impl Runtime {
         reply
     }
 
-    // spawn agent in temp dir, wait for handshake, read details, close.
+    /// Opens a throwaway session in the temp dir, reads the details the
+    /// handshake learned, and closes. A logged-out agent is a result, not
+    /// an error.
     pub async fn probe(&self, agent: &AgentInstallation) -> Result<AgentDetails, AgentError> {
         let opened = self
             .open(agent, SessionOptions::in_dir(std::env::temp_dir()))
@@ -197,12 +213,17 @@ impl Runtime {
             }
             other => other?,
         };
-        // ACP agents often deliver `availableCommands` as an update just
-        // after `session/new`; wait briefly for it before giving up on an
-        // empty list. Agents that report commands at handshake (claude) skip
-        // the wait entirely.
+        // ACP agents deliver `availableCommands` just after `session/new`
+        // and codex fetches skills after open; wait briefly for the list.
+        // Agents that report commands at handshake (claude) or have none to
+        // report skip the wait.
         let deadline = tokio::time::Instant::now() + PROBE_COMMANDS_WAIT;
-        while session.info().details.commands.is_empty() {
+        let has_commands = session
+            .info()
+            .details
+            .capabilities
+            .supports(Capability::SlashCommands);
+        while has_commands && session.info().details.commands.is_empty() {
             let Ok(Some(Ok(_))) = tokio::time::timeout_at(deadline, events.next()).await else {
                 break;
             };
@@ -230,9 +251,9 @@ impl Runtime {
         }
     }
 
-    /// Agents without quota
-    /// (or with an API-key login) return `UnsupportedFeature`. May spawn a
-    /// short-lived agent process; results are cached for 60 s.
+    /// Plan quota for the logged-in account. Agents without quota (or with
+    /// an API-key login) return `UnsupportedFeature`. May spawn a short-lived
+    /// agent process; results are cached for 60 s.
     pub async fn plan_usage(&self, agent: &AgentInstallation) -> Result<PlanUsage, AgentError> {
         let key = (agent.id.clone(), agent.executable_path.clone());
         if let Some((at, usage)) = self.usage_cache.lock().unwrap().get(&key)
@@ -350,6 +371,7 @@ pub struct DiscoveryReport {
 }
 
 impl DiscoveryReport {
+    /// The installed agent with this id, or `NotInstalled`.
     pub fn require(&self, id: impl AsRef<str>) -> Result<&AgentInstallation, AgentError> {
         let id = id.as_ref();
         self.agents

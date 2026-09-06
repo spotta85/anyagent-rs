@@ -65,8 +65,8 @@ pub(crate) enum AuthMarker {
     ApiKeyEnv(&'static str),
 }
 
-/// The supported agents. ACP agents beyond these land with their verified
-/// launch quirks (P2); guessed wire flags do not ship.
+/// The supported agents. A profile ships only with launch flags verified
+/// against a real install; guessed wire flags do not ship.
 pub(crate) static PROFILES: &[AgentProfile] = &[
     AgentProfile {
         id: "claude",
@@ -95,8 +95,8 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         config_dir: ".codex",
         config_home_env: Some("CODEX_HOME"),
         connection: Connection::Native(NativeKind::Codex),
-        // No env marker: app-server 0.147.0 ignores `OPENAI_API_KEY` entirely
-        // (probed 2026-08-27, ticket 10) — auth comes only from auth.json.
+        // No env marker: app-server 0.147.0 ignores `OPENAI_API_KEY`
+        // (probed 2026-08-27); auth comes only from auth.json.
         auth_markers: &[AuthMarker::ConfigFile("auth.json", AuthKind::Subscription)],
         open_auth_kind: None,
         auth_error_hints: &[],
@@ -131,11 +131,9 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         executable_env: "ANYAGENT_GROK_BIN",
         config_dir: ".grok",
         config_home_env: None,
-        // Flag placement verified against grok 1.0.4 (comet field notes):
-        // `--no-auto-update` is TOP-LEVEL and kills a silent multi-second
-        // launch-time update check; `--no-leader` (on the subcommand) starts
-        // a fresh agent instead of attaching to a shared leader process via
-        // ~/.grok/leader.sock — a wedged/stale leader reads as total silence.
+        // Verified against grok 1.0.4: top-level `--no-auto-update` skips a
+        // multi-second update check; `--no-leader` starts a fresh agent
+        // instead of attaching to a leader process that may be wedged.
         connection: Connection::Acp {
             args: &["--no-auto-update", "agent", "--no-leader", "stdio"],
         },

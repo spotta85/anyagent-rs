@@ -11,6 +11,10 @@
 //! fork works. The one thing v1 lacks is steering, which opencode has over ACP
 //! too; the engine queues prompts instead. All routes and event names live in
 //! this file so a future v2 swap is contained.
+//!
+//! High level: `connect` → `launch` (spawn, health, bus, `handshake`) →
+//! `driver_info`; then `Drive::run` turns commands into HTTP calls and SSE
+//! frames into events (`handle_command`, `handle_frame`, `on_*`).
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -21,10 +25,10 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
-use crate::adapter::plan_entries;
 use crate::adapter::{
-    Adapter, ConnectRequest, DriverCommand, DriverConnection, DriverEvent, DriverInfo,
-    WireRecorder, apply_selection, attach, cap, login_methods,
+    Adapter, CLOSE_GRACE, ConnectRequest, DriverCommand, DriverConnection, DriverEvent, DriverInfo,
+    Emitter, FRAME_BUFFER, Gone, HANDSHAKE_TIMEOUT, OUTPUT_CAP, WireRecorder, apply_selection,
+    attach, cap, level_choices, login_methods, offers, plan_entries, selected, set_effort_option,
 };
 use crate::agent::{
     AgentDetails, AuthKind, AuthStatus, Capabilities, Capability, ConfigChoice, ConfigId,
@@ -34,24 +38,21 @@ use crate::agent::{
 use crate::error::AgentError;
 use crate::event::Extensions;
 use crate::event::{
-    Answer, Choice, ChoiceId, CompletionSource, Diagnostic, DiagnosticLevel, EventKind, MessageId,
+    Answer, Choice, ChoiceId, CompletionSource, DiagnosticLevel, EventKind, MessageId,
     PermissionChoice, PermissionRequest, Question, QuestionAnswer, QuestionId, QuestionRequest,
     RawTool, Request, RequestId, StopReason, ToolId, ToolInput, ToolKind, ToolStatus, ToolUpdate,
 };
 use crate::process::{self, Spawn};
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a taken prompt may sit without the server going busy.
 const ADMIT_TIMEOUT: Duration = Duration::from_secs(10);
-const CLOSE_GRACE: Duration = Duration::from_secs(2);
 const HEALTH_POLL: Duration = Duration::from_millis(100);
-const FRAME_BUFFER: usize = 64;
-const OUTPUT_CAP: usize = 16 * 1024;
 
 /// Launches `opencode serve` and speaks its HTTP wire.
 pub(crate) struct OpencodeAdapter;
 
 impl OpencodeAdapter {
+    /// One instance drives every opencode session.
     pub(crate) fn new() -> Self {
         Self
     }
@@ -63,31 +64,24 @@ impl Adapter for OpencodeAdapter {
     /// and hands the live SSE bus to the drive task.
     async fn connect(&self, request: ConnectRequest) -> Result<DriverConnection, AgentError> {
         let (ev_tx, ev_rx) = mpsc::channel(FRAME_BUFFER);
-        let recorder = WireRecorder::for_session(&request.options, &ev_tx).await;
+        let events = Emitter::new(ev_tx);
+        let recorder = WireRecorder::for_session(&request.options, &events).await;
         let launched = launch(&request, recorder).await?;
         let info = launched.info.clone();
-        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         tokio::spawn(
             Drive {
                 http: launched.http,
                 server: launched.server,
                 frames: launched.frames,
-                events: ev_tx,
+                events,
                 info: launched.info,
                 session_id: launched.session_id,
                 windows: launched.windows,
                 variants: launched.variants,
                 login: login_methods(&request.installation),
-                messages: HashMap::new(),
-                ended: HashSet::new(),
+                scratch: TurnScratch::default(),
                 tide: String::new(),
-                parts: HashMap::new(),
-                tools: HashMap::new(),
-                children: HashSet::new(),
-                child_of: HashMap::new(),
-                spawn_order: Vec::new(),
-                child_messages: HashMap::new(),
-                requests: HashMap::new(),
                 cost: 0.0,
                 turn: Turn::Idle,
                 admit_deadline: None,
@@ -107,7 +101,7 @@ impl Adapter for OpencodeAdapter {
 }
 
 // ---------------------------------------------------------------------------
-// Launch and handshake
+// LAUNCH AND HANDSHAKE
 // ---------------------------------------------------------------------------
 
 /// A booted server with its session bound.
@@ -391,8 +385,8 @@ fn driver_info(
         details: AgentDetails {
             version,
             auth,
-            // Steer is absent (v1 queues); RollbackFiles, PlanUsage, and
-            // Subagents are not on this wire honourably.
+            // Steer is absent (v1 queues); RollbackFiles and PlanUsage are
+            // not on this wire. Subagents are task-tool child sessions.
             capabilities: Capabilities::new([
                 Capability::Images,
                 Capability::Resume,
@@ -404,6 +398,7 @@ fn driver_info(
                 Capability::SlashCommands,
                 Capability::Plan,
                 Capability::ContextUsage,
+                Capability::Subagents,
             ]),
             config_options,
             commands: slash_commands(commands),
@@ -416,6 +411,7 @@ fn driver_info(
         deterministic_turn_end: true,
         // No agent-originated turns on opencode; the same signal covers it.
         deterministic_agent_turn_end: true,
+        tools_disabled: false,
     }
 }
 
@@ -490,14 +486,6 @@ fn slash_commands(commands: &Value) -> Vec<SlashCommand> {
         .collect()
 }
 
-/// The model to send with each prompt, from the advertised configuration.
-fn current_model(info: &DriverInfo) -> Option<String> {
-    match info.configuration.options.get(&ConfigId::new("model")) {
-        Some(ConfigValue::Text(model)) => Some(model.clone()),
-        _ => None,
-    }
-}
-
 /// Creation-time `configure` values as (model, effort): only those two,
 /// and the model only from the advertised choices (an unknown model would
 /// fail the first turn). Effort is checked once the model is known.
@@ -559,53 +547,18 @@ fn model_variants(providers: &Value) -> HashMap<String, Vec<String>> {
 }
 
 /// Makes the `effort` option match the selected model: its variants as
-/// choices, the selection kept when the model offers it, and no option for
-/// a model without variants. The value rides every prompt as `variant`.
+/// choices, none for a model without variants. The value rides every
+/// prompt as `variant`.
 fn sync_effort(info: &mut DriverInfo, variants: &HashMap<String, Vec<String>>) {
-    let id = ConfigId::new("effort");
-    let current = match info.configuration.options.remove(&id) {
-        Some(ConfigValue::Text(effort)) => Some(effort),
-        _ => None,
-    };
-    info.details.config_options.retain(|o| o.id != id);
-    let Some(names) = current_model(info).and_then(|model| variants.get(&model)) else {
-        return;
-    };
-    let current = current.filter(|c| names.contains(c)).map(ConfigValue::Text);
-    if let Some(current) = &current {
-        info.configuration
-            .options
-            .insert(id.clone(), current.clone());
-    }
-    info.details.config_options.push(ConfigOption {
-        id,
-        name: "Reasoning effort".into(),
-        category: Some("thought_level".into()),
-        kind: ConfigKind::Select {
-            choices: names
-                .iter()
-                .map(|name| ConfigChoice {
-                    value: name.clone(),
-                    label: name.clone(),
-                    description: None,
-                })
-                .collect(),
-        },
-        current,
-        live: true,
-    });
-}
-
-/// Whether the advertised select `id` offers `value`.
-fn offers(info: &DriverInfo, id: &str, value: &ConfigValue) -> bool {
-    info.details.config_options.iter().any(|o| {
-        o.id.as_str() == id
-            && matches!((&o.kind, value), (ConfigKind::Select { choices }, ConfigValue::Text(v)) if choices.iter().any(|c| &c.value == v))
-    })
+    let choices = selected(info, "model")
+        .and_then(|model| variants.get(&model))
+        .map(|names| level_choices(names.iter().map(String::as_str)))
+        .unwrap_or_default();
+    set_effort_option(info, choices, selected(info, "effort"));
 }
 
 // ---------------------------------------------------------------------------
-// Drive task: engine commands out (HTTP), SSE frames in
+// DRIVE TASK: engine commands out (HTTP), SSE frames in
 // ---------------------------------------------------------------------------
 
 /// One open request awaiting the caller's answer. The payload is kept so a
@@ -632,7 +585,7 @@ struct Drive {
     server: process::Child,
     /// Decoded SSE frames from the `/event` bus; closes when the server dies.
     frames: mpsc::Receiver<Value>,
-    events: mpsc::Sender<DriverEvent>,
+    events: Emitter,
     info: DriverInfo,
     /// The opencode `ses_…` id this session drives.
     session_id: String,
@@ -642,36 +595,12 @@ struct Drive {
     windows: HashMap<String, u64>,
     /// Reasoning variants per model, behind the `effort` option.
     variants: HashMap<String, Vec<String>>,
-    /// Assistant `msg_…` id → our streaming message id. Only assistant
-    /// messages are minted, so membership gates what streams (the user
-    /// message carries a replay of our own prompt).
-    messages: HashMap<String, MessageId>,
-    /// Messages already closed by a completed `message.updated` (the
-    /// completed snapshot republishes, so each closes once).
-    ended: HashSet<String>,
+    /// Everything that lives for one turn; reset at idle.
+    scratch: TurnScratch,
     /// Highest assistant `msg_…` id ever minted. Ids sort by creation time,
     /// so an unknown id at or below it is a bookkeeping republish of a
     /// settled turn (an abort replays its message), never new content.
     tide: String,
-    /// `prt_…` id → (kind, bytes already emitted), for delta/snapshot dedup.
-    parts: HashMap<String, PartState>,
-    /// Tool snapshots by `callID`, for the permission that references one.
-    tools: HashMap<String, ToolUpdate>,
-    /// Task-tool child sessions of this turn; their permission and question
-    /// asks reach the caller, and bound children's turn content streams
-    /// under their spawning tool call.
-    children: HashSet<String>,
-    /// Child session id → spawning task-tool call, for transcript nesting.
-    /// Bound at `session.created`; cleared with `children` at turn end.
-    child_of: HashMap<String, ToolId>,
-    /// Own task-tool `callID`s in first-seen order, for oldest-unbound
-    /// binding. A child's own task tools stay out: grandchildren bind
-    /// through their parent, never through this list.
-    spawn_order: Vec<String>,
-    /// Child assistant `msg_…` id → spawning task-tool call, so the turn-end
-    /// sweep closes stragglers under the right parent.
-    child_messages: HashMap<String, ToolId>,
-    requests: HashMap<RequestId, Pending>,
     /// Session cost so far, summed over step-finishes.
     cost: f64,
     turn: Turn,
@@ -684,6 +613,35 @@ struct Drive {
     turn_error: Option<StopReason>,
     next_message: u64,
     next_request: u64,
+}
+
+/// Per-turn bookkeeping: messages, parts, tools, task-tool children, and
+/// open requests. A settled turn leaves nothing more for any of it.
+#[derive(Default)]
+struct TurnScratch {
+    /// Assistant `msg_…` id → our streaming message id. Only assistant
+    /// messages are minted, so membership gates what streams (the user
+    /// message carries a replay of our own prompt).
+    messages: HashMap<String, MessageId>,
+    /// Messages already closed by a completed `message.updated` (the
+    /// completed snapshot republishes, so each closes once).
+    ended: HashSet<String>,
+    /// `prt_…` id → (kind, bytes already emitted), for delta/snapshot dedup.
+    parts: HashMap<String, PartState>,
+    /// Tool snapshots by `callID`, for the permission that references one.
+    tools: HashMap<String, ToolUpdate>,
+    /// Task-tool child sessions; their permission and question asks reach
+    /// the caller, and bound children's content streams under their tool.
+    children: HashSet<String>,
+    /// Child session id → spawning task-tool call, bound at `session.created`.
+    child_of: HashMap<String, ToolId>,
+    /// Own task-tool `callID`s in first-seen order, for oldest-unbound
+    /// binding. Grandchildren bind through their parent, never this list.
+    spawn_order: Vec<String>,
+    /// Child assistant `msg_…` id → spawning task-tool call, so the turn-end
+    /// sweep closes stragglers under the right parent.
+    child_messages: HashMap<String, ToolId>,
+    requests: HashMap<RequestId, Pending>,
 }
 
 /// Streaming state of one text or reasoning part.
@@ -709,7 +667,7 @@ enum PartKind {
 
 impl Drive {
     /// Main loop until the engine or the server goes away.
-    async fn run(mut self, mut commands: mpsc::Receiver<DriverCommand>) {
+    async fn run(mut self, mut commands: mpsc::UnboundedReceiver<DriverCommand>) {
         loop {
             tokio::select! {
                 cmd = commands.recv() => match cmd {
@@ -727,7 +685,7 @@ impl Drive {
                         }
                     }
                     None => {
-                        self.report_exit().await;
+                        self.events.exited(&mut self.server).await;
                         break;
                     }
                 },
@@ -745,7 +703,7 @@ impl Drive {
     async fn handle_command(&mut self, cmd: DriverCommand) -> Result<(), Gone> {
         match cmd {
             DriverCommand::StartTurn { input } => {
-                self.emit(DriverEvent::TurnAck).await?;
+                self.events.send(DriverEvent::TurnAck).await?;
                 self.turn = Turn::Sent;
                 self.aborting = false;
                 self.turn_error = None;
@@ -756,16 +714,17 @@ impl Drive {
             DriverCommand::Compact => self.compact().await?,
             // Never reached: Steer is unadvertised, so the engine queues
             // mid-turn prompts and re-sends them as `StartTurn`.
-            DriverCommand::Steer { .. } => self.emit(DriverEvent::Steered(false)).await?,
+            DriverCommand::Steer { .. } => self.events.send(DriverEvent::Steered(false)).await?,
             DriverCommand::Answer { request, answer } => self.answer(request, answer).await?,
             DriverCommand::Cancel => {
                 // Armed only once the server took the abort, so a refused
                 // one lets the turn end as what it was.
                 let abort = format!("/session/{}/abort", self.session_id);
-                match self.http.post(&abort, json!({})).await {
+                match self.http.post_quick(&abort, json!({})).await {
                     Ok(_) => self.aborting = true,
                     Err(e) => {
-                        self.diagnostic(DiagnosticLevel::Warning, format!("cancel not taken: {e}"))
+                        self.events
+                            .diagnostic(DiagnosticLevel::Warning, format!("cancel not taken: {e}"))
                             .await?
                     }
                 }
@@ -783,18 +742,21 @@ impl Drive {
     async fn start_turn(&mut self, input: &Input) -> Result<(), Gone> {
         let loaded = attach::load(&input.attachments).await;
         for problem in loaded.iter().filter_map(|l| l.problem.clone()) {
-            self.diagnostic(DiagnosticLevel::Warning, problem).await?;
+            self.events
+                .diagnostic(DiagnosticLevel::Warning, problem)
+                .await?;
         }
         let text = attach::with_refs(input.as_text(), &loaded);
         if let Some((command, arguments)) =
             slash_command(&text).filter(|(name, _)| self.has_command(name))
         {
             if loaded.iter().any(|l| l.image.is_some()) {
-                self.diagnostic(
-                    DiagnosticLevel::Warning,
-                    "images do not ride slash commands and were dropped",
-                )
-                .await?;
+                self.events
+                    .diagnostic(
+                        DiagnosticLevel::Warning,
+                        "images do not ride slash commands and were dropped",
+                    )
+                    .await?;
             }
             return self.start_command(command, arguments);
         }
@@ -826,10 +788,11 @@ impl Drive {
             }
             Err(e) => {
                 self.turn = Turn::Idle;
-                self.emit(DriverEvent::TurnEnded(StopReason::Failed {
-                    message: e.to_string(),
-                }))
-                .await
+                self.events
+                    .send(DriverEvent::TurnEnded(StopReason::Failed {
+                        message: e.to_string(),
+                    }))
+                    .await
             }
         }
     }
@@ -841,7 +804,7 @@ impl Drive {
     /// turn.
     fn start_command(&mut self, command: String, arguments: String) -> Result<(), Gone> {
         let mut body = json!({ "command": command, "arguments": arguments });
-        if let Some(model) = current_model(&self.info) {
+        if let Some(model) = selected(&self.info, "model") {
             body["model"] = Value::from(model);
         }
         let http = self.http.clone();
@@ -849,11 +812,11 @@ impl Drive {
         let events = self.events.clone();
         tokio::spawn(async move {
             if let Err(e) = http.post_unbounded(&path, body).await {
-                let kind = EventKind::Diagnostic(Diagnostic {
-                    level: DiagnosticLevel::Warning,
-                    message: format!("command rejected: {e}"),
-                });
-                events.send(DriverEvent::event(kind)).await.ok();
+                let message = format!("command rejected: {e}");
+                events
+                    .diagnostic(DiagnosticLevel::Warning, message)
+                    .await
+                    .ok();
             }
         });
         self.admit_deadline = Some(tokio::time::Instant::now() + ADMIT_TIMEOUT);
@@ -891,12 +854,12 @@ impl Drive {
                 self.on_session_created(&props["info"]);
                 return Ok(());
             }
-            if !self.children.contains(session) {
+            if !self.scratch.children.contains(session) {
                 return Ok(());
             }
             // An unbound child's content is dropped: no transcript beats a
             // misattributed one.
-            let parent = self.child_of.get(session).cloned();
+            let parent = self.scratch.child_of.get(session).cloned();
             return match kind {
                 "permission.asked" => self.on_permission(props).await,
                 "question.asked" => self.on_question(props).await,
@@ -928,7 +891,7 @@ impl Drive {
                     let message = props["status"]["message"]
                         .as_str()
                         .unwrap_or("the provider is retrying");
-                    return self.diagnostic(DiagnosticLevel::Info, message).await;
+                    return self.events.diagnostic(DiagnosticLevel::Info, message).await;
                 }
                 Ok(())
             }
@@ -947,7 +910,7 @@ impl Drive {
             "message.part.delta" => self.on_delta(props, None).await,
             "permission.asked" => self.on_permission(props).await,
             "question.asked" => self.on_question(props).await,
-            "session.compacted" => self.emit_kind(EventKind::ContextCompacted).await,
+            "session.compacted" => self.events.event(EventKind::ContextCompacted).await,
             "session.error" => self.on_error(props).await,
             // The rest is bookkeeping and reply echoes the engine already owns.
             _ => Ok(()),
@@ -970,16 +933,21 @@ impl Drive {
         };
         // A republished message of a settled turn must not re-mint: its
         // part snapshots would stream into the next turn.
-        if parent.is_none() && !self.messages.contains_key(oc_id) && oc_id <= self.tide.as_str() {
+        if parent.is_none()
+            && !self.scratch.messages.contains_key(oc_id)
+            && oc_id <= self.tide.as_str()
+        {
             return Ok(());
         }
         let message_id = self.message_id(oc_id);
         if let Some(parent) = &parent {
-            self.child_messages.insert(oc_id.to_owned(), parent.clone());
+            self.scratch
+                .child_messages
+                .insert(oc_id.to_owned(), parent.clone());
         } else if let Some(error) = info.get("error").filter(|e| !e.is_null()) {
             self.turn_error = Some(message_error(error));
         }
-        if info["time"]["completed"].is_null() || !self.ended.insert(oc_id.to_owned()) {
+        if info["time"]["completed"].is_null() || !self.scratch.ended.insert(oc_id.to_owned()) {
             return Ok(());
         }
         self.end_message(oc_id.to_owned(), message_id, parent).await
@@ -998,12 +966,13 @@ impl Drive {
         if parent.is_none() {
             extensions.insert("opencode/fork_point".into(), Value::from(oc_id));
         }
-        self.emit(DriverEvent::Event {
-            kind: EventKind::MessageEnded { message_id },
-            parent_tool_id: parent,
-            extensions,
-        })
-        .await
+        self.events
+            .send(DriverEvent::Event {
+                kind: EventKind::MessageEnded { message_id },
+                parent_tool_id: parent,
+                extensions,
+            })
+            .await
     }
 
     /// Registers a task-tool child: a newborn session whose parent is us or
@@ -1017,14 +986,18 @@ impl Drive {
             return;
         };
         if parent == self.session_id {
-            self.children.insert(id.to_owned());
-            if let Some(spawn) = select_spawn(&self.spawn_order, &self.tools, &self.child_of) {
-                self.child_of.insert(id.to_owned(), spawn);
+            self.scratch.children.insert(id.to_owned());
+            if let Some(spawn) = select_spawn(
+                &self.scratch.spawn_order,
+                &self.scratch.tools,
+                &self.scratch.child_of,
+            ) {
+                self.scratch.child_of.insert(id.to_owned(), spawn);
             }
-        } else if self.children.contains(parent) {
-            self.children.insert(id.to_owned());
-            if let Some(spawn) = self.child_of.get(parent).cloned() {
-                self.child_of.insert(id.to_owned(), spawn);
+        } else if self.scratch.children.contains(parent) {
+            self.scratch.children.insert(id.to_owned());
+            if let Some(spawn) = self.scratch.child_of.get(parent).cloned() {
+                self.scratch.child_of.insert(id.to_owned(), spawn);
             }
         }
     }
@@ -1042,7 +1015,9 @@ impl Drive {
             return Ok(());
         }
         self.info.title = Some(title);
-        self.emit(DriverEvent::InfoChanged(self.info.clone())).await
+        self.events
+            .send(DriverEvent::InfoChanged(self.info.clone()))
+            .await
     }
 
     /// One part snapshot: stream text and reasoning, track tools. Parts of the
@@ -1051,7 +1026,7 @@ impl Drive {
     /// attribution across models is murky, so fail silent, not wrong.
     async fn on_part(&mut self, part: &Value, parent: Option<ToolId>) -> Result<(), Gone> {
         let oc_id = part["messageID"].as_str().unwrap_or_default();
-        let Some(message_id) = self.messages.get(oc_id).cloned() else {
+        let Some(message_id) = self.scratch.messages.get(oc_id).cloned() else {
             return Ok(());
         };
         match part["type"].as_str().unwrap_or_default() {
@@ -1082,7 +1057,7 @@ impl Drive {
         let part_id = props["partID"].as_str().unwrap_or_default();
         // Deltas of an unregistered part are for a non-streamed message (the
         // user prompt) or raced ahead of the part; either way, skip.
-        let Some(state) = self.parts.get_mut(part_id) else {
+        let Some(state) = self.scratch.parts.get_mut(part_id) else {
             return Ok(());
         };
         let kind = state.kind;
@@ -1091,7 +1066,9 @@ impl Drive {
         let oc_id = props["messageID"].as_str().unwrap_or_default();
         let message_id = self.message_id(oc_id);
         if let Some(parent) = &parent {
-            self.child_messages.insert(oc_id.to_owned(), parent.clone());
+            self.scratch
+                .child_messages
+                .insert(oc_id.to_owned(), parent.clone());
         }
         self.emit_text(kind, message_id, delta, parent).await
     }
@@ -1107,6 +1084,7 @@ impl Drive {
         let text = part["text"].as_str().unwrap_or_default();
         let part_id = part["id"].as_str().unwrap_or_default().to_owned();
         let state = self
+            .scratch
             .parts
             .entry(part_id)
             .or_insert(PartState { kind, emitted: 0 });
@@ -1123,6 +1101,7 @@ impl Drive {
         self.emit_text(kind, message_id, delta, parent).await
     }
 
+    /// One text or reasoning delta, attributed to `parent` when set.
     async fn emit_text(
         &mut self,
         kind: PartKind,
@@ -1134,12 +1113,13 @@ impl Drive {
             PartKind::Text => EventKind::TextDelta { message_id, text },
             PartKind::Reasoning => EventKind::ReasoningDelta { message_id, text },
         };
-        self.emit(DriverEvent::Event {
-            kind,
-            parent_tool_id: parent,
-            extensions: Extensions::new(),
-        })
-        .await
+        self.events
+            .send(DriverEvent::Event {
+                kind,
+                parent_tool_id: parent,
+                extensions: Extensions::new(),
+            })
+            .await
     }
 
     /// The tool lifecycle from a `tool` part's state. A child's tools ride
@@ -1150,6 +1130,7 @@ impl Drive {
         let name = part["tool"].as_str().unwrap_or_default();
         let state = &part["state"];
         let mut tool = self
+            .scratch
             .tools
             .remove(&call_id)
             .unwrap_or_else(|| fresh_tool(&call_id, name));
@@ -1158,19 +1139,20 @@ impl Drive {
         if parent.is_none()
             && tool.kind == ToolKind::Subagent
             && !done
-            && !self.spawn_order.contains(&call_id)
+            && !self.scratch.spawn_order.contains(&call_id)
         {
-            self.spawn_order.push(call_id.clone());
+            self.scratch.spawn_order.push(call_id.clone());
         }
         if !done {
-            self.tools.insert(call_id, tool.clone());
+            self.scratch.tools.insert(call_id, tool.clone());
         }
-        self.emit(DriverEvent::Event {
-            kind: EventKind::ToolUpdated(tool),
-            parent_tool_id: parent,
-            extensions: Extensions::new(),
-        })
-        .await
+        self.events
+            .send(DriverEvent::Event {
+                kind: EventKind::ToolUpdated(tool),
+                parent_tool_id: parent,
+                extensions: Extensions::new(),
+            })
+            .await
     }
 
     /// The agent's task list is a plan, not a tool call: one snapshot per
@@ -1180,14 +1162,15 @@ impl Drive {
         if part["state"]["status"].as_str() != Some("completed") {
             return Ok(());
         }
-        self.emit(DriverEvent::Event {
-            kind: EventKind::PlanUpdated {
-                entries: plan_entries(&part["state"]["input"]["todos"]),
-            },
-            parent_tool_id: parent,
-            extensions: Extensions::new(),
-        })
-        .await
+        self.events
+            .send(DriverEvent::Event {
+                kind: EventKind::PlanUpdated {
+                    entries: plan_entries(&part["state"]["input"]["todos"], "content"),
+                },
+                parent_tool_id: parent,
+                extensions: Extensions::new(),
+            })
+            .await
     }
 
     /// A step boundary carries the turn's running token and cost totals.
@@ -1209,12 +1192,14 @@ impl Drive {
         if used == 0 {
             return Ok(());
         }
-        self.emit_kind(EventKind::ContextUsage {
-            used_tokens: used,
-            window_tokens: current_model(&self.info).and_then(|m| self.windows.get(&m).copied()),
-            cost_usd: (self.cost > 0.0).then_some(self.cost),
-        })
-        .await
+        self.events
+            .event(EventKind::ContextUsage {
+                used_tokens: used,
+                window_tokens: selected(&self.info, "model")
+                    .and_then(|m| self.windows.get(&m).copied()),
+                cost_usd: (self.cost > 0.0).then_some(self.cost),
+            })
+            .await
     }
 
     /// A permission prompt becomes a request the caller answers.
@@ -1225,6 +1210,7 @@ impl Drive {
         let id = self.request_id();
         let call_id = props["tool"]["callID"].as_str().unwrap_or_default();
         let tool = self
+            .scratch
             .tools
             .get(call_id)
             .cloned()
@@ -1243,7 +1229,7 @@ impl Drive {
             .as_str()
             .unwrap_or(&self.session_id)
             .to_owned();
-        self.requests.insert(
+        self.scratch.requests.insert(
             id,
             Pending {
                 reply: Reply::Permission {
@@ -1253,7 +1239,7 @@ impl Drive {
                 request: request.clone(),
             },
         );
-        self.emit_kind(EventKind::RequestOpened(request)).await
+        self.events.event(EventKind::RequestOpened(request)).await
     }
 
     /// The question tool becomes a question request.
@@ -1273,7 +1259,7 @@ impl Drive {
             id: id.clone(),
             questions,
         });
-        self.requests.insert(
+        self.scratch.requests.insert(
             id,
             Pending {
                 reply: Reply::Question {
@@ -1282,12 +1268,12 @@ impl Drive {
                 request: request.clone(),
             },
         );
-        self.emit_kind(EventKind::RequestOpened(request)).await
+        self.events.event(EventKind::RequestOpened(request)).await
     }
 
     /// Replies to one open request in the shape opencode expects.
     async fn answer(&mut self, request: RequestId, answer: Answer) -> Result<(), Gone> {
-        let Some(pending) = self.requests.remove(&request) else {
+        let Some(pending) = self.scratch.requests.remove(&request) else {
             return Ok(());
         };
         let sent = match (&pending.reply, &answer) {
@@ -1304,7 +1290,7 @@ impl Drive {
                     _ => "reject",
                 };
                 self.http
-                    .post(
+                    .post_quick(
                         &format!("/session/{session_id}/permissions/{permission_id}"),
                         json!({ "response": response }),
                     )
@@ -1312,7 +1298,7 @@ impl Drive {
             }
             (Reply::Question { question_id }, Answer::Question(answers)) => {
                 self.http
-                    .post(
+                    .post_quick(
                         &format!("/question/{question_id}/reply"),
                         json!({ "answers": question_answers(answers) }),
                     )
@@ -1322,8 +1308,8 @@ impl Drive {
             // leave the agent parked on a silently dropped request.
             _ => {
                 let reopened = pending.request.clone();
-                self.requests.insert(request, pending);
-                return self.emit_kind(EventKind::RequestOpened(reopened)).await;
+                self.scratch.requests.insert(request, pending);
+                return self.events.event(EventKind::RequestOpened(reopened)).await;
             }
         };
         match sent {
@@ -1331,11 +1317,12 @@ impl Drive {
             // The agent is still parked on it: report the refusal and reopen
             // the request under the same id so the caller can answer again.
             Err(e) => {
-                self.diagnostic(DiagnosticLevel::Warning, format!("answer not taken: {e}"))
+                self.events
+                    .diagnostic(DiagnosticLevel::Warning, format!("answer not taken: {e}"))
                     .await?;
                 let reopened = pending.request.clone();
-                self.requests.insert(request, pending);
-                self.emit_kind(EventKind::RequestOpened(reopened)).await
+                self.scratch.requests.insert(request, pending);
+                self.events.event(EventKind::RequestOpened(reopened)).await
             }
         }
     }
@@ -1343,6 +1330,7 @@ impl Drive {
     /// `session.idle`: the running turn is really over.
     async fn on_idle(&mut self) -> Result<(), Gone> {
         self.turn = Turn::Idle;
+        self.admit_deadline = None;
         let stop = if std::mem::take(&mut self.aborting) {
             StopReason::Cancelled
         } else {
@@ -1354,29 +1342,20 @@ impl Drive {
         // in time order — a straggler from a bound child closes under its
         // task tool.
         let mut open: Vec<_> = self
+            .scratch
             .messages
             .iter()
-            .filter(|(oc_id, _)| !self.ended.contains(*oc_id))
+            .filter(|(oc_id, _)| !self.scratch.ended.contains(*oc_id))
             .map(|(o, m)| (o.clone(), m.clone()))
             .collect();
         open.sort();
         for (oc_id, message_id) in open {
-            let parent = self.child_messages.get(&oc_id).cloned();
+            let parent = self.scratch.child_messages.get(&oc_id).cloned();
             self.end_message(oc_id, message_id, parent).await?;
         }
-        // A settled turn leaves nothing more for its parts, tools, children,
-        // child bindings, or an unanswered dialog (the engine already closed
-        // the request).
-        self.parts.clear();
-        self.tools.clear();
-        self.messages.clear();
-        self.ended.clear();
-        self.children.clear();
-        self.child_of.clear();
-        self.spawn_order.clear();
-        self.child_messages.clear();
-        self.requests.clear();
-        self.emit(DriverEvent::TurnEnded(stop)).await
+        // The engine already closed any unanswered request.
+        self.scratch = TurnScratch::default();
+        self.events.send(DriverEvent::TurnEnded(stop)).await
     }
 
     /// A session error: a dead credential closes the session; the rest is a
@@ -1385,10 +1364,11 @@ impl Drive {
         let error = &props["error"];
         match error["name"].as_str() {
             Some("ProviderAuthError") => {
-                self.emit(DriverEvent::AuthLost {
-                    login: self.login.clone(),
-                })
-                .await
+                self.events
+                    .send(DriverEvent::AuthLost {
+                        login: self.login.clone(),
+                    })
+                    .await
             }
             // Our own cancel; the aborted message already ends the turn.
             Some("MessageAbortedError") => Ok(()),
@@ -1420,15 +1400,20 @@ impl Drive {
         self.turn_error = None;
         let path = format!("/session/{}/summarize", self.session_id);
         match self.http.post(&path, body).await {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                self.admit_deadline = Some(tokio::time::Instant::now() + ADMIT_TIMEOUT);
+                Ok(())
+            }
             Err(e) => {
                 self.turn = Turn::Idle;
-                self.diagnostic(DiagnosticLevel::Warning, format!("compaction refused: {e}"))
+                self.events
+                    .diagnostic(DiagnosticLevel::Warning, format!("compaction refused: {e}"))
                     .await?;
-                self.emit(DriverEvent::TurnEnded(StopReason::Failed {
-                    message: e.to_string(),
-                }))
-                .await
+                self.events
+                    .send(DriverEvent::TurnEnded(StopReason::Failed {
+                        message: e.to_string(),
+                    }))
+                    .await
             }
         }
     }
@@ -1444,6 +1429,7 @@ impl Drive {
             .ok();
         let Some(anchor) = messages.and_then(|m| user_anchor(&m, turns)) else {
             return self
+                .events
                 .diagnostic(DiagnosticLevel::Warning, "nothing to roll back")
                 .await;
         };
@@ -1457,9 +1443,14 @@ impl Drive {
         match reverted {
             // Nothing advertised changes (the session rewinds in place), but
             // the resulting `SessionUpdated` is the documented confirmation.
-            Ok(_) => self.emit(DriverEvent::InfoChanged(self.info.clone())).await,
+            Ok(_) => {
+                self.events
+                    .send(DriverEvent::InfoChanged(self.info.clone()))
+                    .await
+            }
             Err(e) => {
-                self.diagnostic(DiagnosticLevel::Warning, format!("rollback rejected: {e}"))
+                self.events
+                    .diagnostic(DiagnosticLevel::Warning, format!("rollback rejected: {e}"))
                     .await
             }
         }
@@ -1475,6 +1466,7 @@ impl Drive {
         match id.as_str() {
             "model" if text.split_once('/').is_none() => {
                 return self
+                    .events
                     .diagnostic(
                         DiagnosticLevel::Warning,
                         format!("`{text}` is not a `provider/model` value"),
@@ -1488,7 +1480,8 @@ impl Drive {
             if id.as_str() == "model" {
                 sync_effort(&mut self.info, &self.variants);
             }
-            self.emit(DriverEvent::InfoChanged(self.info.clone()))
+            self.events
+                .send(DriverEvent::InfoChanged(self.info.clone()))
                 .await?;
         }
         Ok(())
@@ -1496,7 +1489,7 @@ impl Drive {
 
     /// The `{providerID, modelID}` body for the advertised model.
     fn model_body(&self) -> Option<Value> {
-        let model = current_model(&self.info)?;
+        let model = selected(&self.info, "model")?;
         let (provider, model) = model.split_once('/')?;
         Some(json!({ "providerID": provider, "modelID": model }))
     }
@@ -1515,6 +1508,7 @@ impl Drive {
     /// busy whose frame was missed, or end the turn rather than hang. A
     /// cancel taken while the prompt sat unadmitted ends it as cancelled.
     async fn check_admission(&mut self) -> Result<(), Gone> {
+        self.admit_deadline = None;
         if self.server_busy().await {
             self.turn = Turn::Busy;
             return Ok(());
@@ -1527,7 +1521,7 @@ impl Drive {
                 message: "opencode took the prompt but never started on it".into(),
             })
         };
-        self.emit(DriverEvent::TurnEnded(stop)).await
+        self.events.send(DriverEvent::TurnEnded(stop)).await
     }
 
     /// Mints the next request id.
@@ -1538,7 +1532,7 @@ impl Drive {
 
     /// The streaming id for an opencode message, minting one on first sight.
     fn message_id(&mut self, oc_id: &str) -> MessageId {
-        if let Some(id) = self.messages.get(oc_id) {
+        if let Some(id) = self.scratch.messages.get(oc_id) {
             return id.clone();
         }
         if oc_id > self.tide.as_str() {
@@ -1546,39 +1540,10 @@ impl Drive {
         }
         self.next_message += 1;
         let id = MessageId::new(format!("m{}", self.next_message));
-        self.messages.insert(oc_id.to_owned(), id.clone());
+        self.scratch.messages.insert(oc_id.to_owned(), id.clone());
         id
     }
-
-    async fn report_exit(&mut self) {
-        let status = self.server.exit_status(CLOSE_GRACE).await;
-        let stderr = self.server.stderr_tail();
-        self.emit(DriverEvent::Exited { status, stderr }).await.ok();
-    }
-
-    async fn diagnostic(
-        &mut self,
-        level: DiagnosticLevel,
-        message: impl Into<String>,
-    ) -> Result<(), Gone> {
-        self.emit_kind(EventKind::Diagnostic(Diagnostic {
-            level,
-            message: message.into(),
-        }))
-        .await
-    }
-
-    async fn emit_kind(&mut self, kind: EventKind) -> Result<(), Gone> {
-        self.emit(DriverEvent::event(kind)).await
-    }
-
-    async fn emit(&mut self, event: DriverEvent) -> Result<(), Gone> {
-        self.events.send(event).await.map_err(|_| Gone)
-    }
 }
-
-/// The engine or the server is gone; the drive task unwinds.
-struct Gone;
 
 /// Sleeps until the admission deadline; pends forever without one.
 async fn admission(deadline: Option<tokio::time::Instant>) {
@@ -1622,7 +1587,7 @@ fn real_title(title: &Value) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Frame decoding
+// FRAME DECODING
 // ---------------------------------------------------------------------------
 
 /// A `/command` prompt split into name and arguments, or `None` for plain text.
@@ -1848,7 +1813,7 @@ fn user_anchor(messages: &Value, turns: u32) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP + SSE over localhost
+// WIRE: HTTP + SSE over localhost
 // ---------------------------------------------------------------------------
 
 /// A minimal HTTP/1.1 client for the local opencode server. Every call is one
@@ -1870,8 +1835,12 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Status reads reconcile turn ends inline in the drive loop, so they get
 /// a much shorter leash.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(3);
+/// Abort and answer POSTs also run inline; a wedged server must not hold
+/// `cancel` or `close` for the full request leash.
+const ACTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Http {
+    /// A GET with the normal leash.
     async fn get(&self, path: &str) -> Result<Value, AgentError> {
         self.request("GET", path, None, Some(HTTP_TIMEOUT)).await
     }
@@ -1881,8 +1850,15 @@ impl Http {
         self.request("GET", path, None, Some(STATUS_TIMEOUT)).await
     }
 
+    /// A JSON POST with the normal leash.
     async fn post(&self, path: &str, body: Value) -> Result<Value, AgentError> {
         self.request("POST", path, Some(body), Some(HTTP_TIMEOUT))
+            .await
+    }
+
+    /// A JSON POST that must answer fast (abort, answers).
+    async fn post_quick(&self, path: &str, body: Value) -> Result<Value, AgentError> {
+        self.request("POST", path, Some(body), Some(ACTION_TIMEOUT))
             .await
     }
 
@@ -1945,6 +1921,9 @@ impl Http {
             None => reader.read_to_end(&mut payload).await.map(|_| ()),
         };
         read.map_err(|e| closed(&e.to_string()))?;
+        if head.chunked {
+            payload = dechunk(&payload);
+        }
         if !(200..300).contains(&status) {
             let detail = String::from_utf8_lossy(&payload);
             return Err(AgentError::ProtocolFailed(format!(
@@ -1952,7 +1931,11 @@ impl Http {
                 detail.trim()
             )));
         }
-        Ok(serde_json::from_slice(&payload).unwrap_or(Value::Null))
+        if payload.iter().all(u8::is_ascii_whitespace) {
+            return Ok(Value::Null);
+        }
+        serde_json::from_slice(&payload)
+            .map_err(|e| AgentError::ProtocolFailed(format!("{method} {path}: bad body: {e}")))
     }
 
     /// A JSON request the server answers and closes.
@@ -2035,6 +2018,27 @@ async fn read_bus(
     }
 }
 
+/// A whole chunked body with the size lines and chunk CRLFs stripped.
+fn dechunk(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(end) = rest.windows(2).position(|w| w == b"\r\n") {
+        let line = String::from_utf8_lossy(&rest[..end]);
+        let size = line.split(';').next().unwrap_or_default().trim();
+        let Ok(size) = usize::from_str_radix(size, 16) else {
+            break;
+        };
+        if size == 0 {
+            break;
+        }
+        rest = &rest[end + 2..];
+        let take = size.min(rest.len());
+        out.extend_from_slice(&rest[..take]);
+        rest = rest.get(take + 2..).unwrap_or_default();
+    }
+    out
+}
+
 /// The status line and headers of a response.
 struct Head {
     status: u16,
@@ -2088,6 +2092,7 @@ struct SseDecoder {
 }
 
 impl SseDecoder {
+    /// An empty decoder; `chunked` says whether HTTP chunk framing wraps the body.
     fn new(chunked: bool) -> Self {
         Self {
             chunked,
@@ -2167,6 +2172,7 @@ fn encode(value: &str) -> String {
     out
 }
 
+/// A connection-level failure as the caller's error.
 fn closed(detail: &str) -> AgentError {
     AgentError::ProtocolFailed(format!("opencode server connection failed: {detail}"))
 }
@@ -2208,6 +2214,15 @@ fn secret() -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn dechunk_joins_chunks_and_ignores_extensions_and_trailers() {
+        let raw = b"5;ext=1\r\n{\"a\":\r\n3\r\n1}\n\r\n0\r\nX-Trailer: y\r\n\r\n";
+        assert_eq!(dechunk(raw), b"{\"a\":1}\n");
+        assert_eq!(dechunk(b"0\r\n\r\n"), b"");
+        // A truncated body keeps what arrived instead of panicking.
+        assert_eq!(dechunk(b"a\r\nshort"), b"short");
+    }
 
     #[test]
     fn sse_decoder_reassembles_frames_split_across_reads() {

@@ -23,11 +23,17 @@ pub(crate) struct Spawn {
     pub env: Vec<(String, String)>,
 }
 
-/// A running agent process. Dropping it kills the direct child.
+/// A running agent process and the process group it leads. Dropping it
+/// without `shutdown` kills the whole group.
 pub(crate) struct Child {
     pub stdin: Option<ChildStdin>,
     pub stdout: Option<ChildStdout>,
     inner: tokio::process::Child,
+    /// The group id, captured at spawn: `id()` is gone once the leader is
+    /// reaped, but workers in the group may still be running.
+    pgid: Option<i32>,
+    /// `shutdown` ran; `Drop` has nothing left to kill.
+    finished: bool,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
     stderr_task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -75,6 +81,8 @@ pub(crate) async fn spawn(spec: Spawn) -> Result<Child, AgentError> {
     Ok(Child {
         stdin: child.stdin.take(),
         stdout: child.stdout.take(),
+        pgid: child.id().map(|pid| pid as i32),
+        finished: false,
         inner: child,
         stderr_tail,
         stderr_task,
@@ -105,13 +113,13 @@ impl Child {
         }
     }
 
-    /// SIGTERM, then SIGKILL when the grace period expires.
+    /// SIGTERM to the group, then SIGKILL when the grace period expires.
     pub async fn shutdown(&mut self, grace: Duration) {
         #[cfg(unix)]
-        let terminated = match self.inner.id() {
-            Some(pid) => {
+        let terminated = match self.pgid {
+            Some(pgid) => {
                 // Negative pid signals the whole group; the child leads its own.
-                unsafe { libc::kill(-(pid as i32), libc::SIGTERM) };
+                unsafe { libc::kill(-pgid, libc::SIGTERM) };
                 tokio::time::timeout(grace, self.inner.wait()).await.is_ok()
             }
             None => false,
@@ -119,17 +127,33 @@ impl Child {
         #[cfg(not(unix))]
         let terminated = false;
         if !terminated {
-            #[cfg(unix)]
-            if let Some(pid) = self.inner.id() {
-                unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-            }
+            self.kill_group();
             let _ = self.inner.kill().await;
         }
+        self.finished = true;
         // The reader ends at stderr EOF; joining it here makes `stderr_tail`
         // complete for error reports (a child that dies at spawn can lose the
         // race between its last lines and the caller reading the tail).
         if let Some(task) = self.stderr_task.take() {
             let _ = tokio::time::timeout(grace, task).await;
+        }
+    }
+}
+
+impl Child {
+    /// SIGKILL to the group; harmless when it is already gone.
+    fn kill_group(&self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid {
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        }
+    }
+}
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.kill_group();
         }
     }
 }
@@ -152,6 +176,7 @@ fn compose_path(exec_path: &Path, own: Option<&str>, login: Option<&str>) -> Str
     out.join(":")
 }
 
+/// The entries of a PATH string, empty ones included (callers filter).
 fn split_path(path: Option<&str>) -> impl Iterator<Item = String> + '_ {
     path.unwrap_or_default().split(':').map(str::to_owned)
 }

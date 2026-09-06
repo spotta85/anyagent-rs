@@ -11,8 +11,9 @@ use crate::event::{Diagnostic, DiagnosticLevel};
 use crate::process::login_shell_path;
 use crate::runtime::{DiscoveryReport, MissingAgent};
 
-/// Scans every profile: env override, then the search dirs, then the login
-/// markers of whatever was found.
+/// Scans every profile concurrently: env override, then the search dirs,
+/// then the login markers of whatever was found. Report order follows the
+/// catalog.
 pub(crate) async fn discover(profiles: &[AgentProfile]) -> DiscoveryReport {
     let mut report = DiscoveryReport {
         agents: Vec::new(),
@@ -27,28 +28,43 @@ pub(crate) async fn discover(profiles: &[AgentProfile]) -> DiscoveryReport {
         .unwrap_or_default();
     let path = std::env::var("PATH").ok();
     let login = login_shell_path().await;
-    for profile in profiles {
-        if let Some(exe) = env_override(profile, &mut report.diagnostics) {
-            let agent = installation(profile, exe, InstallationSource::EnvOverride, &home).await;
-            report.agents.push(agent);
-            continue;
+    let scans = profiles
+        .iter()
+        .map(|profile| scan(profile, &home, path.as_deref(), login.as_deref()));
+    for (found, diagnostics) in futures::future::join_all(scans).await {
+        match found {
+            Ok(agent) => report.agents.push(agent),
+            Err(missing) => report.missing.push(missing),
         }
-        let dirs = search_dirs(profile, &home, path.as_deref(), login.as_deref());
-        match resolve(profile.cli, &dirs) {
-            Some((exe, source)) => {
-                report
-                    .agents
-                    .push(installation(profile, exe, source, &home).await);
-            }
-            None => report.missing.push(MissingAgent {
-                id: AgentId::new(profile.id),
-                name: profile.name.into(),
-                searched: dirs.into_iter().map(|(dir, _)| dir).collect(),
-                install_hint: profile.install_hint.into(),
-            }),
-        }
+        report.diagnostics.extend(diagnostics);
     }
     report
+}
+
+/// One profile's scan: the installation or the missing record, plus any
+/// diagnostics raised on the way.
+async fn scan(
+    profile: &AgentProfile,
+    home: &Path,
+    path: Option<&str>,
+    login: Option<&str>,
+) -> (Result<AgentInstallation, MissingAgent>, Vec<Diagnostic>) {
+    let mut diagnostics = Vec::new();
+    if let Some(exe) = env_override(profile, &mut diagnostics) {
+        let agent = installation(profile, exe, InstallationSource::EnvOverride, home).await;
+        return (Ok(agent), diagnostics);
+    }
+    let dirs = search_dirs(profile, home, path, login);
+    let found = match resolve(profile.cli, &dirs) {
+        Some((exe, source)) => Ok(installation(profile, exe, source, home).await),
+        None => Err(MissingAgent {
+            id: AgentId::new(profile.id),
+            name: profile.name.into(),
+            searched: dirs.into_iter().map(|(dir, _)| dir).collect(),
+            install_hint: profile.install_hint.into(),
+        }),
+    };
+    (found, diagnostics)
 }
 
 /// The executable named by the profile's env var, when set and valid.
@@ -166,6 +182,7 @@ fn version_key(name: &str) -> Vec<u64> {
         .collect()
 }
 
+/// The non-empty directories of a PATH string.
 fn split_path(path: Option<&str>) -> impl Iterator<Item = PathBuf> + '_ {
     path.unwrap_or_default()
         .split(':')
@@ -173,6 +190,7 @@ fn split_path(path: Option<&str>) -> impl Iterator<Item = PathBuf> + '_ {
         .map(PathBuf::from)
 }
 
+/// A regular file with an execute bit (any file on non-unix).
 fn is_executable(path: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -187,6 +205,7 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
+/// One found executable as an installation, with its offline auth state.
 async fn installation(
     profile: &AgentProfile,
     executable: PathBuf,
@@ -271,6 +290,7 @@ async fn keychain_present(service: &str) -> bool {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .kill_on_drop(true)
         .status();
     tokio::time::timeout(std::time::Duration::from_secs(2), status)
         .await

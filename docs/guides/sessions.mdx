@@ -173,7 +173,7 @@ session.configure("effort", "high").await?;
 
 | Agent | Where the choices come from | Live |
 |---|---|---|
-| Claude | the model's `supportedEffortLevels` | no, creation-only |
+| Claude | the model's `supportedEffortLevels` | yes |
 | Codex | its model catalog, sent with the next turn | yes |
 | opencode | the model's `variants`, sent as `variant` with every prompt | yes |
 | grok | the model's `reasoningEfforts`, with grok's labels, set through `set_model` | yes |

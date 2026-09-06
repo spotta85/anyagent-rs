@@ -28,12 +28,22 @@ pub(crate) struct Inline {
     pub base64: String,
 }
 
-/// Reads each attachment; sniffs images and encodes those under the cap.
+/// Reads each attachment under the cap; sniffs images and encodes them.
+/// Larger files are never read: they ride as path refs only.
 pub(crate) async fn load(paths: &[PathBuf]) -> Vec<Loaded> {
     let mut loaded = Vec::with_capacity(paths.len());
     for path in paths {
         let absolute = std::path::absolute(path).unwrap_or_else(|_| path.clone());
         let path = absolute.display().to_string();
+        let size = tokio::fs::metadata(&absolute).await.map(|m| m.len());
+        if size.is_ok_and(|n| n > INLINE_CAP as u64) {
+            loaded.push(Loaded {
+                path,
+                image: None,
+                problem: None,
+            });
+            continue;
+        }
         match tokio::fs::read(&absolute).await {
             Ok(bytes) => loaded.push(Loaded {
                 path,

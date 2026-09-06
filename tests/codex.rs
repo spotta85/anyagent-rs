@@ -113,14 +113,17 @@ async fn handshake_reports_auth_version_options_and_token() {
     assert_eq!(info.resume_token.as_ref().unwrap().as_str(), "th-1");
 
     let caps = &info.details.capabilities;
-    for cap in [Capability::Steer, Capability::Fork, Capability::PlanUsage] {
-        assert!(caps.supports(cap.clone()), "missing {cap:?}");
-    }
     for cap in [
-        Capability::Questions,
+        Capability::Steer,
+        Capability::Fork,
+        Capability::PlanUsage,
         Capability::Rollback,
         Capability::Images,
     ] {
+        assert!(caps.supports(cap.clone()), "missing {cap:?}");
+    }
+    // Questions need codex's collaboration mode, which is not wired yet.
+    for cap in [Capability::Questions, Capability::RollbackFiles] {
         assert!(!caps.supports(cap.clone()), "over-advertised {cap:?}");
     }
 
@@ -512,8 +515,8 @@ async fn creation_config_is_validated_before_the_wire_sees_it() {
 
 /// Mode/sandbox are creation-only; mid-session configure refused typed.
 #[tokio::test]
-async fn mode_and_sandbox_are_creation_only_thread_settings() {
-    let (session, _events) = open_with(
+async fn mode_and_sandbox_are_live_and_ride_every_turn() {
+    let (session, mut events) = open_with(
         "mode",
         "",
         SessionOptions::in_dir(std::env::temp_dir())
@@ -528,9 +531,26 @@ async fn mode_and_sandbox_are_creation_only_thread_settings() {
         text_option(&info, "sandbox").as_deref(),
         Some("workspace-write")
     );
-    // Not live: a mid-session change is refused by the engine.
-    let err = session.configure("mode", "never").await.err().unwrap();
-    assert!(matches!(err, AgentError::InvalidConfiguration(_)), "{err}");
+    session.prompt("hi").await.unwrap();
+    let text = complete_turn(&session, &mut events, PermissionChoice::AllowOnce).await;
+    assert!(
+        text.contains("policy=untrusted sandbox=workspaceWrite"),
+        "{text}"
+    );
+    // Live: `turn/start` carries `approvalPolicy` and `sandboxPolicy`.
+    session.configure("mode", "never").await.unwrap();
+    session.configure("sandbox", "read-only").await.unwrap();
+    loop {
+        if let EventKind::SessionUpdated(info) = next(&mut events).await.kind
+            && text_option(&info, "sandbox").as_deref() == Some("read-only")
+        {
+            assert_eq!(text_option(&info, "mode").as_deref(), Some("never"));
+            break;
+        }
+    }
+    session.prompt("again").await.unwrap();
+    let text = complete_turn(&session, &mut events, PermissionChoice::AllowOnce).await;
+    assert!(text.contains("policy=never sandbox=readOnly"), "{text}");
     session.close().await.unwrap();
 }
 
@@ -741,8 +761,10 @@ async fn plan_usage_probe_reads_the_windows() {
 /// requestUserInput question translates both ways even though capability not advertised.
 #[tokio::test]
 async fn a_question_request_translates_both_ways() {
-    // `requestUserInput` is schema-confirmed but unobserved live (ticket 10):
-    // the translation exists even though the capability is not advertised.
+    // `requestUserInput` fires only for clients that opt into the
+    // experimental API on `initialize` (the fixture answers `noapi`
+    // otherwise) and, live, only in collaboration mode — so the capability
+    // stays off while the translation is exercised here.
     let (session, mut events) = open("question", "--question").await;
     session.prompt("hi").await.unwrap();
     let mut text = String::new();
@@ -771,19 +793,107 @@ async fn a_question_request_translates_both_ways() {
     session.close().await.unwrap();
 }
 
-/// MCP forwarding refused typed UnsupportedFeature.
+/// MCP servers ride `-c mcp_servers.…` launch overrides; SSE is refused.
 #[tokio::test]
-async fn mcp_forwarding_is_refused_typed() {
-    let err = open_with(
+async fn mcp_servers_ride_the_launch_config() {
+    let (session, mut events) = open_with(
         "mcp",
         "",
         SessionOptions::in_dir(std::env::temp_dir())
-            .mcp_server(McpServer::http("docs", "http://localhost:1")),
+            .mcp_server(McpServer::http("docs", "http://localhost:1").with("X-Key", "k"))
+            .mcp_server(McpServer::stdio("tool", "/bin/tool", ["--serve"])),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        session.info().details.capabilities.mcp_transports,
+        vec![anyagent::McpTransport::Stdio, anyagent::McpTransport::Http]
+    );
+    session.prompt("hi").await.unwrap();
+    let text = complete_turn(&session, &mut events, PermissionChoice::AllowOnce).await;
+    assert!(text.contains("mcp=docs,tool"), "{text}");
+    session.close().await.unwrap();
+
+    let err = open_with(
+        "mcp-sse",
+        "",
+        SessionOptions::in_dir(std::env::temp_dir())
+            .mcp_server(McpServer::sse("voice", "http://localhost:2")),
     )
     .await
     .err()
     .unwrap();
     assert!(matches!(err, AgentError::UnsupportedFeature(_)), "{err}");
+}
+
+/// `thread/revert {beforeTurnId}` cuts the conversation before the kept
+/// turn; `SessionUpdated` confirms it, a cut deeper than the history is a
+/// warning, and the files scope stays refused.
+#[tokio::test]
+async fn rollback_drops_turns_and_confirms_with_session_updated() {
+    use std::num::NonZeroU32;
+    let (session, mut events) = open("rollback", "").await;
+    for prompt in ["one", "two"] {
+        session.prompt(prompt).await.unwrap();
+        complete_turn(&session, &mut events, PermissionChoice::AllowOnce).await;
+    }
+    session
+        .rollback(
+            NonZeroU32::new(1).unwrap(),
+            anyagent::RollbackScope::Conversation,
+        )
+        .await
+        .unwrap();
+    loop {
+        if let EventKind::SessionUpdated(_) = next(&mut events).await.kind {
+            break;
+        }
+    }
+    session.prompt("three").await.unwrap();
+    let text = complete_turn(&session, &mut events, PermissionChoice::AllowOnce).await;
+    assert!(text.contains("rolled=1"), "{text}");
+    session
+        .rollback(
+            NonZeroU32::new(9).unwrap(),
+            anyagent::RollbackScope::Conversation,
+        )
+        .await
+        .unwrap();
+    loop {
+        if let EventKind::Diagnostic(d) = next(&mut events).await.kind
+            && d.message.contains("rollback(9) rejected")
+        {
+            break;
+        }
+    }
+    let err = session
+        .rollback(
+            NonZeroU32::new(1).unwrap(),
+            anyagent::RollbackScope::ConversationAndFiles,
+        )
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(err, AgentError::UnsupportedFeature(_)), "{err}");
+    session.close().await.unwrap();
+}
+
+/// The server's own rename lands as the session title.
+#[tokio::test]
+async fn a_thread_rename_updates_the_title() {
+    let (session, mut events) = open("rename", "--rename").await;
+    assert_eq!(session.info().title, None);
+    session.prompt("hi").await.unwrap();
+    complete_turn(&session, &mut events, PermissionChoice::AllowOnce).await;
+    loop {
+        if let EventKind::SessionUpdated(info) = next(&mut events).await.kind
+            && info.title.is_some()
+        {
+            assert_eq!(info.title.as_deref(), Some("Pear talk"));
+            break;
+        }
+    }
+    session.close().await.unwrap();
 }
 
 /// Config_home creates directory and reaches child as CODEX_HOME; turn echoes cfg path.
@@ -806,19 +916,25 @@ async fn config_home_reaches_the_child_and_is_created() {
     session.close().await.unwrap();
 }
 
-/// Attachments ride as path refs (ref count in wire).
+/// Every attachment rides as a path ref; images also ride as `localImage`.
 #[tokio::test]
-async fn attachments_ride_as_path_refs() {
+async fn attachments_ride_as_path_refs_and_images_as_local_image_items() {
     let dir = std::env::temp_dir().join(format!("anyagent-codex-att-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("report.pdf"), b"%PDF-1.7 data").unwrap();
+    std::fs::write(dir.join("shot.png"), b"\x89PNG\r\n\x1a\ndata").unwrap();
     let (session, mut events) = open("attach", "").await;
     session
-        .prompt(Input::text("look at this").attach(dir.join("report.pdf")))
+        .prompt(
+            Input::text("look at this")
+                .attach(dir.join("report.pdf"))
+                .attach(dir.join("shot.png")),
+        )
         .await
         .unwrap();
     let text = complete_turn(&session, &mut events, PermissionChoice::AllowOnce).await;
     assert!(text.contains("ref=1"), "{text}");
+    assert!(text.contains("images=1"), "{text}");
     session.close().await.unwrap();
 }
 
