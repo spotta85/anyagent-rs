@@ -703,7 +703,8 @@ async fn logged_out_is_reported_and_the_first_turn_surfaces_auth_required() {
     assert!(failed);
 }
 
-/// Resume keeps thread id; fork at fork_point creates new id with correct fork anchor.
+/// Resume keeps the thread id and its turn history (a rollback can cut into
+/// it); fork at fork_point creates a new id with the right anchor.
 #[tokio::test]
 async fn resume_keeps_the_thread_and_fork_cuts_at_the_anchor() {
     let (session, mut events) = open("resume-src", "").await;
@@ -712,7 +713,7 @@ async fn resume_keeps_the_thread_and_fork_cuts_at_the_anchor() {
     let token = session.info().resume_token.unwrap();
     session.close().await.unwrap();
 
-    let (resumed, _events) = open_with(
+    let (resumed, mut events) = open_with(
         "resume",
         "",
         SessionOptions::in_dir(std::env::temp_dir()).resume(token.clone()),
@@ -720,6 +721,21 @@ async fn resume_keeps_the_thread_and_fork_cuts_at_the_anchor() {
     .await
     .unwrap();
     assert_eq!(resumed.info().resume_token.unwrap(), token);
+    resumed
+        .rollback(
+            std::num::NonZeroU32::new(1).unwrap(),
+            anyagent::RollbackScope::Conversation,
+        )
+        .await
+        .unwrap();
+    loop {
+        if let EventKind::SessionUpdated(_) = next(&mut events).await.kind {
+            break;
+        }
+    }
+    resumed.prompt("hi").await.unwrap();
+    let text = complete_turn(&resumed, &mut events, PermissionChoice::AllowOnce).await;
+    assert!(text.contains("rolled=1"), "{text}");
     resumed.close().await.unwrap();
 
     // Fork at a wire turn id (the `codex/fork_point` extension currency).

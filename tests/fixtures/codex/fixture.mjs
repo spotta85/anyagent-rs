@@ -109,7 +109,8 @@ async function onRequest(m) {
       return reply(threadResult(m.params));
     case 'thread/resume':
       THREAD.id = m.params.threadId;
-      return reply(threadResult(m.params));
+      turnIds.push('turn-prev'); // the thread's history rides the bind
+      return reply({ ...threadResult(m.params), thread: { ...THREAD, turns: [{ id: 'turn-prev' }] } });
     case 'thread/fork':
       THREAD.id = 'th-fork-1';
       THREAD.forkPoint = m.params.lastTurnId ?? null;

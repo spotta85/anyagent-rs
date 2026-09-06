@@ -1913,17 +1913,15 @@ impl Http {
             .map_err(|e| closed(&e.to_string()))?;
         let status = head.status;
         let mut payload = Vec::new();
-        let read = match head.length {
-            Some(n) => {
+        let read = match (head.chunked, head.length) {
+            (true, _) => read_chunked(&mut reader, &mut payload).await,
+            (false, Some(n)) => {
                 payload.resize(n, 0);
                 reader.read_exact(&mut payload).await.map(|_| ())
             }
-            None => reader.read_to_end(&mut payload).await.map(|_| ()),
+            (false, None) => reader.read_to_end(&mut payload).await.map(|_| ()),
         };
         read.map_err(|e| closed(&e.to_string()))?;
-        if head.chunked {
-            payload = dechunk(&payload);
-        }
         if !(200..300).contains(&status) {
             let detail = String::from_utf8_lossy(&payload);
             return Err(AgentError::ProtocolFailed(format!(
@@ -2018,25 +2016,37 @@ async fn read_bus(
     }
 }
 
-/// A whole chunked body with the size lines and chunk CRLFs stripped.
-fn dechunk(raw: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(raw.len());
-    let mut rest = raw;
-    while let Some(end) = rest.windows(2).position(|w| w == b"\r\n") {
-        let line = String::from_utf8_lossy(&rest[..end]);
+/// Reads a chunked body up to its terminal chunk, so a kept-open socket
+/// never stalls the request. Chunk extensions and trailers are skipped.
+async fn read_chunked<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    out: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).await? == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        }
         let size = line.split(';').next().unwrap_or_default().trim();
-        let Ok(size) = usize::from_str_radix(size, 16) else {
-            break;
-        };
+        let size =
+            usize::from_str_radix(size, 16).map_err(|_| std::io::Error::other("bad chunk size"))?;
         if size == 0 {
             break;
         }
-        rest = &rest[end + 2..];
-        let take = size.min(rest.len());
-        out.extend_from_slice(&rest[..take]);
-        rest = rest.get(take + 2..).unwrap_or_default();
+        let start = out.len();
+        out.resize(start + size, 0);
+        reader.read_exact(&mut out[start..]).await?;
+        line.clear();
+        reader.read_line(&mut line).await?; // the chunk's own CRLF
     }
-    out
+    // Trailers end at a blank line.
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).await? == 0 || line.trim_end().is_empty() {
+            return Ok(());
+        }
+    }
 }
 
 /// The status line and headers of a response.
@@ -2215,13 +2225,20 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    #[test]
-    fn dechunk_joins_chunks_and_ignores_extensions_and_trailers() {
-        let raw = b"5;ext=1\r\n{\"a\":\r\n3\r\n1}\n\r\n0\r\nX-Trailer: y\r\n\r\n";
-        assert_eq!(dechunk(raw), b"{\"a\":1}\n");
-        assert_eq!(dechunk(b"0\r\n\r\n"), b"");
-        // A truncated body keeps what arrived instead of panicking.
-        assert_eq!(dechunk(b"a\r\nshort"), b"short");
+    #[tokio::test]
+    async fn read_chunked_stops_at_the_terminal_chunk_and_skips_extensions_and_trailers() {
+        let raw: &[u8] = b"5;ext=1\r\n{\"a\":\r\n3\r\n1}\n\r\n0\r\nX-Trailer: y\r\n\r\nnext";
+        let mut reader = BufReader::new(raw);
+        let mut out = Vec::new();
+        read_chunked(&mut reader, &mut out).await.unwrap();
+        assert_eq!(out, b"{\"a\":1}\n");
+        // The socket stays readable past the terminal chunk.
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).await.unwrap();
+        assert_eq!(rest, b"next");
+        let mut out = Vec::new();
+        let truncated = read_chunked(&mut BufReader::new(&b"a\r\nshort"[..]), &mut out).await;
+        assert!(truncated.is_err());
     }
 
     #[test]

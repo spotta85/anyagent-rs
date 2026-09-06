@@ -979,6 +979,14 @@ impl Drive {
                 if let ("model", ConfigValue::Text(model)) = (config_id.as_str(), &value) {
                     let effort = selected(&self.info, "effort");
                     set_effort_option(&mut self.info, effort_levels(&self.models, model), effort);
+                    // The relaunch options must not revive a dropped effort.
+                    self.request
+                        .options
+                        .configure
+                        .retain(|(key, _)| key.as_str() != "effort");
+                    if let Some(effort) = selected(&self.info, "effort") {
+                        self.remember_option(ConfigId::new("effort"), ConfigValue::Text(effort));
+                    }
                     set_fast_option(
                         &mut self.info,
                         supports_fast(&self.models, model).then_some(requested_fast(&self.request)),

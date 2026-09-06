@@ -101,9 +101,15 @@ impl Child {
         tail.iter().cloned().collect::<Vec<_>>().join("\n")
     }
 
-    /// Waits for the child and stderr reader for at most `grace` each.
+    /// Waits for the child and stderr reader for at most `grace` each. A
+    /// leader that already died takes its workers with it; once reaped, the
+    /// pgid may be recycled, so `Drop` must not signal it again.
     pub async fn exit_status(&mut self, grace: Duration) -> String {
+        if !self.is_running() {
+            self.kill_group();
+        }
         let status = tokio::time::timeout(grace, self.inner.wait()).await;
+        self.finished = matches!(status, Ok(Ok(_)));
         if let Some(task) = self.stderr_task.take() {
             let _ = tokio::time::timeout(grace, task).await;
         }

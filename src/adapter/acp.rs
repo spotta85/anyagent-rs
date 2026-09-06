@@ -987,15 +987,20 @@ impl Drive {
             }
             U::ConfigOptionUpdate(update) => {
                 // The wire replaces its own options; `mode` (from the mode
-                // state) and kiro's synthesized `effort` are ours to keep.
+                // state), first-class `model`/`effort` (from `models`), and
+                // kiro's synthesized `effort` are ours to keep.
+                let first_class = self.first_class_model;
+                let ours = move |id: &str| {
+                    id == "mode" || (first_class && matches!(id, "model" | "effort"))
+                };
                 self.info
                     .details
                     .config_options
-                    .retain(|o| o.id.as_str() == "mode");
+                    .retain(|o| ours(o.id.as_str()));
                 self.info
                     .configuration
                     .options
-                    .retain(|id, _| id.as_str() == "mode");
+                    .retain(|id, _| ours(id.as_str()));
                 apply_session_config(&mut self.info, None, Some(&update.config_options));
                 if self.kiro {
                     sync_effort(&mut self.info);

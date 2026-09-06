@@ -25,7 +25,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const FORK_AT = (process.argv.find((a) => a.startsWith('--resume-session-at=')) ?? '').slice(20) || null;
 const S = flag('--fork-session') ? 'sess-fork-1' : 'sess-c1';
 if (flag('--echo-relaunch')) appendFileSync('launches.jsonl', JSON.stringify(process.argv) + '\n');
-let recalled = flag('--echo-relaunch') && flag('--resume') ? JSON.parse(readFileSync('history.json', 'utf8')) : [];
+let recalled = flag('--echo-relaunch') && flag('--resume') && existsSync('history.json') ? JSON.parse(readFileSync('history.json', 'utf8')) : [];
 let n = 0;
 const uid = () => `f${n++}`;
 const USAGE = { input_tokens: 2, cache_creation_input_tokens: 198, cache_read_input_tokens: 1000, output_tokens: 0 };

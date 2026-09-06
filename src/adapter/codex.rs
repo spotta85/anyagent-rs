@@ -61,7 +61,7 @@ impl Adapter for CodexAdapter {
         let (ev_tx, ev_rx) = mpsc::channel(FRAME_BUFFER);
         let events = Emitter::new(ev_tx);
         let recorder = WireRecorder::for_session(&request.options, &events).await;
-        let (child, wire, info, models, thread_id) = launch(&request, recorder).await?;
+        let (child, wire, info, models, thread_id, turns) = launch(&request, recorder).await?;
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         tokio::spawn(
             Drive {
@@ -72,7 +72,7 @@ impl Adapter for CodexAdapter {
                 models,
                 thread_id,
                 turn: None,
-                turns: Vec::new(),
+                turns,
                 turn_started: false,
                 pending_steer: None,
                 cancel_pending: false,
@@ -198,7 +198,7 @@ fn mcp_overrides(servers: &[McpServer]) -> Result<Vec<String>, AgentError> {
 async fn launch(
     request: &ConnectRequest,
     recorder: Option<WireRecorder>,
-) -> Result<(process::Child, Wire, DriverInfo, Value, String), AgentError> {
+) -> Result<(process::Child, Wire, DriverInfo, Value, String, Vec<String>), AgentError> {
     let env = crate::adapter::config_home_env(&request.installation, &request.options)?;
     // CODEX_HOME must already exist or the server exits at startup
     // (probed 2026-08-27).
@@ -218,7 +218,9 @@ async fn launch(
     .await?;
     let mut wire = Wire::over(&mut child, recorder);
     match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut wire, request)).await {
-        Ok(Ok((info, models, thread_id))) => Ok((child, wire, info, models, thread_id)),
+        Ok(Ok((info, models, thread_id, turns))) => {
+            Ok((child, wire, info, models, thread_id, turns))
+        }
         Ok(Err(e)) => {
             let e = with_stderr(e, &child);
             child.shutdown(CLOSE_GRACE).await;
@@ -236,7 +238,7 @@ async fn launch(
 async fn handshake(
     wire: &mut Wire,
     request: &ConnectRequest,
-) -> Result<(DriverInfo, Value, String), AgentError> {
+) -> Result<(DriverInfo, Value, String, Vec<String>), AgentError> {
     let init = wire
         .roundtrip("initialize", initialize_params())
         .await
@@ -266,7 +268,14 @@ async fn handshake(
     let info = driver_info(
         &init, &account, &models, &thread, &config, commands, request,
     );
-    Ok((info, models, thread_id))
+    // A resumed or forked thread brings its turn ids; rollback cuts into them.
+    let turns = thread["thread"]["turns"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|turn| turn["id"].as_str().map(str::to_owned))
+        .collect();
+    Ok((info, models, thread_id, turns))
 }
 
 /// Skills are codex's slash commands. `data` groups them by root and the same
