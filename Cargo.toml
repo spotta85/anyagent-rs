@@ -16,6 +16,11 @@ exclude = ["docs/", "image.png"]
 [workspace]
 exclude = ["spikes/s0-acp"]
 
+[features]
+# `Runtime::with_mock` and `anyagent::mock`: the real engine over a scripted
+# agent, for testing an app without a subprocess.
+mock = []
+
 [dependencies]
 agent-client-protocol-schema = { version = "1.7", default-features = false }
 async-trait = "0.1"

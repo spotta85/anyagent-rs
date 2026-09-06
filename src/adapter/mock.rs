@@ -1,5 +1,7 @@
 //! In-process scripted adapter. Plays a script of steps per turn so the
 //! engine and the public interface can be tested without a subprocess.
+//! Public behind the `mock` feature: `Runtime::with_mock(script)` gives an
+//! app the real engine over a scripted agent.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -24,7 +26,7 @@ use crate::event::{
 #[derive(Debug, Clone)]
 // Test scripts favor direct event construction over per-step heap allocation.
 #[allow(clippy::large_enum_variant)]
-pub(crate) enum Step {
+pub enum Step {
     Emit(EventKind),
     /// Pause until the engine forwards an `Answer`.
     AwaitAnswer,
@@ -35,13 +37,17 @@ pub(crate) enum Step {
 
 /// What the mock agent will do, turn by turn.
 #[derive(Debug, Clone)]
-pub(crate) struct Script {
+pub struct Script {
     /// Each `StartTurn` pops the next list. An exhausted script hangs.
     pub turns: VecDeque<Vec<Step>>,
     /// Advertise steering.
     pub steer: bool,
     /// Reject every steer (to exercise the requeue-at-head rule).
     pub steer_rejects: bool,
+    /// Answer steers at all; `false` leaves them pending forever.
+    pub steer_ack: bool,
+    /// Keep running after `Close`, like a wedged adapter.
+    pub ignore_close: bool,
     /// The wire ends prompted turns itself.
     pub deterministic: bool,
     /// Same for agent-originated turns.
@@ -62,6 +68,8 @@ impl Default for Script {
             turns: VecDeque::new(),
             steer: false,
             steer_rejects: false,
+            steer_ack: true,
+            ignore_close: false,
             deterministic: true,
             deterministic_agent: true,
             buffer: 64,
@@ -73,21 +81,22 @@ impl Default for Script {
 }
 
 impl Script {
-    pub(crate) fn turn(mut self, steps: Vec<Step>) -> Self {
+    /// Appends one turn's steps.
+    pub fn turn(mut self, steps: Vec<Step>) -> Self {
         self.turns.push_back(steps);
         self
     }
 }
 
-pub(crate) struct MockAdapter {
+pub struct MockAdapter {
     script: Script,
-    #[allow(dead_code)]
     /// Driver events delivered so far, for backpressure assertions.
     sent: Arc<AtomicUsize>,
 }
 
 impl MockAdapter {
-    pub(crate) fn new(script: Script) -> Self {
+    /// An adapter that plays `script`.
+    pub fn new(script: Script) -> Self {
         Self {
             script,
             sent: Arc::new(AtomicUsize::new(0)),
@@ -95,7 +104,7 @@ impl MockAdapter {
     }
 
     /// One turn: text, a permission request, more text after the answer, done.
-    pub(crate) fn permission_flow() -> Self {
+    pub fn permission_flow() -> Self {
         Self::new(Script::default().turn(vec![
             Step::Emit(text("m1", "Let me check. ")),
             Step::Emit(permission("r1")),
@@ -105,8 +114,8 @@ impl MockAdapter {
         ]))
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn sent(&self) -> Arc<AtomicUsize> {
+    /// Driver events delivered so far, for backpressure assertions.
+    pub fn sent(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.sent)
     }
 }
@@ -114,7 +123,7 @@ impl MockAdapter {
 #[async_trait]
 impl Adapter for MockAdapter {
     async fn connect(&self, _request: ConnectRequest) -> Result<DriverConnection, AgentError> {
-        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (ev_tx, ev_rx) = mpsc::channel(self.script.buffer);
         tokio::spawn(drive(
             self.script.clone(),
@@ -134,7 +143,7 @@ impl Adapter for MockAdapter {
 /// services the next engine command.
 async fn drive(
     mut script: Script,
-    mut commands: mpsc::Receiver<DriverCommand>,
+    mut commands: mpsc::UnboundedReceiver<DriverCommand>,
     events: mpsc::Sender<DriverEvent>,
     sent: Arc<AtomicUsize>,
 ) {
@@ -187,7 +196,9 @@ async fn drive(
                 turn_open = true;
             }
             DriverCommand::Steer { .. } => {
-                if !send(DriverEvent::Steered(script.steer && !script.steer_rejects)).await {
+                if script.steer_ack
+                    && !send(DriverEvent::Steered(script.steer && !script.steer_rejects)).await
+                {
                     return;
                 }
             }
@@ -211,6 +222,7 @@ async fn drive(
                 }
             }
             DriverCommand::Cancel | DriverCommand::Configure(..) | DriverCommand::Rollback(..) => {}
+            DriverCommand::Close if script.ignore_close => {}
             DriverCommand::Close => return,
         }
     }
@@ -243,19 +255,22 @@ fn info(script: &Script) -> DriverInfo {
         title: None,
         deterministic_turn_end: script.deterministic,
         deterministic_agent_turn_end: script.deterministic_agent,
+        tools_disabled: false,
     }
 }
 
 // Event builders shared with the conformance tests.
 
-pub(crate) fn text(message: &str, text: &str) -> EventKind {
+/// A text delta on `message`.
+pub fn text(message: &str, text: &str) -> EventKind {
     EventKind::TextDelta {
         message_id: MessageId::new(message),
         text: text.into(),
     }
 }
 
-pub(crate) fn tool(id: &str, status: ToolStatus) -> EventKind {
+/// A `cargo test` execute tool in the given state.
+pub fn tool(id: &str, status: ToolStatus) -> EventKind {
     EventKind::ToolUpdated(ToolUpdate {
         id: ToolId::new(id),
         kind: ToolKind::Execute,
@@ -272,7 +287,8 @@ pub(crate) fn tool(id: &str, status: ToolStatus) -> EventKind {
     })
 }
 
-pub(crate) fn permission(id: &str) -> EventKind {
+/// A permission request for the tool above, offering allow-once and deny-once.
+pub fn permission(id: &str) -> EventKind {
     let EventKind::ToolUpdated(tool) = tool("tool-1", ToolStatus::Pending) else {
         unreachable!()
     };
@@ -284,7 +300,8 @@ pub(crate) fn permission(id: &str) -> EventKind {
     }))
 }
 
-pub(crate) fn completed() -> StopReason {
+/// A protocol-ended completion.
+pub fn completed() -> StopReason {
     StopReason::Completed {
         source: CompletionSource::Protocol,
     }

@@ -4,6 +4,11 @@
 //! and events out. Turn end is deterministic: `agent_settled` is the only
 //! frame that means no retry, compaction, or queued continuation is still
 //! coming (`agent_end` fires per low-level run). The engine owns turn rules.
+//!
+//! High level: `connect` → `launch` (spawn + `handshake`: state, catalogs,
+//! auth and version side processes) → `driver_info`; then `Drive::run`
+//! turns commands into RPC commands (`handle_command`) and events into
+//! ours (`handle_frame`, `on_*`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -15,8 +20,9 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::adapter::{
-    Adapter, ConnectRequest, DriverCommand, DriverConnection, DriverEvent, DriverInfo,
-    WireRecorder, attach, cap, login_methods, with_stderr,
+    Adapter, CLOSE_GRACE, ConnectRequest, DriverCommand, DriverConnection, DriverEvent, DriverInfo,
+    Emitter, FRAME_BUFFER, Gone, HANDSHAKE_TIMEOUT, LineWire, OUTPUT_CAP, WireRecorder, attach,
+    cap, level_choices, login_methods, selected, set_effort_option, with_stderr,
 };
 use crate::agent::{
     AgentDetails, AuthKind, AuthStatus, Capabilities, Capability, ConfigChoice, ConfigId,
@@ -31,18 +37,15 @@ use crate::event::{
 };
 use crate::process::{self, Spawn};
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
-const CLOSE_GRACE: Duration = Duration::from_secs(2);
 /// `--version` and `auth check` are sub-second; this only bounds a hang.
 const SIDE_PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
-const FRAME_BUFFER: usize = 64;
-const OUTPUT_CAP: usize = 16 * 1024;
 
 /// Launches a pi-dialect CLI in RPC mode. The catalog entry supplies the
 /// executable; a fork that shares the wire (omp) would be one more profile.
 pub(crate) struct PiAdapter;
 
 impl PiAdapter {
+    /// One instance drives every pi session.
     pub(crate) fn new() -> Self {
         Self
     }
@@ -54,14 +57,15 @@ impl Adapter for PiAdapter {
     /// to the drive task.
     async fn connect(&self, request: ConnectRequest) -> Result<DriverConnection, AgentError> {
         let (ev_tx, ev_rx) = mpsc::channel(FRAME_BUFFER);
-        let recorder = WireRecorder::for_session(&request.options, &ev_tx).await;
+        let events = Emitter::new(ev_tx);
+        let recorder = WireRecorder::for_session(&request.options, &events).await;
         let (child, wire, info, window) = launch(&request, recorder).await?;
-        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         tokio::spawn(
             Drive {
                 wire,
                 child,
-                events: ev_tx,
+                events,
                 info: info.clone(),
                 window,
                 message: None,
@@ -84,6 +88,10 @@ impl Adapter for PiAdapter {
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// LAUNCH AND HANDSHAKE
+// ---------------------------------------------------------------------------
 
 /// Spawns the CLI and handshakes within the timeout. Also returns the current
 /// model's context window, which only the handshake sees.
@@ -182,10 +190,16 @@ async fn handshake(
     let provider = state["model"]["provider"].as_str().unwrap_or_default();
     let (auth, version) = tokio::join!(auth_status(request, provider, env), version(exe, env));
     let window = state["model"]["contextWindow"].as_u64().filter(|w| *w > 0);
-    Ok((
-        driver_info(&state, &models, &levels, &commands, auth, version),
-        window,
-    ))
+    let info = driver_info(
+        &state,
+        &models,
+        &levels,
+        &commands,
+        auth,
+        version,
+        request.options.no_tools,
+    );
+    Ok((info, window))
 }
 
 /// pi's own readiness check for the session's provider. This is the only
@@ -256,11 +270,12 @@ fn driver_info(
     commands: &Value,
     auth: AuthStatus,
     version: Option<String>,
+    no_tools: bool,
 ) -> DriverInfo {
     let model = model_value(&state["model"]);
     let effort = state["thinkingLevel"].as_str().map(str::to_owned);
     let mut configuration = SessionConfiguration::default();
-    let mut config_options = vec![ConfigOption {
+    let config_options = vec![ConfigOption {
         id: ConfigId::new("model"),
         name: "Model".into(),
         category: Some("model".into()),
@@ -270,17 +285,12 @@ fn driver_info(
         current: model.clone().map(ConfigValue::Text),
         live: true,
     }];
-    if let Some(option) = effort_option(&levels["levels"], effort.clone()) {
-        config_options.push(option);
+    if let Some(model) = model {
+        configuration
+            .options
+            .insert(ConfigId::new("model"), ConfigValue::Text(model));
     }
-    for (id, value) in [("model", model), ("effort", effort)] {
-        if let Some(value) = value {
-            configuration
-                .options
-                .insert(ConfigId::new(id), ConfigValue::Text(value));
-        }
-    }
-    DriverInfo {
+    let mut info = DriverInfo {
         details: AgentDetails {
             version,
             auth,
@@ -309,7 +319,10 @@ fn driver_info(
         // Every prompt settles with exactly one `agent_settled`.
         deterministic_turn_end: true,
         deterministic_agent_turn_end: true,
-    }
+        tools_disabled: no_tools,
+    };
+    set_effort_option(&mut info, thinking_choices(&levels["levels"]), effort);
+    info
 }
 
 /// The model catalog as config choices, valued `provider/modelId` because
@@ -351,30 +364,20 @@ fn split_model(value: &str) -> Result<(&str, &str), AgentError> {
     }
 }
 
-/// Pi's thinking levels for the *current* model as the `effort` option; a
-/// model without reasoning support reports `off` alone, which is not worth
+/// Pi's thinking levels for the *current* model as effort choices; a model
+/// without reasoning support reports `off` alone, which is not worth
 /// advertising.
-fn effort_option(levels: &Value, current: Option<String>) -> Option<ConfigOption> {
-    let choices: Vec<ConfigChoice> = levels
-        .as_array()?
-        .iter()
-        .filter_map(|level| level.as_str())
-        .map(|level| ConfigChoice {
-            value: level.to_owned(),
-            label: level.to_owned(),
-            description: None,
-        })
+fn thinking_choices(levels: &Value) -> Vec<ConfigChoice> {
+    let levels: Vec<&str> = levels
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
         .collect();
-    // A level the new model does not offer is not the current one.
-    let current = current.filter(|level| choices.iter().any(|c| &c.value == level));
-    (choices.len() > 1).then(|| ConfigOption {
-        id: ConfigId::new("effort"),
-        name: "Reasoning effort".into(),
-        category: Some("thought_level".into()),
-        kind: ConfigKind::Select { choices },
-        current: current.map(ConfigValue::Text),
-        live: true,
-    })
+    match levels.len() > 1 {
+        true => level_choices(levels),
+        false => Vec::new(),
+    }
 }
 
 /// Extension commands, prompt templates, and skills, all invoked with `/`.
@@ -397,7 +400,7 @@ fn slash_commands(commands: &Value) -> Vec<SlashCommand> {
 }
 
 // ---------------------------------------------------------------------------
-// Drive task: engine commands out, wire frames in
+// DRIVE TASK: engine commands out, wire frames in
 // ---------------------------------------------------------------------------
 
 /// A command whose response still matters.
@@ -414,7 +417,7 @@ enum Pending {
 struct Drive {
     wire: Wire,
     child: process::Child,
-    events: mpsc::Sender<DriverEvent>,
+    events: Emitter,
     /// Current advertised state; mutated and re-sent as `InfoChanged`.
     info: DriverInfo,
     /// Context window of the current model, for `ContextUsage`.
@@ -441,7 +444,7 @@ struct Drive {
 
 impl Drive {
     /// Main loop until the engine or the agent goes away.
-    async fn run(mut self, mut commands: mpsc::Receiver<DriverCommand>) {
+    async fn run(mut self, mut commands: mpsc::UnboundedReceiver<DriverCommand>) {
         loop {
             tokio::select! {
                 cmd = commands.recv() => match cmd {
@@ -452,14 +455,14 @@ impl Drive {
                         }
                     }
                 },
-                frame = self.wire.frames.recv() => match frame {
+                frame = self.wire.line.frames.recv() => match frame {
                     Some(frame) => {
                         if self.handle_frame(frame).await.is_err() {
                             break;
                         }
                     }
                     None => {
-                        self.report_exit().await;
+                        self.events.exited(&mut self.child).await;
                         break;
                     }
                 },
@@ -468,12 +471,13 @@ impl Drive {
         self.child.shutdown(CLOSE_GRACE).await;
     }
 
+    /// One engine command as RPC commands.
     async fn handle_command(&mut self, cmd: DriverCommand) -> Result<(), Gone> {
         match cmd {
             // Never `follow_up`: the engine owns the prompt queue, so a
             // mid-turn prompt is queued by it and arrives as its own turn.
             DriverCommand::StartTurn { input } => {
-                self.emit(DriverEvent::TurnAck).await?;
+                self.events.send(DriverEvent::TurnAck).await?;
                 // A cancel that raced the previous turn's natural end must
                 // not bleed into this one.
                 self.aborting = false;
@@ -501,13 +505,15 @@ impl Drive {
             // turn; `compaction_end` reports the compaction itself, as it
             // does for pi's own automatic compactions.
             DriverCommand::Compact => {
+                self.aborting = false;
                 let id = self.wire.send("compact", json!({})).await?;
                 self.pending.insert(id, Pending::Compact);
             }
             DriverCommand::Configure(id, value) => self.configure(id, value).await?,
             DriverCommand::Rollback(..) => {
                 // Not advertised: pi forks a new session instead of rewinding.
-                self.diagnostic(DiagnosticLevel::Warning, "rollback is not supported on pi")
+                self.events
+                    .diagnostic(DiagnosticLevel::Warning, "rollback is not supported on pi")
                     .await?;
             }
             DriverCommand::Close => unreachable!("handled in run"),
@@ -527,14 +533,15 @@ impl Drive {
             }
             "extension_ui_request" => self.on_ui_request(&frame).await,
             "agent_settled" => self.on_settled().await,
-            "compaction_end" => self.emit_kind(EventKind::ContextCompacted).await,
+            "compaction_end" => self.events.event(EventKind::ContextCompacted).await,
             "extension_error" => {
                 let error = frame["error"].as_str().unwrap_or("extension failed");
-                self.diagnostic(DiagnosticLevel::Error, error).await
+                self.events.diagnostic(DiagnosticLevel::Error, error).await
             }
             "auto_retry_start" | "summarization_retry_scheduled" => {
                 let error = frame["errorMessage"].as_str().unwrap_or("transient error");
-                self.diagnostic(DiagnosticLevel::Warning, format!("retrying after {error}"))
+                self.events
+                    .diagnostic(DiagnosticLevel::Warning, format!("retrying after {error}"))
                     .await
             }
             // Narration the engine already owns or does not need:
@@ -553,15 +560,16 @@ impl Drive {
             other => {
                 let mut extensions = Extensions::new();
                 extensions.insert("pi/raw_frame".into(), frame.clone());
-                self.emit(DriverEvent::Event {
-                    kind: EventKind::Diagnostic(Diagnostic {
-                        level: DiagnosticLevel::Info,
-                        message: format!("unrecognized pi frame `{other}`"),
-                    }),
-                    parent_tool_id: None,
-                    extensions,
-                })
-                .await
+                self.events
+                    .send(DriverEvent::Event {
+                        kind: EventKind::Diagnostic(Diagnostic {
+                            level: DiagnosticLevel::Info,
+                            message: format!("unrecognized pi frame `{other}`"),
+                        }),
+                        parent_tool_id: None,
+                        extensions,
+                    })
+                    .await
             }
         }
     }
@@ -579,41 +587,47 @@ impl Drive {
         match pending {
             Pending::Prompt if success => Ok(()),
             Pending::Prompt => {
-                self.emit(DriverEvent::TurnEnded(StopReason::Failed {
-                    message: error.to_owned(),
-                }))
-                .await
+                self.events
+                    .send(DriverEvent::TurnEnded(StopReason::Failed {
+                        message: error.to_owned(),
+                    }))
+                    .await
             }
-            Pending::Steer => self.emit(DriverEvent::Steered(success)).await,
+            Pending::Steer => self.events.send(DriverEvent::Steered(success)).await,
             // pi refuses a session that is too small to be worth summarizing.
             // Either way the receipt is the end of the compaction turn.
             Pending::Compact if !success => {
-                self.diagnostic(
-                    DiagnosticLevel::Warning,
-                    format!("compaction refused: {error}"),
-                )
-                .await?;
-                self.emit(DriverEvent::TurnEnded(StopReason::Failed {
-                    message: error.to_owned(),
-                }))
-                .await
+                self.events
+                    .diagnostic(
+                        DiagnosticLevel::Warning,
+                        format!("compaction refused: {error}"),
+                    )
+                    .await?;
+                self.events
+                    .send(DriverEvent::TurnEnded(StopReason::Failed {
+                        message: error.to_owned(),
+                    }))
+                    .await
             }
             Pending::Compact => {
-                self.emit(DriverEvent::TurnEnded(StopReason::Completed {
-                    source: CompletionSource::Protocol,
-                }))
-                .await
+                self.events
+                    .send(DriverEvent::TurnEnded(StopReason::Completed {
+                        source: CompletionSource::Protocol,
+                    }))
+                    .await
             }
             Pending::Configure(id, _) if !success => {
-                self.diagnostic(
-                    DiagnosticLevel::Warning,
-                    format!("`{id}` was refused: {error}"),
-                )
-                .await
+                self.events
+                    .diagnostic(
+                        DiagnosticLevel::Warning,
+                        format!("`{id}` was refused: {error}"),
+                    )
+                    .await
             }
             Pending::Configure(id, value) => {
                 if crate::adapter::apply_selection(&mut self.info, &id, &value) {
-                    self.emit(DriverEvent::InfoChanged(self.info.clone()))
+                    self.events
+                        .send(DriverEvent::InfoChanged(self.info.clone()))
                         .await?;
                 }
                 if id.as_str() != "model" {
@@ -629,26 +643,15 @@ impl Drive {
             }
             Pending::Thinking if !success => Ok(()),
             Pending::Thinking => {
-                let current = self.selected("effort");
-                let option = effort_option(&frame["data"]["levels"], current);
-                self.info
-                    .details
-                    .config_options
-                    .retain(|o| o.id.as_str() != "effort");
-                self.info
-                    .configuration
-                    .options
-                    .remove(&ConfigId::new("effort"));
-                if let Some(option) = option {
-                    if let Some(ConfigValue::Text(level)) = option.current.clone() {
-                        self.info
-                            .configuration
-                            .options
-                            .insert(ConfigId::new("effort"), ConfigValue::Text(level));
-                    }
-                    self.info.details.config_options.push(option);
-                }
-                self.emit(DriverEvent::InfoChanged(self.info.clone())).await
+                let current = selected(&self.info, "effort");
+                set_effort_option(
+                    &mut self.info,
+                    thinking_choices(&frame["data"]["levels"]),
+                    current,
+                );
+                self.events
+                    .send(DriverEvent::InfoChanged(self.info.clone()))
+                    .await
             }
         }
     }
@@ -670,11 +673,13 @@ impl Drive {
         let text = event["delta"].as_str().unwrap_or_default().to_owned();
         match event["type"].as_str().unwrap_or_default() {
             "text_delta" => {
-                self.emit_kind(EventKind::TextDelta { message_id, text })
+                self.events
+                    .event(EventKind::TextDelta { message_id, text })
                     .await
             }
             "thinking_delta" => {
-                self.emit_kind(EventKind::ReasoningDelta { message_id, text })
+                self.events
+                    .event(EventKind::ReasoningDelta { message_id, text })
                     .await
             }
             // The call is named before its arguments finish streaming;
@@ -699,7 +704,8 @@ impl Drive {
         }
         self.stop = Some(stop_reason(message));
         if let Some(message_id) = self.message.take() {
-            self.emit_kind(EventKind::MessageEnded { message_id })
+            self.events
+                .event(EventKind::MessageEnded { message_id })
                 .await?;
         }
         let usage = &message["usage"];
@@ -707,12 +713,13 @@ impl Drive {
         let Some(used_tokens) = usage["totalTokens"].as_u64().filter(|t| *t > 0) else {
             return Ok(());
         };
-        self.emit_kind(EventKind::ContextUsage {
-            used_tokens,
-            window_tokens: self.window,
-            cost_usd: (self.cost > 0.0).then_some(self.cost),
-        })
-        .await
+        self.events
+            .event(EventKind::ContextUsage {
+                used_tokens,
+                window_tokens: self.window,
+                cost_usd: (self.cost > 0.0).then_some(self.cost),
+            })
+            .await
     }
 
     /// The tool lifecycle: arguments and status from `tool_execution_*`, with
@@ -762,11 +769,12 @@ impl Drive {
         }
         let delta = text[*sent..].to_owned();
         *sent = text.len();
-        self.emit_kind(EventKind::ToolOutputDelta {
-            tool_id: ToolId::new(id),
-            text: delta,
-        })
-        .await
+        self.events
+            .event(EventKind::ToolOutputDelta {
+                tool_id: ToolId::new(id),
+                text: delta,
+            })
+            .await
     }
 
     /// Extension dialogs become questions. Fire-and-forget notices become
@@ -781,7 +789,7 @@ impl Drive {
                 Some("warning") => DiagnosticLevel::Warning,
                 _ => DiagnosticLevel::Info,
             };
-            return self.diagnostic(level, message).await;
+            return self.events.diagnostic(level, message).await;
         }
         self.next_request += 1;
         let id = RequestId::new(format!("r{}", self.next_request));
@@ -796,15 +804,16 @@ impl Drive {
         if let Some(timeout) = frame["timeout"].as_u64() {
             extensions.insert("pi/timeout_ms".into(), timeout.into());
         }
-        self.emit(DriverEvent::Event {
-            kind: EventKind::RequestOpened(Request::Question(QuestionRequest {
-                id,
-                questions: vec![question],
-            })),
-            parent_tool_id: None,
-            extensions,
-        })
-        .await
+        self.events
+            .send(DriverEvent::Event {
+                kind: EventKind::RequestOpened(Request::Question(QuestionRequest {
+                    id,
+                    questions: vec![question],
+                })),
+                parent_tool_id: None,
+                extensions,
+            })
+            .await
     }
 
     /// Replies to one open dialog in the shape its method expects.
@@ -819,7 +828,7 @@ impl Drive {
         let mut frame = dialog_response(&method, answer);
         frame["type"] = "extension_ui_response".into();
         frame["id"] = wire_id.into();
-        self.wire.write(frame).await?;
+        self.wire.line.write(frame).await?;
         Ok(())
     }
 
@@ -831,12 +840,11 @@ impl Drive {
                 source: CompletionSource::Protocol,
             }),
         };
-        self.stop = None;
         // An aborted tool never gets its `tool_execution_end`; nothing from
         // a settled run is still coming, so its bookkeeping goes with it.
         self.tools.clear();
         self.streamed.clear();
-        self.emit(DriverEvent::TurnEnded(stop)).await
+        self.events.send(DriverEvent::TurnEnded(stop)).await
     }
 
     /// Sends a `prompt` or `steer` carrying the input's text and its images;
@@ -844,7 +852,9 @@ impl Drive {
     async fn send_input(&mut self, command: &str, input: &Input) -> Result<String, Gone> {
         let loaded = attach::load(&input.attachments).await;
         for problem in loaded.iter().filter_map(|l| l.problem.clone()) {
-            self.diagnostic(DiagnosticLevel::Warning, problem).await?;
+            self.events
+                .diagnostic(DiagnosticLevel::Warning, problem)
+                .await?;
         }
         let images: Vec<Value> = loaded
             .iter()
@@ -871,6 +881,7 @@ impl Drive {
                 ),
                 Err(e) => {
                     return self
+                        .events
                         .diagnostic(DiagnosticLevel::Warning, e.to_string())
                         .await;
                 }
@@ -889,13 +900,15 @@ impl Drive {
         self.emit_tool(tool, extensions).await
     }
 
+    /// One tool snapshot, with any wire-only detail in `extensions`.
     async fn emit_tool(&mut self, tool: ToolUpdate, extensions: Extensions) -> Result<(), Gone> {
-        self.emit(DriverEvent::Event {
-            kind: EventKind::ToolUpdated(tool),
-            parent_tool_id: None,
-            extensions,
-        })
-        .await
+        self.events
+            .send(DriverEvent::Event {
+                kind: EventKind::ToolUpdated(tool),
+                parent_tool_id: None,
+                extensions,
+            })
+            .await
     }
 
     /// The message being streamed, minting one if a delta arrives first.
@@ -907,53 +920,10 @@ impl Drive {
             })
             .clone()
     }
-
-    /// The currently advertised value of one option.
-    fn selected(&self, id: &str) -> Option<String> {
-        match self.info.configuration.options.get(&ConfigId::new(id)) {
-            Some(ConfigValue::Text(value)) => Some(value.clone()),
-            _ => None,
-        }
-    }
-
-    async fn report_exit(&mut self) {
-        let status = self.child.exit_status(CLOSE_GRACE).await;
-        let stderr = self.child.stderr_tail();
-        self.emit(DriverEvent::Exited { status, stderr }).await.ok();
-    }
-
-    async fn diagnostic(
-        &mut self,
-        level: DiagnosticLevel,
-        message: impl Into<String>,
-    ) -> Result<(), Gone> {
-        self.emit_kind(EventKind::Diagnostic(Diagnostic {
-            level,
-            message: message.into(),
-        }))
-        .await
-    }
-
-    async fn emit_kind(&mut self, kind: EventKind) -> Result<(), Gone> {
-        self.emit(DriverEvent::event(kind)).await
-    }
-
-    async fn emit(&mut self, event: DriverEvent) -> Result<(), Gone> {
-        self.events.send(event).await.map_err(|_| Gone)
-    }
-}
-
-/// The engine or the agent is gone; the drive task unwinds.
-struct Gone;
-
-impl From<std::io::Error> for Gone {
-    fn from(_: std::io::Error) -> Self {
-        Gone
-    }
 }
 
 // ---------------------------------------------------------------------------
-// Frame decoding
+// FRAME DECODING
 // ---------------------------------------------------------------------------
 
 /// The last assistant message's own verdict. Our own `abort` is recognised by
@@ -1117,47 +1087,22 @@ fn dialog_response(method: &str, answer: Option<QuestionAnswer>) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// Wire
+// WIRE: RPC commands and responses over stdio
 // ---------------------------------------------------------------------------
 
 /// The JSONL command/event wire. Commands carry a correlating `id`; every
 /// other line is an event.
 struct Wire {
-    stdin: tokio::process::ChildStdin,
-    /// All frames the reader task saw, bounded; pipe backpressure beyond.
-    frames: mpsc::Receiver<Value>,
+    line: LineWire,
     next_id: u64,
-    recorder: Option<WireRecorder>,
 }
 
 impl Wire {
-    /// Takes the child's stdio and starts the line-reader task. Records split
-    /// on `\n` only, with a trailing `\r` stripped, as the protocol demands.
+    /// Takes the child's stdio and starts the line-reader task.
     fn over(child: &mut process::Child, recorder: Option<WireRecorder>) -> Self {
-        use tokio::io::{AsyncBufReadExt, BufReader};
-        let stdin = child.stdin.take().expect("piped stdin");
-        let stdout = child.stdout.take().expect("piped stdout");
-        let (tx, frames) = mpsc::channel(FRAME_BUFFER);
-        let reader_recorder = recorder.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(frame) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                if let Some(recorder) = &reader_recorder {
-                    recorder.record("in", &frame);
-                }
-                if tx.send(frame).await.is_err() {
-                    break;
-                }
-            }
-        });
         Self {
-            stdin,
-            frames,
+            line: LineWire::over(child, recorder),
             next_id: 1,
-            recorder,
         }
     }
 
@@ -1168,16 +1113,17 @@ impl Wire {
         let mut frame = body;
         frame["type"] = command.into();
         frame["id"] = id.clone().into();
-        self.write(frame).await?;
+        self.line.write(frame).await?;
         Ok(id)
     }
 
     /// Dismisses one extension dialog so the extension stops blocking.
     async fn cancel_dialog(&mut self, wire_id: &str) -> std::io::Result<()> {
-        self.write(json!({
-            "type": "extension_ui_response", "id": wire_id, "cancelled": true,
-        }))
-        .await
+        self.line
+            .write(json!({
+                "type": "extension_ui_response", "id": wire_id, "cancelled": true,
+            }))
+            .await
     }
 
     /// Handshake only: sends a command and blocks on its response, skipping
@@ -1188,7 +1134,12 @@ impl Wire {
             .await
             .map_err(|_| closed(command))?;
         loop {
-            let frame = self.frames.recv().await.ok_or_else(|| closed(command))?;
+            let frame = self
+                .line
+                .frames
+                .recv()
+                .await
+                .ok_or_else(|| closed(command))?;
             if frame["type"].as_str() != Some("response") || frame["id"].as_str() != Some(&id) {
                 continue;
             }
@@ -1199,18 +1150,9 @@ impl Wire {
             return Ok(frame["data"].clone());
         }
     }
-
-    async fn write(&mut self, frame: Value) -> std::io::Result<()> {
-        use tokio::io::AsyncWriteExt;
-        if let Some(recorder) = &self.recorder {
-            recorder.record("out", &frame);
-        }
-        let mut line = frame.to_string();
-        line.push('\n');
-        self.stdin.write_all(line.as_bytes()).await
-    }
 }
 
+/// The wire closed mid-handshake, as the caller's error.
 fn closed(command: &str) -> AgentError {
     AgentError::ProtocolFailed(format!("agent closed the wire during `{command}`"))
 }

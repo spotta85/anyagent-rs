@@ -1,6 +1,10 @@
 //! Native Codex adapter: drives `codex app-server` over line-delimited
-//! JSON-RPC 2.0 (validated 2026-08-27, ticket 10). Turn end is deterministic:
-//! exactly one `turn/completed` per turn. The engine owns all turn rules.
+//! JSON-RPC 2.0 (validated 2026-08-27). Turn end is deterministic: exactly
+//! one `turn/completed` per turn. The engine owns all turn rules.
+//!
+//! High level: `connect` → `launch` (spawn + `handshake`, thread bind) →
+//! `driver_info`; then `Drive::run` turns commands into requests
+//! (`handle_command`) and notifications into events (`handle_frame`, `on_*`).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -11,27 +15,23 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::adapter::{
-    Adapter, ConnectRequest, DriverCommand, DriverConnection, DriverEvent, DriverInfo,
-    WireRecorder, attach, cap, login_methods, with_stderr,
+    Adapter, CLOSE_GRACE, ConnectRequest, DriverCommand, DriverConnection, DriverEvent, DriverInfo,
+    Emitter, FRAME_BUFFER, Gone, HANDSHAKE_TIMEOUT, LineWire, OUTPUT_CAP, WireRecorder, attach,
+    cap, login_methods, plan_entries, selected, set_effort_option, with_stderr,
 };
 use crate::agent::{
     AccountInfo, AgentDetails, AuthKind, AuthStatus, Capabilities, Capability, ConfigChoice,
-    ConfigId, ConfigKind, ConfigOption, ConfigValue, Input, ResumeToken, SessionConfiguration,
-    SessionStart, SlashCommand,
+    ConfigId, ConfigKind, ConfigOption, ConfigValue, Input, McpConnection, McpServer, McpTransport,
+    ResumeToken, SessionConfiguration, SessionStart, SlashCommand,
 };
 use crate::error::AgentError;
 use crate::event::{
     Answer, Choice, ChoiceId, CompletionSource, Diagnostic, DiagnosticLevel, EventKind, Extensions,
-    FileDiff, MessageId, PermissionChoice, PermissionRequest, PlanEntry, PlanStatus, PlanUsage,
-    Question, QuestionAnswer, QuestionId, QuestionRequest, RawTool, Request, RequestId, StopReason,
-    ToolId, ToolInput, ToolKind, ToolStatus, ToolUpdate, UsageWindow,
+    FileDiff, MessageId, PermissionChoice, PermissionRequest, PlanUsage, Question, QuestionAnswer,
+    QuestionId, QuestionRequest, RawTool, Request, RequestId, StopReason, ToolId, ToolInput,
+    ToolKind, ToolStatus, ToolUpdate, UsageWindow,
 };
 use crate::process::{self, Spawn};
-
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
-const CLOSE_GRACE: Duration = Duration::from_secs(2);
-const FRAME_BUFFER: usize = 64;
-const OUTPUT_CAP: usize = 16 * 1024;
 
 /// Prefix on every `clientUserMessageId` we mint; echoed user-message items
 /// carrying it are our own prompts and steers, and are dropped.
@@ -47,6 +47,7 @@ const SANDBOXES: [&str; 3] = ["read-only", "workspace-write", "danger-full-acces
 pub(crate) struct CodexAdapter;
 
 impl CodexAdapter {
+    /// One instance drives every codex session.
     pub(crate) fn new() -> Self {
         Self
     }
@@ -57,24 +58,21 @@ impl Adapter for CodexAdapter {
     /// Spawns the server, handshakes, binds the thread, and hands the live
     /// wire to the drive task.
     async fn connect(&self, request: ConnectRequest) -> Result<DriverConnection, AgentError> {
-        if !request.options.mcp_servers.is_empty() {
-            // Codex reads MCP servers from its own config.toml; the wire has
-            // no per-session declaration.
-            return Err(AgentError::UnsupportedFeature("MCP forwarding".into()));
-        }
         let (ev_tx, ev_rx) = mpsc::channel(FRAME_BUFFER);
-        let recorder = WireRecorder::for_session(&request.options, &ev_tx).await;
-        let (child, wire, info, models, thread_id) = launch(&request, recorder).await?;
-        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let events = Emitter::new(ev_tx);
+        let recorder = WireRecorder::for_session(&request.options, &events).await;
+        let (child, wire, info, models, thread_id, turns) = launch(&request, recorder).await?;
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         tokio::spawn(
             Drive {
                 wire,
                 child,
-                events: ev_tx,
+                events,
                 info: info.clone(),
                 models,
                 thread_id,
                 turn: None,
+                turns,
                 turn_started: false,
                 pending_steer: None,
                 cancel_pending: false,
@@ -112,8 +110,7 @@ impl Adapter for CodexAdapter {
         .await?;
         let mut wire = Wire::over(&mut child, None);
         let fetch = async {
-            wire.roundtrip("initialize", json!({ "clientInfo": client_info() }))
-                .await?;
+            wire.roundtrip("initialize", initialize_params()).await?;
             wire.notify("initialized").await?;
             wire.roundtrip("account/rateLimits/read", json!({})).await
         };
@@ -135,15 +132,73 @@ impl Adapter for CodexAdapter {
     }
 }
 
-fn client_info() -> Value {
-    json!({ "name": "anyagent", "version": env!("CARGO_PKG_VERSION") })
+// ---------------------------------------------------------------------------
+// LAUNCH AND HANDSHAKE
+// ---------------------------------------------------------------------------
+
+/// `initialize` params: who we are, plus the experimental API opt-in
+/// `requestUserInput` needs (what t3 and synara send).
+fn initialize_params() -> Value {
+    json!({
+        "clientInfo": { "name": "anyagent", "version": env!("CARGO_PKG_VERSION") },
+        "capabilities": { "experimentalApi": true },
+    })
+}
+
+/// The MCP servers as `-c mcp_servers.<name>.<key>=<toml>` launch overrides,
+/// the wire having no per-thread declaration. SSE is not a codex transport.
+fn mcp_overrides(servers: &[McpServer]) -> Result<Vec<String>, AgentError> {
+    let quote = |s: &str| serde_json::to_string(s).unwrap_or_default();
+    let table = |map: &std::collections::BTreeMap<String, String>| {
+        let pairs: Vec<String> = map
+            .iter()
+            .map(|(k, v)| format!("{}={}", quote(k), quote(v)))
+            .collect();
+        format!("{{{}}}", pairs.join(", "))
+    };
+    let mut args = Vec::new();
+    for server in servers {
+        // The name is a bare TOML key segment; anything else would split or
+        // break the override.
+        let bare = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+        if server.name.is_empty() || !server.name.chars().all(bare) {
+            return Err(AgentError::InvalidConfiguration(format!(
+                "codex MCP server name `{}` must be [A-Za-z0-9_-]",
+                server.name
+            )));
+        }
+        let key = |field: &str| format!("mcp_servers.{}.{field}", server.name);
+        let mut push = |field: &str, value: String| {
+            args.push("-c".to_owned());
+            args.push(format!("{}={value}", key(field)));
+        };
+        match &server.connection {
+            McpConnection::Stdio { command, args, env } => {
+                push("command", quote(&command.to_string_lossy()));
+                push("args", serde_json::to_string(args).unwrap_or_default());
+                if !env.is_empty() {
+                    push("env", table(env));
+                }
+            }
+            McpConnection::Http { url, headers } => {
+                push("url", quote(url));
+                if !headers.is_empty() {
+                    push("http_headers", table(headers));
+                }
+            }
+            McpConnection::Sse { .. } => {
+                return Err(AgentError::UnsupportedFeature("Sse MCP servers".into()));
+            }
+        }
+    }
+    Ok(args)
 }
 
 /// Spawns the server and handshakes within the timeout.
 async fn launch(
     request: &ConnectRequest,
     recorder: Option<WireRecorder>,
-) -> Result<(process::Child, Wire, DriverInfo, Value, String), AgentError> {
+) -> Result<(process::Child, Wire, DriverInfo, Value, String, Vec<String>), AgentError> {
     let env = crate::adapter::config_home_env(&request.installation, &request.options)?;
     // CODEX_HOME must already exist or the server exits at startup
     // (probed 2026-08-27).
@@ -152,16 +207,20 @@ async fn launch(
             .await
             .map_err(|e| AgentError::SpawnFailed(format!("could not create config home: {e}")))?;
     }
+    let mut args = mcp_overrides(&request.options.mcp_servers)?;
+    args.push("app-server".into());
     let mut child = process::spawn(Spawn {
         exec_path: request.installation.executable_path.clone(),
-        args: vec!["app-server".into()],
+        args,
         cwd: request.options.cwd().clone(),
         env,
     })
     .await?;
     let mut wire = Wire::over(&mut child, recorder);
     match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut wire, request)).await {
-        Ok(Ok((info, models, thread_id))) => Ok((child, wire, info, models, thread_id)),
+        Ok(Ok((info, models, thread_id, turns))) => {
+            Ok((child, wire, info, models, thread_id, turns))
+        }
         Ok(Err(e)) => {
             let e = with_stderr(e, &child);
             child.shutdown(CLOSE_GRACE).await;
@@ -179,9 +238,9 @@ async fn launch(
 async fn handshake(
     wire: &mut Wire,
     request: &ConnectRequest,
-) -> Result<(DriverInfo, Value, String), AgentError> {
+) -> Result<(DriverInfo, Value, String, Vec<String>), AgentError> {
     let init = wire
-        .roundtrip("initialize", json!({ "clientInfo": client_info() }))
+        .roundtrip("initialize", initialize_params())
         .await
         .map_err(WireError::into_error)?;
     wire.notify("initialized")
@@ -209,7 +268,14 @@ async fn handshake(
     let info = driver_info(
         &init, &account, &models, &thread, &config, commands, request,
     );
-    Ok((info, models, thread_id))
+    // A resumed or forked thread brings its turn ids; rollback cuts into them.
+    let turns = thread["thread"]["turns"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|turn| turn["id"].as_str().map(str::to_owned))
+        .collect();
+    Ok((info, models, thread_id, turns))
 }
 
 /// Skills are codex's slash commands. `data` groups them by root and the same
@@ -256,6 +322,8 @@ struct StartConfig {
     sandbox: Option<String>,
 }
 
+/// Creation-time `configure` values as a `StartConfig`, each checked
+/// against the catalog.
 fn start_config(request: &ConnectRequest, models: &Value) -> Result<StartConfig, AgentError> {
     let mut config = StartConfig::default();
     for (id, value) in &request.options.configure {
@@ -330,6 +398,12 @@ async fn open_thread(
     }
     if let Some(sandbox) = &config.sandbox {
         params["sandbox"] = json!(sandbox);
+    }
+    // `no_tools` cannot switch tools off on this wire; the strictest policy
+    // makes every command ask (and get declined) inside a read-only sandbox.
+    if request.options.no_tools {
+        params["approvalPolicy"] = json!("untrusted");
+        params["sandbox"] = json!("read-only");
     }
     let method = match &request.options.start {
         SessionStart::New => "thread/start",
@@ -410,9 +484,8 @@ fn driver_info(
         .or_else(|| model.as_deref().and_then(|m| default_effort(models, m)));
     let mode = thread["approvalPolicy"].as_str().unwrap_or("on-request");
     let sandbox = sandbox_name(&thread["sandbox"]);
-    // model, effort and serviceTier are per-turn `turn/start` parameters, so
-    // they switch live with no wire call; mode and sandbox are thread-creation
-    // settings.
+    // Every option rides `turn/start` (model, effort, serviceTier,
+    // approvalPolicy, sandboxPolicy), so all switch live with no wire call.
     let model_option = ConfigOption {
         id: ConfigId::new("model"),
         name: "Model".into(),
@@ -459,11 +532,11 @@ fn driver_info(
     };
     let mode_option = ConfigOption {
         id: ConfigId::new("mode"),
-        name: "Approval policy".into(),
+        name: "Mode".into(),
         category: Some("mode".into()),
         kind: select(&MODES, mode),
         current: Some(ConfigValue::Text(mode.to_owned())),
-        live: false,
+        live: true,
     };
     let sandbox_option = ConfigOption {
         id: ConfigId::new("sandbox"),
@@ -471,7 +544,7 @@ fn driver_info(
         category: Some("sandbox".into()),
         kind: select(&SANDBOXES, &sandbox),
         current: Some(ConfigValue::Text(sandbox.clone())),
-        live: false,
+        live: true,
     };
     let mut configuration = SessionConfiguration::default();
     for (id, value) in [
@@ -491,22 +564,28 @@ fn driver_info(
         details: AgentDetails {
             version,
             auth,
-            // Not advertised: Images (input blocks unprobed on this wire),
-            // Questions (`item/tool/requestUserInput` never fired live —
-            // ticket 10; the handler exists defensively), Rollback
-            // (`thread/rollback` is deprecated upstream; deferred).
-            capabilities: Capabilities::new([
-                Capability::Steer,
-                Capability::Permissions,
-                Capability::Resume,
-                Capability::Fork,
-                Capability::Compact,
-                Capability::Plan,
-                Capability::Subagents,
-                Capability::SlashCommands,
-                Capability::ContextUsage,
-                Capability::PlanUsage,
-            ]),
+            // Not advertised: Questions. `requestUserInput` only fires in
+            // codex's collaboration (plan) mode ("I can't use that tool in
+            // the current mode", probed 0.152.0); the translation exists for
+            // when `collaborationMode` is wired.
+            capabilities: {
+                let mut capabilities = Capabilities::new([
+                    Capability::Steer,
+                    Capability::Permissions,
+                    Capability::Images,
+                    Capability::Resume,
+                    Capability::Fork,
+                    Capability::Rollback,
+                    Capability::Compact,
+                    Capability::Plan,
+                    Capability::Subagents,
+                    Capability::SlashCommands,
+                    Capability::ContextUsage,
+                    Capability::PlanUsage,
+                ]);
+                capabilities.mcp_transports = vec![McpTransport::Stdio, McpTransport::Http];
+                capabilities
+            },
             config_options: [
                 Some(model_option),
                 effort_option,
@@ -527,6 +606,7 @@ fn driver_info(
         // Exactly one `turn/completed` per turn, even interrupted or 401.
         deterministic_turn_end: true,
         deterministic_agent_turn_end: true,
+        tools_disabled: false,
     };
     let model = info.configuration.options.get(&ConfigId::new("model"));
     let supported =
@@ -540,7 +620,7 @@ fn driver_info(
 }
 
 // ---------------------------------------------------------------------------
-// Drive task: engine commands out, wire frames in
+// DRIVE TASK: engine commands out, wire frames in
 // ---------------------------------------------------------------------------
 
 /// A client request awaiting its JSON-RPC response.
@@ -550,6 +630,8 @@ enum Pending {
     Interrupt,
     Skills,
     Compact,
+    /// `thread/revert`; the history length kept on success.
+    Rollback(usize),
 }
 
 /// A server→client request waiting for `answer`.
@@ -562,7 +644,7 @@ struct PendingRequest {
 struct Drive {
     wire: Wire,
     child: process::Child,
-    events: mpsc::Sender<DriverEvent>,
+    events: Emitter,
     /// Current advertised state; mutated and re-sent as `InfoChanged`.
     info: DriverInfo,
     /// The `model/list` catalog, kept to rebuild effort choices on a switch.
@@ -570,6 +652,8 @@ struct Drive {
     thread_id: String,
     /// The running wire turn, once `turn/start`'s response names it.
     turn: Option<String>,
+    /// Completed parent-thread turn ids, oldest first; rollback cuts before one.
+    turns: Vec<String>,
     /// `turn/started` seen. A steer sent before it is refused by the wire
     /// (probed 2026-08-27), so one waits in `pending_steer`.
     turn_started: bool,
@@ -598,7 +682,7 @@ struct Drive {
 
 impl Drive {
     /// Main loop until the engine or the agent goes away.
-    async fn run(mut self, mut commands: mpsc::Receiver<DriverCommand>) {
+    async fn run(mut self, mut commands: mpsc::UnboundedReceiver<DriverCommand>) {
         // Late skills fetch (see `handshake`); a send failure means the wire
         // is already gone and the loop below will report it.
         if let Ok(id) = self.wire.request("skills/list", json!({})).await {
@@ -614,14 +698,14 @@ impl Drive {
                         }
                     }
                 },
-                frame = self.wire.frames.recv() => match frame {
+                frame = self.wire.line.frames.recv() => match frame {
                     Some(frame) => {
                         if self.handle_frame(frame).await.is_err() {
                             break;
                         }
                     }
                     None => {
-                        self.report_exit().await;
+                        self.events.exited(&mut self.child).await;
                         break;
                     }
                 },
@@ -630,47 +714,13 @@ impl Drive {
         self.child.shutdown(CLOSE_GRACE).await;
     }
 
+    /// One engine command as JSON-RPC requests, or a local option change.
     async fn handle_command(&mut self, cmd: DriverCommand) -> Result<(), Gone> {
         match cmd {
             DriverCommand::StartTurn { input } => {
-                self.emit(DriverEvent::TurnAck).await?;
-                let text = self.input_text(&input).await?;
-                // model, effort and serviceTier ride on every turn (per-turn
-                // parameters). `summary` opts into reasoning summaries: without
-                // it no reasoning deltas stream at all (probed 2026-09-03).
-                let mut params = json!({
-                    "threadId": self.thread_id,
-                    "clientUserMessageId": self.mint(),
-                    "input": [{ "type": "text", "text": text }],
-                    "summary": "auto",
-                });
-                for key in ["model", "effort", "serviceTier"] {
-                    if let Some(ConfigValue::Text(value)) =
-                        self.info.configuration.options.get(&ConfigId::new(key))
-                        && (key != "serviceTier" || value != "default")
-                    {
-                        params[key] = json!(value);
-                    }
-                }
-                let fast = self.info.configuration.options.get(&ConfigId::new("fast"))
-                    == Some(&ConfigValue::Bool(true));
-                // An explicit serviceTier wins over the fast shorthand; fast
-                // only resolves the tier when none was chosen directly.
-                let tier_explicit = self
-                    .info
-                    .configuration
-                    .options
-                    .contains_key(&ConfigId::new("serviceTier"));
-                if fast || !tier_explicit {
-                    let tier = params["model"]
-                        .as_str()
-                        .and_then(|model| fast_tier(&self.models, model));
-                    params["serviceTier"] = json!(if fast {
-                        tier.unwrap_or("default")
-                    } else {
-                        "default"
-                    });
-                }
+                self.events.send(DriverEvent::TurnAck).await?;
+                let items = self.input_items(&input).await?;
+                let params = self.turn_params(items);
                 let id = self.wire.request("turn/start", params).await?;
                 self.pending.insert(id, Pending::StartTurn);
             }
@@ -703,12 +753,11 @@ impl Drive {
                 }
             }
             DriverCommand::Configure(id, value) => {
-                // model, effort, fast and serviceTier are per-turn parameters:
-                // apply locally, the next `turn/start` carries them. mode and
-                // sandbox are creation-only, so the engine never forwards them.
-                // An explicit serviceTier wins over the fast shorthand below.
-                if matches!(id.as_str(), "model" | "effort" | "fast" | "serviceTier")
-                    && crate::adapter::apply_selection(&mut self.info, &id, &value)
+                // Every option rides the next `turn/start`; apply locally.
+                if matches!(
+                    id.as_str(),
+                    "model" | "effort" | "fast" | "serviceTier" | "mode" | "sandbox"
+                ) && crate::adapter::apply_selection(&mut self.info, &id, &value)
                 {
                     if let ("model", ConfigValue::Text(model)) = (id.as_str(), &value) {
                         refresh_effort(&mut self.info, &self.models, model);
@@ -720,7 +769,8 @@ impl Drive {
                             true,
                         );
                     }
-                    self.emit(DriverEvent::InfoChanged(self.info.clone()))
+                    self.events
+                        .send(DriverEvent::InfoChanged(self.info.clone()))
                         .await?;
                 }
             }
@@ -734,16 +784,31 @@ impl Drive {
                     .await?;
                 self.pending.insert(id, Pending::Compact);
             }
-            DriverCommand::Rollback(..) => {
-                // Not advertised: deferred (tickets 07/09). Note 0.152.0
-                // still ships `thread/rollback` and `thread/revert` (and T3
-                // calls the former), so this is implementable natively —
-                // probe the params before picking it up.
-                self.diagnostic(
-                    DiagnosticLevel::Warning,
-                    "rollback is not supported on codex",
-                )
-                .await?;
+            // Conversation only; the engine refuses the files scope.
+            // `thread/rollback` is refused for paginated threads (probed
+            // 2026-09-05); `thread/revert` cuts before a turn instead.
+            DriverCommand::Rollback(turns, _) => {
+                let n = turns.get() as usize;
+                let Some(keep) = self.turns.len().checked_sub(n) else {
+                    return self
+                        .events
+                        .diagnostic(
+                            DiagnosticLevel::Warning,
+                            format!(
+                                "rollback({n}) rejected: {} completed turns",
+                                self.turns.len()
+                            ),
+                        )
+                        .await;
+                };
+                let id = self
+                    .wire
+                    .request(
+                        "thread/revert",
+                        json!({ "threadId": self.thread_id, "beforeTurnId": self.turns[keep] }),
+                    )
+                    .await?;
+                self.pending.insert(id, Pending::Rollback(keep));
             }
             DriverCommand::Close => unreachable!("handled in run"),
         }
@@ -775,44 +840,65 @@ impl Drive {
             Pending::StartTurn => match error {
                 Some(message) => {
                     self.cancel_pending = false;
-                    self.emit(DriverEvent::TurnEnded(StopReason::Failed {
-                        message: message.to_owned(),
-                    }))
-                    .await?
+                    self.events
+                        .send(DriverEvent::TurnEnded(StopReason::Failed {
+                            message: message.to_owned(),
+                        }))
+                        .await?
                 }
                 None => {
                     self.turn = frame["result"]["turn"]["id"].as_str().map(str::to_owned);
-                    if self.cancel_pending {
-                        self.cancel_pending = false;
-                        if let Some(turn) = self.turn.clone() {
-                            self.interrupt(&turn).await?;
-                        }
-                    }
+                    self.interrupt_if_pending().await?;
                 }
             },
-            Pending::Steer => self.emit(DriverEvent::Steered(error.is_none())).await?,
+            Pending::Steer => {
+                self.events
+                    .send(DriverEvent::Steered(error.is_none()))
+                    .await?
+            }
             // "no active turn to interrupt" means already idle: success.
             Pending::Interrupt => {}
             // Compaction runs as its own wire turn, which ends the engine's.
             // A refusal never starts one, so it ends that turn itself.
             Pending::Compact => {
                 if let Some(message) = error {
-                    self.diagnostic(
-                        DiagnosticLevel::Warning,
-                        format!("compaction refused: {message}"),
-                    )
-                    .await?;
-                    self.emit(DriverEvent::TurnEnded(StopReason::Failed {
-                        message: message.to_owned(),
-                    }))
-                    .await?;
+                    self.events
+                        .diagnostic(
+                            DiagnosticLevel::Warning,
+                            format!("compaction refused: {message}"),
+                        )
+                        .await?;
+                    self.events
+                        .send(DriverEvent::TurnEnded(StopReason::Failed {
+                            message: message.to_owned(),
+                        }))
+                        .await?;
                 }
             }
+            // Nothing advertised changes; `SessionUpdated` is the documented
+            // confirmation.
+            Pending::Rollback(keep) => match error {
+                Some(message) => {
+                    self.events
+                        .diagnostic(
+                            DiagnosticLevel::Warning,
+                            format!("rollback rejected: {message}"),
+                        )
+                        .await?
+                }
+                None => {
+                    self.turns.truncate(keep);
+                    self.events
+                        .send(DriverEvent::InfoChanged(self.info.clone()))
+                        .await?
+                }
+            },
             Pending::Skills => {
                 let commands = parse_skill_commands(&frame["result"]);
                 if !commands.is_empty() {
                     self.info.details.commands = commands;
-                    self.emit(DriverEvent::InfoChanged(self.info.clone()))
+                    self.events
+                        .send(DriverEvent::InfoChanged(self.info.clone()))
                         .await?;
                 }
             }
@@ -887,6 +973,7 @@ impl Drive {
                 if let Some(id) = params["turn"]["id"].as_str() {
                     self.turn.get_or_insert_with(|| id.to_owned());
                 }
+                self.interrupt_if_pending().await?;
                 if let Some(input) = self.pending_steer.take() {
                     self.send_steer(input).await?;
                 }
@@ -925,7 +1012,7 @@ impl Drive {
             }
             "turn/plan/updated" => {
                 self.content(EventKind::PlanUpdated {
-                    entries: plan_entries(&params["plan"]),
+                    entries: plan_entries(&params["plan"], "step"),
                 })
                 .await
             }
@@ -948,24 +1035,33 @@ impl Drive {
                     None => Ok(()),
                 }
             }
+            "thread/name/updated" => {
+                self.info.title = params["name"].as_str().map(str::to_owned);
+                self.events
+                    .send(DriverEvent::InfoChanged(self.info.clone()))
+                    .await
+            }
             "account/rateLimits/updated" => match plan_usage(&params["rateLimits"]) {
                 Some(usage) => self.content(EventKind::PlanUsageUpdated(usage)).await,
                 None => Ok(()),
             },
             "error" => self.on_error(params).await,
             "warning" | "guardianWarning" | "configWarning" | "model/rerouted" => {
-                self.diagnostic(DiagnosticLevel::Warning, notice_text(params))
+                self.events
+                    .diagnostic(DiagnosticLevel::Warning, notice_text(params))
                     .await
             }
             "deprecationNotice" => {
-                self.diagnostic(DiagnosticLevel::Info, notice_text(params))
+                self.events
+                    .diagnostic(DiagnosticLevel::Info, notice_text(params))
                     .await
             }
             // Startup chatter; only a failed MCP server is worth surfacing.
             "mcpServer/startupStatus/updated" => {
                 match (params["status"].as_str(), params["error"].as_str()) {
                     (Some("failed"), Some(error)) => {
-                        self.diagnostic(DiagnosticLevel::Warning, error.to_owned())
+                        self.events
+                            .diagnostic(DiagnosticLevel::Warning, error.to_owned())
                             .await
                     }
                     _ => Ok(()),
@@ -983,15 +1079,16 @@ impl Drive {
             other => {
                 let mut extensions = Extensions::new();
                 extensions.insert("codex/raw_frame".into(), params.clone());
-                self.emit(DriverEvent::Event {
-                    kind: EventKind::Diagnostic(Diagnostic {
-                        level: DiagnosticLevel::Info,
-                        message: format!("unrecognized codex frame `{other}`"),
-                    }),
-                    parent_tool_id: None,
-                    extensions,
-                })
-                .await
+                self.events
+                    .send(DriverEvent::Event {
+                        kind: EventKind::Diagnostic(Diagnostic {
+                            level: DiagnosticLevel::Info,
+                            message: format!("unrecognized codex frame `{other}`"),
+                        }),
+                        parent_tool_id: None,
+                        extensions,
+                    })
+                    .await
             }
         }
     }
@@ -1025,14 +1122,15 @@ impl Drive {
                 if let (None, Some(turn)) = (&self.child_tool, &self.turn) {
                     extensions.insert("codex/fork_point".into(), Value::from(turn.clone()));
                 }
-                self.emit(DriverEvent::Event {
-                    kind: EventKind::MessageEnded {
-                        message_id: MessageId::new(id),
-                    },
-                    parent_tool_id: self.child_tool.clone(),
-                    extensions,
-                })
-                .await
+                self.events
+                    .send(DriverEvent::Event {
+                        kind: EventKind::MessageEnded {
+                            message_id: MessageId::new(id),
+                        },
+                        parent_tool_id: self.child_tool.clone(),
+                        extensions,
+                    })
+                    .await
             }
             "reasoning" => {
                 if completed && self.open_reasoning.remove(&id) {
@@ -1087,7 +1185,7 @@ impl Drive {
         self.requests.clear();
         self.children.clear();
         self.open_reasoning.clear();
-        self.turn = None;
+        self.turns.extend(self.turn.take());
         self.turn_started = false;
         self.pending_steer = None;
         self.cancel_pending = false;
@@ -1104,7 +1202,7 @@ impl Drive {
                     .to_owned(),
             },
         };
-        self.emit(DriverEvent::TurnEnded(stop)).await
+        self.events.send(DriverEvent::TurnEnded(stop)).await
     }
 
     /// `error` notifications; a 401 means the credentials died.
@@ -1117,7 +1215,8 @@ impl Drive {
             // surface the login need on the first one (probed 2026-08-27).
             self.auth_lost = true;
             return self
-                .emit(DriverEvent::AuthLost {
+                .events
+                .send(DriverEvent::AuthLost {
                     login: login_methods(&self.request.installation),
                 })
                 .await;
@@ -1127,14 +1226,15 @@ impl Drive {
         } else {
             DiagnosticLevel::Error
         };
-        self.diagnostic(
-            level,
-            error["message"]
-                .as_str()
-                .unwrap_or("agent error")
-                .to_owned(),
-        )
-        .await
+        self.events
+            .diagnostic(
+                level,
+                error["message"]
+                    .as_str()
+                    .unwrap_or("agent error")
+                    .to_owned(),
+            )
+            .await
     }
 
     /// Approvals and questions arrive as server→client JSON-RPC requests;
@@ -1167,8 +1267,8 @@ impl Drive {
                     detail: params["reason"].as_str().map(str::to_owned),
                 })
             }
-            // Schema-confirmed, never observed live on 0.147.0 (ticket 10):
-            // translated defensively; `Capability::Questions` stays off.
+            // Schema-confirmed, never observed live on 0.147.0; translated
+            // defensively while `Capability::Questions` stays off.
             "item/tool/requestUserInput" => {
                 let questions = questions(&params["questions"]);
                 self.requests.insert(
@@ -1185,6 +1285,7 @@ impl Drive {
                     .respond_error(wire_id, &format!("unsupported request: {other}"))
                     .await?;
                 return self
+                    .events
                     .diagnostic(
                         DiagnosticLevel::Warning,
                         format!("declined agent request {other}"),
@@ -1192,7 +1293,8 @@ impl Drive {
                     .await;
             }
         };
-        self.emit(DriverEvent::event(EventKind::RequestOpened(open)))
+        self.events
+            .send(DriverEvent::event(EventKind::RequestOpened(open)))
             .await
     }
 
@@ -1238,23 +1340,36 @@ impl Drive {
             })
     }
 
+    /// `turn/steer` into the running wire turn; refused when none is known.
     async fn send_steer(&mut self, input: Input) -> Result<(), Gone> {
         let Some(turn) = self.turn.clone() else {
-            self.emit(DriverEvent::Steered(false)).await?;
+            self.events.send(DriverEvent::Steered(false)).await?;
             return Ok(());
         };
-        let text = self.input_text(&input).await?;
+        let items = self.input_items(&input).await?;
         let params = json!({
             "threadId": self.thread_id,
             "expectedTurnId": turn,
             "clientUserMessageId": self.mint(),
-            "input": [{ "type": "text", "text": text }],
+            "input": items,
         });
         let id = self.wire.request("turn/steer", params).await?;
         self.pending.insert(id, Pending::Steer);
         Ok(())
     }
 
+    /// Sends the interrupt a cancel queued before the turn id was known.
+    async fn interrupt_if_pending(&mut self) -> Result<(), Gone> {
+        if self.cancel_pending
+            && let Some(turn) = self.turn.clone()
+        {
+            self.cancel_pending = false;
+            self.interrupt(&turn).await?;
+        }
+        Ok(())
+    }
+
+    /// `turn/interrupt` for one wire turn.
     async fn interrupt(&mut self, turn: &str) -> Result<(), Gone> {
         let id = self
             .wire
@@ -1267,69 +1382,75 @@ impl Drive {
         Ok(())
     }
 
-    /// Prompt text with attachment path refs. Image blocks are unprobed on
-    /// this wire, so attachments ride as refs only.
-    async fn input_text(&mut self, input: &Input) -> Result<String, Gone> {
+    /// The `input` items for a prompt or steer: the text with attachment
+    /// path refs, then one `localImage` per image under the inline cap.
+    async fn input_items(&mut self, input: &Input) -> Result<Vec<Value>, Gone> {
         let loaded = attach::load(&input.attachments).await;
         for problem in loaded.iter().filter_map(|l| l.problem.as_deref()) {
-            self.diagnostic(DiagnosticLevel::Warning, problem.to_owned())
+            self.events
+                .diagnostic(DiagnosticLevel::Warning, problem.to_owned())
                 .await?;
         }
-        Ok(attach::with_refs(input.as_text(), &loaded))
+        let mut items =
+            vec![json!({ "type": "text", "text": attach::with_refs(input.as_text(), &loaded) })];
+        for image in loaded.iter().filter(|l| l.image.is_some()) {
+            items.push(json!({ "type": "localImage", "path": image.path }));
+        }
+        Ok(items)
     }
 
+    /// `turn/start` params: every option rides each turn. `summary` opts
+    /// into reasoning summaries (none stream without it, probed 2026-09-03);
+    /// `fast` resolves the model's fast tier, and "default" is never sent.
+    fn turn_params(&mut self, items: Vec<Value>) -> Value {
+        let mut params = json!({
+            "threadId": self.thread_id,
+            "clientUserMessageId": self.mint(),
+            "input": items,
+            "summary": "auto",
+        });
+        let option = |key: &str| selected(&self.info, key);
+        for (key, param) in [
+            ("model", "model"),
+            ("effort", "effort"),
+            ("mode", "approvalPolicy"),
+        ] {
+            if let Some(value) = option(key) {
+                params[param] = json!(value);
+            }
+        }
+        if let Some(sandbox) = option("sandbox") {
+            params["sandboxPolicy"] = json!({ "type": sandbox_policy(&sandbox) });
+        }
+        if let Some(tier) = option("serviceTier").filter(|tier| tier != "default") {
+            params["serviceTier"] = json!(tier);
+        }
+        let fast = self.info.configuration.options.get(&ConfigId::new("fast"))
+            == Some(&ConfigValue::Bool(true));
+        if fast && let Some(tier) = option("model").and_then(|m| fast_tier(&self.models, &m)) {
+            params["serviceTier"] = json!(tier);
+        }
+        params
+    }
+
+    /// The next `clientUserMessageId`; echoes carrying it are our own.
     fn mint(&mut self) -> String {
         let id = format!("{CLIENT_MSG_PREFIX}{}", self.next_msg);
         self.next_msg += 1;
         id
     }
 
-    /// The agent went away: report how it died before the stream closes.
-    async fn report_exit(&mut self) {
-        let status = self.child.exit_status(CLOSE_GRACE).await;
-        let stderr = self.child.stderr_tail();
-        self.emit(DriverEvent::Exited { status, stderr }).await.ok();
-    }
-
-    async fn diagnostic(
-        &mut self,
-        level: DiagnosticLevel,
-        message: impl Into<String>,
-    ) -> Result<(), Gone> {
-        self.content(EventKind::Diagnostic(Diagnostic {
-            level,
-            message: message.into(),
-        }))
-        .await
-    }
-
     /// Emits one content event, attributed to the subagent tool when the frame
     /// came from a child thread.
     async fn content(&mut self, kind: EventKind) -> Result<(), Gone> {
-        self.emit(DriverEvent::Event {
-            kind,
-            parent_tool_id: self.child_tool.clone(),
-            extensions: Extensions::new(),
-        })
-        .await
-    }
-
-    async fn emit(&mut self, event: DriverEvent) -> Result<(), Gone> {
-        self.events.send(event).await.map_err(|_| Gone)
-    }
-}
-
-/// The engine or the agent is gone; the drive task unwinds.
-struct Gone;
-
-impl From<std::io::Error> for Gone {
-    fn from(_: std::io::Error) -> Self {
-        Gone
+        self.events
+            .content(kind, self.child_tool.clone(), Extensions::new())
+            .await
     }
 }
 
 // ---------------------------------------------------------------------------
-// Translation helpers
+// FRAME DECODING
 // ---------------------------------------------------------------------------
 
 /// Joined text of a message item's content blocks.
@@ -1449,21 +1570,6 @@ fn file_changes(changes: &Value) -> (Vec<PathBuf>, Vec<FileDiff>) {
     (locations, diffs)
 }
 
-fn plan_entries(plan: &Value) -> Vec<PlanEntry> {
-    plan.as_array()
-        .into_iter()
-        .flatten()
-        .map(|entry| PlanEntry {
-            text: entry["step"].as_str().unwrap_or_default().to_owned(),
-            status: match entry["status"].as_str().unwrap_or_default() {
-                "inProgress" | "in_progress" => PlanStatus::InProgress,
-                "completed" => PlanStatus::Completed,
-                _ => PlanStatus::Pending,
-            },
-        })
-        .collect()
-}
-
 /// `requestUserInput` questions to the portable shape. Choice ids are the
 /// labels: that is what the answer echoes back.
 fn questions(input: &Value) -> Vec<Question> {
@@ -1555,6 +1661,16 @@ fn window_label(mins: u64) -> String {
     }
 }
 
+/// The kebab-case sandbox setting as `turn/start`'s camelCase policy type.
+fn sandbox_policy(name: &str) -> &str {
+    match name {
+        "read-only" => "readOnly",
+        "workspace-write" => "workspaceWrite",
+        "danger-full-access" => "dangerFullAccess",
+        other => other,
+    }
+}
+
 /// The wire's camelCase sandbox report back to its kebab-case setting name.
 fn sandbox_name(sandbox: &Value) -> String {
     match sandbox["type"].as_str().unwrap_or_default() {
@@ -1565,6 +1681,7 @@ fn sandbox_name(sandbox: &Value) -> String {
     }
 }
 
+/// The catalog entry for a model id.
 fn model_entry<'a>(models: &'a Value, id: &str) -> Option<&'a Value> {
     models
         .as_array()?
@@ -1591,6 +1708,7 @@ fn fast_tier<'a>(models: &'a Value, model: &str) -> Option<&'a str> {
         })
 }
 
+/// The catalog's default model, else its first.
 fn default_model(models: &Value) -> Option<String> {
     let entries = models.as_array()?;
     entries
@@ -1601,6 +1719,7 @@ fn default_model(models: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// A model's default reasoning effort.
 fn default_effort(models: &Value, model: &str) -> Option<String> {
     model_entry(models, model)?["defaultReasoningEffort"]
         .as_str()
@@ -1639,8 +1758,8 @@ fn effort_choices(models: &Value, model: &str) -> Vec<ConfigChoice> {
 }
 
 /// "Standard" plus every service tier any model reports (`serviceTiers` in
-/// `model/list`); "default" is never sent on the wire. Tiers are identical
-/// across the models that have them, so one static option serves all.
+/// `model/list`). Tiers are identical across the models that have them, so
+/// one option serves all; `turn/start` resolves "default" per model.
 fn tier_choices(models: &Value) -> Vec<ConfigChoice> {
     let mut choices = vec![ConfigChoice {
         value: "default".into(),
@@ -1672,77 +1791,27 @@ fn tier_choices(models: &Value) -> Vec<ConfigChoice> {
 /// does not support falls back to its default.
 fn refresh_effort(info: &mut DriverInfo, models: &Value, model: &str) {
     let choices = effort_choices(models, model);
-    let effort_id = ConfigId::new("effort");
-    let current = info
-        .configuration
-        .options
-        .get(&effort_id)
-        .and_then(|v| match v {
-            ConfigValue::Text(text) => Some(text.clone()),
-            ConfigValue::Bool(_) => None,
-        })
-        .filter(|current| choices.iter().any(|c| &c.value == current))
+    let current = selected(info, "effort")
+        .filter(|level| choices.iter().any(|c| &c.value == level))
         .or_else(|| default_effort(models, model));
-    if let Some(option) = info
-        .details
-        .config_options
-        .iter_mut()
-        .find(|o| o.id == effort_id)
-    {
-        option.kind = ConfigKind::Select { choices };
-        option.current = current.clone().map(ConfigValue::Text);
-    }
-    match current {
-        Some(effort) => {
-            info.configuration
-                .options
-                .insert(effort_id, ConfigValue::Text(effort));
-        }
-        None => {
-            info.configuration.options.remove(&effort_id);
-        }
-    }
+    set_effort_option(info, choices, current);
 }
 
 // ---------------------------------------------------------------------------
-// Wire: line-delimited JSON-RPC 2.0 over the child's stdio
+// WIRE: JSON-RPC 2.0 requests, responses, and notifications
 // ---------------------------------------------------------------------------
 
 struct Wire {
-    stdin: tokio::process::ChildStdin,
-    /// All frames the reader task saw, bounded; pipe backpressure beyond.
-    frames: mpsc::Receiver<Value>,
+    line: LineWire,
     next_id: u64,
-    recorder: Option<WireRecorder>,
 }
 
 impl Wire {
     /// Takes the child's stdio and starts the line-reader task.
     fn over(child: &mut process::Child, recorder: Option<WireRecorder>) -> Self {
-        use tokio::io::{AsyncBufReadExt, BufReader};
-        let stdin = child.stdin.take().expect("piped stdin");
-        let stdout = child.stdout.take().expect("piped stdout");
-        let (tx, frames) = mpsc::channel(FRAME_BUFFER);
-        let reader_recorder = recorder.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(frame) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                if let Some(recorder) = &reader_recorder {
-                    recorder.record("in", &frame);
-                }
-                if tx.send(frame).await.is_err() {
-                    break;
-                }
-            }
-        });
         Self {
-            stdin,
-            frames,
+            line: LineWire::over(child, recorder),
             next_id: 1,
-            recorder,
         }
     }
 
@@ -1750,13 +1819,16 @@ impl Wire {
     async fn request(&mut self, method: &str, params: Value) -> std::io::Result<u64> {
         let id = self.next_id;
         self.next_id += 1;
-        self.write(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
+        self.line
+            .write(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
             .await?;
         Ok(id)
     }
 
+    /// A notification with empty params.
     async fn notify(&mut self, method: &str) -> Result<(), WireError> {
-        self.write(json!({ "jsonrpc": "2.0", "method": method, "params": {} }))
+        self.line
+            .write(json!({ "jsonrpc": "2.0", "method": method, "params": {} }))
             .await
             .map_err(|_| WireError::Closed)
     }
@@ -1764,12 +1836,14 @@ impl Wire {
     /// Answers one of the server's requests. Server ids live in the server's
     /// own id space, separate from ours.
     async fn respond(&mut self, id: u64, result: Value) -> std::io::Result<()> {
-        self.write(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+        self.line
+            .write(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
             .await
     }
 
+    /// Declines one of the server's requests.
     async fn respond_error(&mut self, id: u64, message: &str) -> std::io::Result<()> {
-        self.write(
+        self.line.write(
             json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": message } }),
         )
         .await
@@ -1783,7 +1857,7 @@ impl Wire {
             .await
             .map_err(|_| WireError::Closed)?;
         loop {
-            let frame = self.frames.recv().await.ok_or(WireError::Closed)?;
+            let frame = self.line.frames.recv().await.ok_or(WireError::Closed)?;
             if !frame["method"].is_null() || frame["id"].as_u64() != Some(id) {
                 continue;
             }
@@ -1793,16 +1867,6 @@ impl Wire {
             return Ok(frame["result"].clone());
         }
     }
-
-    async fn write(&mut self, frame: Value) -> std::io::Result<()> {
-        use tokio::io::AsyncWriteExt;
-        if let Some(recorder) = &self.recorder {
-            recorder.record("out", &frame);
-        }
-        let mut line = frame.to_string();
-        line.push('\n');
-        self.stdin.write_all(line.as_bytes()).await
-    }
 }
 
 enum WireError {
@@ -1811,6 +1875,7 @@ enum WireError {
 }
 
 impl WireError {
+    /// A handshake failure as the caller's error.
     fn into_error(self) -> AgentError {
         match self {
             WireError::Closed => AgentError::ProtocolFailed("agent closed the wire".into()),

@@ -63,6 +63,7 @@ That's the whole core flow. Everything else is the same few objects:
 | Switch model / mode / any advertised option live | `session.configure("model", "sonnet")` |
 | Resume, fork, or rewind a conversation | `SessionOptions::resume` / `fork_from`, `session.rollback(..)` |
 | Add custom MCP Servers | `SessionOptions::mcp_server(..)` |
+| Test your app against a scripted agent, no subprocess | `Runtime::with_mock(script)` (feature `mock`) |
 
 Events cover streamed text and reasoning, typed tool calls with diffs, plans,
 token usage, permission requests, subagents, and turn boundaries — the same

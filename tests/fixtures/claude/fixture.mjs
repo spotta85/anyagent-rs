@@ -12,6 +12,12 @@ import { createInterface } from 'node:readline';
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 
 const flag = (name) => process.argv.includes(name);
+const argAfter = (name) => { const i = process.argv.indexOf(name); return i > -1 ? process.argv[i + 1] : undefined; };
+// Flag settings: seeded from the launch flags, merged by apply_flag_settings.
+const flags = {
+  fastMode: argAfter('--settings') ? JSON.parse(argAfter('--settings')).fastMode === true : undefined,
+  effortLevel: argAfter('--effort'),
+};
 const send = (m) => process.stdout.write(JSON.stringify(m) + '\n');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // A fork launch (`--fork-session`, optionally `--resume-session-at=<uuid>`)
@@ -19,7 +25,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const FORK_AT = (process.argv.find((a) => a.startsWith('--resume-session-at=')) ?? '').slice(20) || null;
 const S = flag('--fork-session') ? 'sess-fork-1' : 'sess-c1';
 if (flag('--echo-relaunch')) appendFileSync('launches.jsonl', JSON.stringify(process.argv) + '\n');
-let recalled = flag('--echo-relaunch') && flag('--resume') ? JSON.parse(readFileSync('history.json', 'utf8')) : [];
+let recalled = flag('--echo-relaunch') && flag('--resume') && existsSync('history.json') ? JSON.parse(readFileSync('history.json', 'utf8')) : [];
 let n = 0;
 const uid = () => `f${n++}`;
 const USAGE = { input_tokens: 2, cache_creation_input_tokens: 198, cache_read_input_tokens: 1000, output_tokens: 0 };
@@ -87,6 +93,11 @@ function onControl(m) {
     }
     case 'set_permission_mode':
       return reply({ mode: m.request.mode });
+    // Live settings merge (2.1.261): fastMode and effortLevel. The real CLI
+    // acknowledges any value (probed 2026-09-05, even `bogus`).
+    case 'apply_flag_settings':
+      Object.assign(flags, m.request.settings ?? {});
+      return reply({});
     case 'set_model':
       return reply({});
     case 'get_binary_version':
@@ -148,6 +159,16 @@ async function runTurn(m) {
     send({ type: 'assistant', message: { id: 'err_1', model: '<synthetic>', role: 'assistant', content: [{ type: 'text', text: 'Not logged in · Please run /login' }], usage: USAGE }, session_id: S, uuid: uid(), parent_tool_use_id: null, error: 'authentication_failed', is_api_error_message: true });
     send({ type: 'result', session_id: S, uuid: uid(), subtype: 'success', is_error: true, stop_reason: 'stop_sequence', terminal_reason: 'api_error', num_turns: 1, total_cost_usd: 0, usage: {}, modelUsage: {}, result: 'Not logged in · Please run /login', user_message_uuid: u });
     turn = null;
+    return;
+  }
+  // An unknown `/command` is answered by the CLI itself (2.1.261): a
+  // synthetic assistant message plus a result naming it, nothing streamed.
+  if (prompt.startsWith('/') && !prompt.startsWith('/compact')) {
+    const name = prompt.split(' ')[0];
+    send({ type: 'assistant', message: { id: 'syn_1', model: '<synthetic>', role: 'assistant', content: [{ type: 'text', text: `Unknown command: ${name}` }], usage: USAGE }, session_id: S, uuid: uid(), parent_tool_use_id: null });
+    resultFrame({ result: `Unknown command: ${name}`, user_message_uuid: u });
+    turn = null;
+    if (queue.length) runTurn(queue.shift()).catch(() => process.exit(1));
     return;
   }
   // `/compact` (probed 2026-09-04, 2.1.260). Success is silent: status
@@ -248,8 +269,9 @@ async function runTurn(m) {
   // Echo the config-home env var so tests can assert isolation reached the
   // child (set by SessionOptions::config_home).
   if (flag('--echo-config-home')) delta({ type: 'text_delta', text: `cfg=${process.env.CLAUDE_CONFIG_DIR ?? 'unset'} ` });
-  const settingsIndex = process.argv.indexOf('--settings');
-  if (settingsIndex > -1) delta({ type: 'text_delta', text: `fast=${JSON.parse(process.argv[settingsIndex + 1]).fastMode} ` });
+  // Echo the flag settings once any was set, so tests can assert switches.
+  if (flags.fastMode !== undefined || flags.effortLevel !== undefined)
+    delta({ type: 'text_delta', text: `fast=${flags.fastMode ?? false} effort=${flags.effortLevel ?? 'unset'} ` });
   // Echo --mcp-config so tests can assert the launch shape.
   const mi = process.argv.indexOf('--mcp-config');
   if (mi > -1) {

@@ -1,5 +1,10 @@
 //! The session engine owns the adapter connection, turn state, and prompt
 //! queue. Applications hold only `Session` and `Events`.
+//!
+//! High level: `start` spawns one `Engine` task per session; `Engine::run`
+//! loops over commands (`handle_command`), driver events
+//! (`handle_driver_event`), and the quiet-window watchdog (`on_quiet`), then
+//! promotes queued prompts and syncs the status.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroU32;
@@ -32,8 +37,15 @@ const EVENT_BUFFER: usize = 1024;
 const CLOSE_GRACE: Duration = Duration::from_secs(5);
 const QUIET_USER_TURN: Duration = Duration::from_secs(120);
 const QUIET_AGENT_TURN: Duration = Duration::from_secs(20);
+/// Default `SessionOptions::stall_after`: mid-turn silence that earns a
+/// warning. Never ends the turn: a slow tool and a hung agent look the same.
+const STALL_WARNING: Duration = Duration::from_secs(120);
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
+
+// ---------------------------------------------------------------------------
+// PUBLIC HANDLES
+// ---------------------------------------------------------------------------
 
 /// Snapshot of a live session. Also carried by `EventKind::SessionUpdated`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -70,6 +82,7 @@ pub struct Session {
     id: SessionId,
     commands: mpsc::Sender<Command>,
     info: Arc<Mutex<SessionInfo>>,
+    tools_disabled: bool,
 }
 
 /// Ordered event stream, buffering up to 1024 undrained events.
@@ -103,6 +116,7 @@ enum Command {
 }
 
 impl Session {
+    /// The engine-minted session id every event carries.
     pub fn id(&self) -> &SessionId {
         &self.id
     }
@@ -116,6 +130,11 @@ impl Session {
     /// The push form of the same fact is `EventKind::StatusChanged`.
     pub fn status(&self) -> SessionStatus {
         self.info.lock().unwrap_or_else(|e| e.into_inner()).status
+    }
+
+    /// The adapter honoured `no_tools`: the agent cannot run tools here.
+    pub(crate) fn tools_disabled(&self) -> bool {
+        self.tools_disabled
     }
 
     /// Starts a turn when idle. During a turn, steers when possible or queues.
@@ -240,6 +259,8 @@ pub(crate) fn start(
         deadline: None,
         closing: None,
         auto_approve: matches!(options.permission_mode, PermissionMode::AutoApprove),
+        stall: None,
+        stall_after: options.stall_after.unwrap_or(STALL_WARNING),
         exit: None,
         noise_reported: false,
         awaiting_ack: false,
@@ -253,6 +274,7 @@ pub(crate) fn start(
             id,
             commands: commands_tx,
             info,
+            tools_disabled: connection.info.tools_disabled,
         },
         Events(events_rx),
     )
@@ -271,6 +293,7 @@ fn quiet_window(
     Some(options.quiet_window.unwrap_or(default))
 }
 
+/// The first snapshot, from what the adapter learned at connect.
 fn session_info(id: SessionId, agent: AgentInstallation, info: &DriverInfo) -> SessionInfo {
     SessionInfo {
         id,
@@ -284,7 +307,7 @@ fn session_info(id: SessionId, agent: AgentInstallation, info: &DriverInfo) -> S
 }
 
 // ---------------------------------------------------------------------------
-// Engine
+// ENGINE: state
 // ---------------------------------------------------------------------------
 
 enum TurnState {
@@ -316,6 +339,7 @@ struct QuestionShape {
 }
 
 impl RequestShape {
+    /// What a request accepts, taken from the request itself.
     fn of(request: &Request) -> Self {
         match request {
             Request::Permission(r) => RequestShape::Permission(r.options.clone()),
@@ -388,7 +412,7 @@ fn question_complaint(question: &QuestionShape, answer: &QuestionAnswer) -> Opti
 struct Engine {
     id: SessionId,
     info: Arc<Mutex<SessionInfo>>,
-    driver: mpsc::Sender<DriverCommand>,
+    driver: mpsc::UnboundedSender<DriverCommand>,
     events: mpsc::Sender<Result<Event, AgentError>>,
     events_alive: bool,
     seq: u64,
@@ -407,6 +431,10 @@ struct Engine {
     closing: Option<Vec<Reply<()>>>,
     /// `PermissionMode::AutoApprove`: allow each permission request once.
     auto_approve: bool,
+    /// When mid-turn silence becomes a warning; re-armed by every driver
+    /// event, off while the agent waits on the caller.
+    stall: Option<Instant>,
+    stall_after: Duration,
     /// Exit report from the adapter, delivered just before its channel closes.
     exit: Option<(String, String)>,
     noise_reported: bool,
@@ -428,6 +456,9 @@ impl Engine {
         let mut commands_open = true;
         while !self.done {
             let deadline = self.deadline.unwrap_or_else(Instant::now);
+            let stall = self.stall.unwrap_or_else(Instant::now);
+            // Biased: a queued driver event re-arms the deadline before the
+            // quiet timer can end the turn under it.
             tokio::select! {
                 biased;
                 cmd = commands.recv(), if commands_open => match cmd {
@@ -438,11 +469,17 @@ impl Engine {
                     }
                 },
                 ev = driver_events.recv() => match ev {
-                    Some(ev) => self.handle_driver_event(ev).await,
+                    Some(ev) => {
+                        self.handle_driver_event(ev).await;
+                        self.arm_stall();
+                    }
                     None => self.driver_gone().await,
                 },
                 _ = tokio::time::sleep_until(deadline), if self.deadline.is_some() => {
                     self.on_quiet().await;
+                }
+                _ = tokio::time::sleep_until(stall), if self.stall.is_some() => {
+                    self.on_stall().await;
                 }
             }
             // Frames already queued may still belong to the turn that just
@@ -482,8 +519,11 @@ impl Engine {
         self.emit(EventKind::StatusChanged(status), false).await;
     }
 
-    // -- commands -----------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // ENGINE: commands from the application
+    // -----------------------------------------------------------------------
 
+    /// Routes one command to its handler and replies to the caller.
     async fn handle_command(&mut self, cmd: Command) {
         match cmd {
             Command::Prompt(input, reply) => self.handle_prompt(input, reply).await,
@@ -543,7 +583,7 @@ impl Engine {
             }
             TurnState::Running { .. } if self.steer_supported && self.steer.is_none() => {
                 self.steer = Some((prompt_id, input.clone(), reply));
-                if self.forward(DriverCommand::Steer { input }).await.is_err() {
+                if self.forward(DriverCommand::Steer { input }).is_err() {
                     self.resolve_steer(false).await;
                 }
             }
@@ -576,14 +616,14 @@ impl Engine {
             )));
         };
         shape.accepts(&answer)?;
-        if let TurnState::Running { open_requests, .. } = &mut self.state {
-            open_requests.remove(&request);
-        }
+        // Forward first: a rejected forward leaves the request open.
         self.forward(DriverCommand::Answer {
             request: request.clone(),
             answer,
-        })
-        .await?;
+        })?;
+        if let TurnState::Running { open_requests, .. } = &mut self.state {
+            open_requests.remove(&request);
+        }
         self.emit(
             EventKind::RequestClosed {
                 request_id: request,
@@ -592,6 +632,7 @@ impl Engine {
         )
         .await;
         self.arm_deadline();
+        self.arm_stall();
         Ok(())
     }
 
@@ -633,52 +674,53 @@ impl Engine {
                 )));
             }
         }
-        self.forward(DriverCommand::Configure(id, value)).await
+        self.forward(DriverCommand::Configure(id, value))
     }
 
+    /// Checks rollback support and idleness, then forwards.
     async fn handle_rollback(
         &mut self,
         turns: NonZeroU32,
         scope: RollbackScope,
     ) -> Result<(), AgentError> {
-        let capabilities = self.info().details.capabilities;
-        if !capabilities.supports(Capability::Rollback) {
+        if !self.supports(Capability::Rollback) {
             return Err(AgentError::UnsupportedFeature("rollback".into()));
         }
-        if scope == RollbackScope::ConversationAndFiles
-            && !capabilities.supports(Capability::RollbackFiles)
+        if scope == RollbackScope::ConversationAndFiles && !self.supports(Capability::RollbackFiles)
         {
             return Err(AgentError::UnsupportedFeature("file rollback".into()));
         }
         if matches!(self.state, TurnState::Running { .. }) {
             return Err(AgentError::SessionBusy);
         }
-        self.forward(DriverCommand::Rollback(turns, scope)).await
+        self.forward(DriverCommand::Rollback(turns, scope))
     }
 
     /// Compaction occupies the agent, so it runs as an agent-originated turn:
     /// prompts queue behind it, and the adapter's turn end closes it.
     async fn handle_compact(&mut self) -> Result<(), AgentError> {
-        if !self
-            .info()
-            .details
-            .capabilities
-            .supports(Capability::Compact)
-        {
+        if !self.supports(Capability::Compact) {
             return Err(AgentError::UnsupportedFeature("compact".into()));
         }
         if matches!(self.state, TurnState::Running { .. }) {
             return Err(AgentError::SessionBusy);
         }
-        self.forward(DriverCommand::Compact).await?;
+        self.forward(DriverCommand::Compact)?;
         self.enter_running(TurnOrigin::Agent).await;
         Ok(())
     }
 
     /// Cancels the active turn; open requests close first. Idempotent.
+    /// Clearing the queue also drops a steer still waiting for its verdict,
+    /// or it would be requeued at turn end and run after the cancel.
     async fn handle_cancel(&mut self, clear_queue: bool) -> Result<(), AgentError> {
         if clear_queue {
             self.queue.clear();
+            if let Some((_, _, reply)) = self.steer.take() {
+                let _ = reply.send(Err(AgentError::InvalidRequest(
+                    "cancelled before delivery".into(),
+                )));
+            }
         }
         let TurnState::Running { open_requests, .. } = &mut self.state else {
             return Ok(());
@@ -692,7 +734,7 @@ impl Engine {
             )
             .await;
         }
-        let result = self.forward(DriverCommand::Cancel).await;
+        let result = self.forward(DriverCommand::Cancel);
         self.arm_deadline();
         result
     }
@@ -713,13 +755,16 @@ impl Engine {
         self.state = TurnState::Closing;
         self.closing.get_or_insert_with(Vec::new).extend(reply);
         if first {
-            let _ = self.driver.send(DriverCommand::Close).await;
+            let _ = self.driver.send(DriverCommand::Close);
             self.deadline = Some(Instant::now() + CLOSE_GRACE);
         }
     }
 
-    // -- driver events --------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // ENGINE: events from the adapter
+    // -----------------------------------------------------------------------
 
+    /// Routes one driver event; content before a `TurnAck` is stale and dropped.
     async fn handle_driver_event(&mut self, ev: DriverEvent) {
         // Turn content delivered between our `StartTurn` and the adapter's
         // ack belongs to a turn the engine already ended; attributing it to
@@ -761,15 +806,16 @@ impl Engine {
             return;
         }
         // AutoApprove answers permissions itself; the caller never sees them.
+        // A request that does not offer a one-time allow is forwarded
+        // instead: a persistent rule is never chosen on the caller's behalf.
         if self.auto_approve
             && let EventKind::RequestOpened(Request::Permission(request)) = &kind
+            && request.options.contains(&PermissionChoice::AllowOnce)
         {
-            let _ = self
-                .forward(DriverCommand::Answer {
-                    request: request.id.clone(),
-                    answer: Answer::Permission(PermissionChoice::AllowOnce),
-                })
-                .await;
+            let _ = self.forward(DriverCommand::Answer {
+                request: request.id.clone(),
+                answer: Answer::Permission(PermissionChoice::AllowOnce),
+            });
             return;
         }
         if matches!(self.state, TurnState::Idle) && is_content(&kind) {
@@ -795,6 +841,7 @@ impl Engine {
         self.arm_deadline();
     }
 
+    /// Wire evidence that the turn ended; late ones are one diagnostic.
     async fn handle_turn_ended(&mut self, stop: StopReason) {
         if matches!(self.state, TurnState::Running { .. }) {
             self.end_turn(stop).await;
@@ -807,6 +854,7 @@ impl Engine {
         }
     }
 
+    /// Adopts new advertised details and republishes the snapshot.
     async fn handle_info_changed(&mut self, info: DriverInfo) {
         let updated = {
             let mut current = self.info.lock().unwrap_or_else(|e| e.into_inner());
@@ -890,6 +938,20 @@ impl Engine {
         }
     }
 
+    /// The agent has been silent mid-turn for `stall_after`: say so once,
+    /// and again only after it speaks and goes quiet again. The seconds ride
+    /// `extensions["anyagent/stalled"]` so apps can match without the text.
+    async fn on_stall(&mut self) {
+        self.stall = None;
+        let secs = self.stall_after.as_secs();
+        let kind = EventKind::Diagnostic(Diagnostic {
+            level: DiagnosticLevel::Warning,
+            message: format!("no activity from the agent for {secs} s; cancel if it is stuck"),
+        });
+        let extensions = Extensions::from([("anyagent/stalled".to_owned(), secs.into())]);
+        self.emit_with(kind, true, extensions).await;
+    }
+
     /// The quiet window elapsed, or the close grace expired.
     async fn on_quiet(&mut self) {
         self.deadline = None;
@@ -914,7 +976,9 @@ impl Engine {
         }
     }
 
-    // -- turn lifecycle -------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // ENGINE: turn lifecycle
+    // -----------------------------------------------------------------------
 
     /// Starts the next queued prompt when the session is idle.
     async fn promote(&mut self) {
@@ -931,7 +995,7 @@ impl Engine {
     async fn start_turn(&mut self, prompt_id: PromptId, input: Input) -> TurnId {
         let turn = self.enter_running(TurnOrigin::Prompt(prompt_id)).await;
         self.awaiting_ack = true;
-        let _ = self.forward(DriverCommand::StartTurn { input }).await;
+        let _ = self.forward(DriverCommand::StartTurn { input });
         turn
     }
 
@@ -948,6 +1012,7 @@ impl Engine {
         };
         self.emit(EventKind::TurnStarted { origin }, true).await;
         self.arm_deadline();
+        self.arm_stall();
         turn
     }
 
@@ -998,7 +1063,11 @@ impl Engine {
             Extensions::new(),
         )
         .await;
-        self.deadline = None;
+        // A failed push above may have started closing; keep its grace.
+        if !matches!(self.state, TurnState::Closing) {
+            self.deadline = None;
+        }
+        self.stall = None;
         self.noise_reported = false;
         self.resolve_steer(false).await;
     }
@@ -1021,19 +1090,37 @@ impl Engine {
         }
     }
 
-    // -- helpers ----------------------------------------------------------------
-
-    fn info(&self) -> SessionInfo {
-        self.info.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    /// Arms the stall warning while a turn runs and the agent is not waiting
+    /// on the caller; clears it otherwise.
+    fn arm_stall(&mut self) {
+        self.stall = match &self.state {
+            TurnState::Running { open_requests, .. } if open_requests.is_empty() => {
+                Some(Instant::now() + self.stall_after)
+            }
+            _ => None,
+        };
     }
 
-    async fn forward(&self, cmd: DriverCommand) -> Result<(), AgentError> {
-        self.driver
-            .send(cmd)
-            .await
-            .map_err(|_| AgentError::SessionClosed)
+    // -----------------------------------------------------------------------
+    // HELPERS
+    // -----------------------------------------------------------------------
+
+    /// Whether the session advertises this action, read under the lock.
+    fn supports(&self, cap: Capability) -> bool {
+        self.info
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .details
+            .capabilities
+            .supports(cap)
     }
 
+    /// Hands a command to the adapter; a gone adapter reads as closed.
+    fn forward(&self, cmd: DriverCommand) -> Result<(), AgentError> {
+        self.driver.send(cmd).map_err(|_| AgentError::SessionClosed)
+    }
+
+    /// A warning-level diagnostic outside any turn.
     async fn diagnostic(&mut self, message: impl Into<String>) {
         let kind = EventKind::Diagnostic(Diagnostic {
             level: DiagnosticLevel::Warning,
@@ -1044,6 +1131,11 @@ impl Engine {
 
     /// Emits an engine-made event, attached to the running turn when asked.
     async fn emit(&mut self, kind: EventKind, in_turn: bool) {
+        self.emit_with(kind, in_turn, Extensions::new()).await;
+    }
+
+    /// `emit` with extensions.
+    async fn emit_with(&mut self, kind: EventKind, in_turn: bool, extensions: Extensions) {
         let turn = match (&self.state, in_turn) {
             (TurnState::Running { turn, .. }, true) => Some(TurnContext {
                 id: turn.clone(),
@@ -1051,7 +1143,7 @@ impl Engine {
             }),
             _ => None,
         };
-        self.push(turn, kind, Extensions::new()).await;
+        self.push(turn, kind, extensions).await;
     }
 
     /// Assigns the sequence number and delivers. `try_send` never parks the

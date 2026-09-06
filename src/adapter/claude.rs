@@ -1,6 +1,10 @@
 //! Native Claude Code adapter: drives `claude` over its stream-json wire
-//! (validated 2026-08-23, ticket 04). Turn end is deterministic: exactly one
-//! `result` frame per turn. The engine owns all turn rules.
+//! (validated 2026-08-23). Turn end is deterministic: exactly one `result`
+//! frame per turn. The engine owns all turn rules.
+//!
+//! High level: `connect` → `launch` (spawn + `handshake`) → `driver_info`;
+//! then `Drive::run` turns commands into control requests and user messages
+//! (`handle_command`) and wire frames into events (`handle_frame`, `on_*`).
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -9,10 +13,11 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use crate::adapter::plan_entries;
 use crate::adapter::{
-    Adapter, ConnectRequest, DriverCommand, DriverConnection, DriverEvent, DriverInfo,
-    WireRecorder, attach, cap, login_methods, with_stderr,
+    Adapter, CLOSE_GRACE, ConnectRequest, DriverCommand, DriverConnection, DriverEvent, DriverInfo,
+    Emitter, FRAME_BUFFER, Gone, HANDSHAKE_TIMEOUT, LineWire, OUTPUT_CAP, WireRecorder, attach,
+    cap, level_choices, login_methods, plan_entries, selected, set_effort_option, set_fast_option,
+    with_stderr,
 };
 use crate::agent::{
     AccountInfo, AgentDetails, AuthKind, AuthStatus, Capabilities, Capability, ConfigChoice,
@@ -28,11 +33,7 @@ use crate::event::{
 };
 use crate::process::{self, Spawn};
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
-const CLOSE_GRACE: Duration = Duration::from_secs(2);
 const REWIND_TIMEOUT: Duration = Duration::from_secs(10);
-const FRAME_BUFFER: usize = 64;
-const OUTPUT_CAP: usize = 16 * 1024;
 
 /// Gateway credential: the CLI accepts it but never names it in `account`.
 const GATEWAY_TOKEN_ENV: &str = "ANTHROPIC_AUTH_TOKEN";
@@ -58,6 +59,7 @@ const BASE_ARGS: [&str; 10] = [
 pub(crate) struct ClaudeAdapter;
 
 impl ClaudeAdapter {
+    /// One instance drives every claude session.
     pub(crate) fn new() -> Self {
         Self
     }
@@ -69,23 +71,24 @@ impl Adapter for ClaudeAdapter {
     /// live wire to the drive task.
     async fn connect(&self, request: ConnectRequest) -> Result<DriverConnection, AgentError> {
         let (ev_tx, ev_rx) = mpsc::channel(FRAME_BUFFER);
-        let recorder = WireRecorder::for_session(&request.options, &ev_tx).await;
+        let events = Emitter::new(ev_tx);
+        let recorder = WireRecorder::for_session(&request.options, &events).await;
         let (child, wire, info, models) =
             launch(&request, &request.options.start, recorder.clone()).await?;
-        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         tokio::spawn(
             Drive {
                 wire,
                 child,
-                events: ev_tx,
+                events,
                 info: info.clone(),
                 models,
-                launched_fast: requested_fast(&request),
                 tools: HashMap::new(),
                 requests: HashMap::new(),
                 messages: HashMap::new(),
                 configs: Vec::new(),
                 usage_request: None,
+                interrupt_id: None,
                 turn_uuid: None,
                 turn_assistant: None,
                 history: Vec::new(),
@@ -133,6 +136,10 @@ impl Adapter for ClaudeAdapter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// LAUNCH AND HANDSHAKE
+// ---------------------------------------------------------------------------
+
 /// Spawns the CLI bound to `start` and handshakes within the timeout: the
 /// one launch recipe for `connect` and rollback's respawn.
 async fn launch(
@@ -166,6 +173,9 @@ async fn launch(
         }
     };
     args.extend(option_args(&request.options)?);
+    if request.options.no_tools {
+        args.extend(["--tools".into(), String::new()]);
+    }
     let mut env = crate::adapter::config_home_env(&request.installation, &request.options)?;
     // Free until used (probed 2026-08-27): enables `rewind_files` for the
     // files rollback scope. Env-only, so it must be set at spawn.
@@ -300,33 +310,22 @@ fn supports_fast(models: &Value, model: &str) -> bool {
         .any(|entry| entry["value"].as_str() == Some(model) && entry["supportsFastMode"] == true)
 }
 
-/// The current model's effort levels as a creation-only option; `None` when
-/// the catalog has no levels for it.
-fn effort_option(models: &Value, model: &str, configured: Option<String>) -> Option<ConfigOption> {
-    let entries = models.as_array()?;
+/// The current model's effort levels as a live option (`apply_flag_settings`
+/// switches it); `None` when the catalog has none.
+fn effort_levels(models: &Value, model: &str) -> Vec<ConfigChoice> {
+    let Some(entries) = models.as_array() else {
+        return Vec::new();
+    };
     let entry = entries
         .iter()
         .find(|m| m["value"].as_str() == Some(model))
-        .or_else(|| entries.first())?;
-    let choices: Vec<ConfigChoice> = entry["supportedEffortLevels"]
-        .as_array()?
-        .iter()
-        .filter_map(|level| level.as_str())
-        .map(|level| ConfigChoice {
-            value: level.to_owned(),
-            label: level.to_owned(),
-            description: None,
-        })
-        .collect();
-    (!choices.is_empty()).then(|| ConfigOption {
-        id: ConfigId::new("effort"),
-        name: "Reasoning effort".into(),
-        category: Some("thought_level".into()),
-        kind: ConfigKind::Select { choices },
-        // `None`: the CLI keeps its own default and never reports it.
-        current: configured.map(ConfigValue::Text),
-        live: false,
-    })
+        .or_else(|| entries.first());
+    let levels = entry
+        .and_then(|e| e["supportedEffortLevels"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str);
+    level_choices(levels)
 }
 
 /// The `initialize` model catalog as config choices.
@@ -343,21 +342,10 @@ fn model_choices(models: &Value) -> Vec<ConfigChoice> {
         .collect()
 }
 
-/// Login state from `initialize`'s `account`. The CLI always sends the object,
-/// so only its contents separate a login from none (all probed live
-/// 2026-08-27, claude 2.1.241):
-///
-/// - `email` / `subscriptionType` — a real login, subscription or console.
-/// - `apiProvider: "bedrock"` — external AWS credentials, no Anthropic login.
-/// - `tokenSource: "none"` plus `ANTHROPIC_AUTH_TOKEN` in the environment — a
-///   gateway login, which the wire never reports.
-/// - `apiKeySource` — a key supplied by that env var. Note `tokenSource` is
-///   still `"none"` here, so it alone cannot mean "logged out".
-/// - `tokenSource: "none"` and nothing else — no credential. This is what an
-///   expired OAuth session looks like, and it read as an API-key login before
-///   this gate existed.
-/// - anything else — defer to the offline marker instead of inventing an
-///   answer.
+/// Login state from `initialize`'s `account` (probed 2026-08-27, 2.1.241):
+/// email/plan = a login; `apiProvider: bedrock` = cloud credentials;
+/// `apiKeySource` or a known `tokenSource` = API key; `tokenSource: none`
+/// = logged out unless the gateway token env is set; else the marker.
 fn account_status(account: &Value, request: &ConnectRequest) -> AuthStatus {
     let email = account["email"].as_str();
     let plan = account["subscriptionType"].as_str();
@@ -374,10 +362,8 @@ fn account_status(account: &Value, request: &ConnectRequest) -> AuthStatus {
             }),
         };
     }
-    // A cloud-provider login carries no Anthropic identity at all: auth is the
-    // provider's own credentials, so `apiProvider` is the only tell. T3 keys on
-    // the same field (`ClaudeProvider.ts:567`); Vertex's value is unconfirmed,
-    // so it is not guessed here — it falls to the marker like any unknown shape.
+    // A cloud-provider login has no Anthropic identity; `apiProvider` is
+    // the only tell. Vertex's value is unconfirmed, so it is not guessed.
     if account["apiProvider"].as_str() == Some("bedrock") {
         return AuthStatus::Authenticated {
             kind: AuthKind::CloudProvider,
@@ -390,10 +376,8 @@ fn account_status(account: &Value, request: &ConnectRequest) -> AuthStatus {
             account: None,
         };
     }
-    // Some CLI versions name the credential in `tokenSource` itself instead of
-    // `apiKeySource` ("apiKey", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN" —
-    // T3's observed set, `ClaudeProvider.ts:516`). Only those known spellings
-    // count; other non-"none" values still fall to the marker.
+    // Some CLI versions name the credential in `tokenSource` instead; only
+    // the known spellings count, other values fall to the marker.
     let token_source = account["tokenSource"].as_str().unwrap_or_default();
     let normalized = token_source.to_lowercase().replace(['_', '-', ' '], "");
     if matches!(
@@ -406,11 +390,8 @@ fn account_status(account: &Value, request: &ConnectRequest) -> AuthStatus {
         };
     }
     if account["tokenSource"].as_str() == Some("none") {
-        // A gateway credential is invisible on this wire: with only
-        // `ANTHROPIC_AUTH_TOKEN` set, the account object is byte-identical to a
-        // logged-out one (probed live 2026-08-27). Read the variable the same
-        // way discovery reads `ANTHROPIC_API_KEY`, or we call working setups
-        // logged out. Like any key, it is reported, never validated.
+        // A gateway token is invisible on this wire (the account object
+        // reads logged out); the env var is reported, never validated.
         if std::env::var(GATEWAY_TOKEN_ENV).is_ok_and(|v| !v.trim().is_empty()) {
             return AuthStatus::Authenticated {
                 kind: AuthKind::ApiKey,
@@ -431,22 +412,7 @@ fn account_status(account: &Value, request: &ConnectRequest) -> AuthStatus {
 /// What the `initialize` response tells us, folded into the engine vocabulary.
 fn driver_info(init: &Value, version: Option<String>, request: &ConnectRequest) -> DriverInfo {
     let auth = account_status(&init["account"], request);
-    let commands = init["commands"]
-        .as_array()
-        .map(|commands| {
-            commands
-                .iter()
-                .map(|c| SlashCommand {
-                    name: c["name"].as_str().unwrap_or_default().to_owned(),
-                    description: c["description"].as_str().unwrap_or_default().to_owned(),
-                    input_hint: c["argumentHint"]
-                        .as_str()
-                        .filter(|h| !h.is_empty())
-                        .map(str::to_owned),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let commands = slash_commands(&init["commands"]);
     // The CLI's fixed permission modes, current from `initialize`.
     let mode = init["current_permission_mode"]
         .as_str()
@@ -454,7 +420,7 @@ fn driver_info(init: &Value, version: Option<String>, request: &ConnectRequest) 
         .to_owned();
     let mode_option = ConfigOption {
         id: ConfigId::new("mode"),
-        name: "Permission mode".into(),
+        name: "Mode".into(),
         category: Some("mode".into()),
         kind: ConfigKind::Select {
             choices: ["default", "acceptEdits", "plan", "bypassPermissions"]
@@ -481,10 +447,6 @@ fn driver_info(init: &Value, version: Option<String>, request: &ConnectRequest) 
         current: Some(ConfigValue::Text(model.clone())),
         live: true,
     };
-    // Effort is creation-only (`--effort`): the wire has no live switch — the
-    // `/effort` command runs as its own synthetic turn (probed 2026-08-24).
-    // A live change is a reopen with the resume token.
-    let effort_option = effort_option(&init["models"], &model, creation_option(request, "effort"));
     let mut configuration = SessionConfiguration::default();
     configuration
         .options
@@ -492,11 +454,6 @@ fn driver_info(init: &Value, version: Option<String>, request: &ConnectRequest) 
     configuration
         .options
         .insert(ConfigId::new("model"), ConfigValue::Text(model.clone()));
-    if let Some(current) = effort_option.as_ref().and_then(|o| o.current.clone()) {
-        configuration
-            .options
-            .insert(ConfigId::new("effort"), current);
-    }
     let mut info = DriverInfo {
         details: AgentDetails {
             version,
@@ -517,15 +474,13 @@ fn driver_info(init: &Value, version: Option<String>, request: &ConnectRequest) 
                     Capability::Compact,
                     Capability::SlashCommands,
                     Capability::Resume,
+                    Capability::Plan,
                 ]);
                 capabilities.mcp_transports =
                     vec![McpTransport::Stdio, McpTransport::Http, McpTransport::Sse];
                 capabilities
             },
-            config_options: [Some(mode_option), Some(model_option), effort_option]
-                .into_iter()
-                .flatten()
-                .collect(),
+            config_options: vec![mode_option, model_option],
             commands,
         },
         configuration,
@@ -536,11 +491,19 @@ fn driver_info(init: &Value, version: Option<String>, request: &ConnectRequest) 
             SessionStart::New | SessionStart::Fork { .. } => None,
         },
         title: None,
+        tools_disabled: request.options.no_tools,
         // Every turn shape ends with its own `result` frame.
         deterministic_turn_end: true,
         deterministic_agent_turn_end: true,
     };
-    crate::adapter::set_fast_option(
+    // Effort rides `--effort` at launch and `apply_flag_settings` live. No
+    // selection: the CLI keeps its own default and never reports it.
+    set_effort_option(
+        &mut info,
+        effort_levels(&init["models"], &model),
+        creation_option(request, "effort"),
+    );
+    set_fast_option(
         &mut info,
         supports_fast(&init["models"], &model).then_some(requested_fast(request)),
         true,
@@ -549,7 +512,7 @@ fn driver_info(init: &Value, version: Option<String>, request: &ConnectRequest) 
 }
 
 // ---------------------------------------------------------------------------
-// Drive task: engine commands out, wire frames in
+// DRIVE TASK: engine commands out, wire frames in
 // ---------------------------------------------------------------------------
 
 /// A `can_use_tool` request waiting for `answer`: what we need to build the
@@ -574,12 +537,10 @@ struct Turn {
 struct Drive {
     wire: Wire,
     child: process::Child,
-    events: mpsc::Sender<DriverEvent>,
+    events: Emitter,
     /// Current advertised state; mutated and re-sent as `InfoChanged`.
     info: DriverInfo,
     models: Value,
-    /// The running process's speed; a changed preference resumes before a turn.
-    launched_fast: bool,
     /// Tool snapshots by `tool_use_id`, completed by `tool_result` frames.
     tools: HashMap<String, ToolUpdate>,
     requests: HashMap<RequestId, PendingRequest>,
@@ -589,19 +550,19 @@ struct Drive {
     configs: Vec<(String, ConfigId, ConfigValue)>,
     /// An in-flight `get_usage`, sent after each `result` frame.
     usage_request: Option<String>,
+    /// The last `interrupt` control request, whose receipt may name a
+    /// cancelled queued prompt.
+    interrupt_id: Option<String>,
     /// Context occupancy of the latest assistant message.
     last_usage: Option<u64>,
-    /// The running turn's user-message uuid. An interrupt that lands before
-    /// the CLI starts the turn cancels the message out of its queue and never
-    /// sends a `result`; the interrupt receipt names this uuid instead.
+    /// The running turn's user-message uuid; an interrupt receipt names it
+    /// when the turn was cancelled before it started (no `result` follows).
     turn_uuid: Option<String>,
     /// The running turn's last main-transcript assistant frame uuid.
     turn_assistant: Option<String>,
-    /// One entry per completed turn, oldest first. Rollback forks at the
-    /// last *kept* turn's assistant uuid — forking at a user message re-runs
-    /// it, and result uuids are not transcript messages (probed 2026-08-25).
-    /// The files scope rewinds at the first *dropped* turn's user uuid, the
-    /// CLI's checkpoint key (probed 2026-08-27).
+    /// One entry per completed turn, oldest first. Rollback forks at the last
+    /// kept turn's assistant uuid and rewinds files at the first dropped
+    /// turn's user uuid (probed 2026-08-25/27).
     history: Vec<Turn>,
     /// Launch options, kept current for resume and rollback.
     request: ConnectRequest,
@@ -612,7 +573,7 @@ struct Drive {
 
 impl Drive {
     /// Main loop until the engine or the agent goes away.
-    async fn run(mut self, mut commands: mpsc::Receiver<DriverCommand>) {
+    async fn run(mut self, mut commands: mpsc::UnboundedReceiver<DriverCommand>) {
         loop {
             tokio::select! {
                 cmd = commands.recv() => match cmd {
@@ -623,14 +584,14 @@ impl Drive {
                         }
                     }
                 },
-                frame = self.wire.frames.recv() => match frame {
+                frame = self.wire.line.frames.recv() => match frame {
                     Some(frame) => {
                         if self.handle_frame(frame).await.is_err() {
                             break;
                         }
                     }
                     None => {
-                        self.report_exit().await;
+                        self.events.exited(&mut self.child).await;
                         break;
                     }
                 },
@@ -639,27 +600,32 @@ impl Drive {
         self.child.shutdown(CLOSE_GRACE).await;
     }
 
+    /// One engine command as control requests or user messages.
     async fn handle_command(&mut self, cmd: DriverCommand) -> Result<(), Gone> {
         match cmd {
             DriverCommand::StartTurn { input } => {
-                self.resume_for_fast().await?;
-                self.emit(DriverEvent::TurnAck).await?;
+                self.events.send(DriverEvent::TurnAck).await?;
                 self.turn_uuid = Some(self.send_user(&input).await?);
             }
-            // The CLI queues mid-turn user messages as their own turns
-            // (`command_lifecycle`: queued, then started after the running
-            // turn completes) — that is queueing, not steering, so the
-            // adapter does not advertise `Steer` and refuses the fallback.
+            // The CLI queues mid-turn user messages as their own turns, so
+            // `Steer` is not advertised and the fallback is refused.
             DriverCommand::Steer { .. } => {
-                self.emit(DriverEvent::Steered(false)).await?;
+                self.events.send(DriverEvent::Steered(false)).await?;
             }
             DriverCommand::Answer { request, answer } => self.answer(request, answer).await?,
             DriverCommand::Cancel => {
                 // `cancel_queued` clears anything the CLI parked as a queued
-                // message; then unblock any waiting permission.
-                self.wire
-                    .control(json!({ "subtype": "interrupt", "cancel_queued": true }))
-                    .await?;
+                // message; then unblock any waiting permission. One interrupt
+                // in flight is enough: a second would take over `interrupt_id`
+                // and the first receipt, which may name the cancelled prompt,
+                // would go unread.
+                if self.interrupt_id.is_none() {
+                    self.interrupt_id = Some(
+                        self.wire
+                            .control(json!({ "subtype": "interrupt", "cancel_queued": true }))
+                            .await?,
+                    );
+                }
                 for (_, pending) in std::mem::take(&mut self.requests) {
                     self.wire
                         .respond(
@@ -669,13 +635,9 @@ impl Drive {
                         .await?;
                 }
             }
-            DriverCommand::Configure(id, value) if id.as_str() == "fast" => {
-                if crate::adapter::apply_selection(&mut self.info, &id, &value) {
-                    self.remember_option(id, value);
-                    self.emit(DriverEvent::InfoChanged(self.info.clone()))
-                        .await?;
-                }
-            }
+            // Fast mode and effort are settings keys the CLI merges live
+            // (`apply_flag_settings`, 2.1.261). The CLI acknowledges any
+            // value, so the engine's choice check is the only validation.
             DriverCommand::Configure(id, value) => {
                 let request = match (id.as_str(), &value) {
                     ("mode", ConfigValue::Text(mode)) => {
@@ -684,6 +646,14 @@ impl Drive {
                     ("model", ConfigValue::Text(model)) => {
                         json!({ "subtype": "set_model", "model": model })
                     }
+                    ("fast", ConfigValue::Bool(fast)) => json!({
+                        "subtype": "apply_flag_settings",
+                        "settings": { "fastMode": fast },
+                    }),
+                    ("effort", ConfigValue::Text(level)) => json!({
+                        "subtype": "apply_flag_settings",
+                        "settings": { "effortLevel": level },
+                    }),
                     _ => return Ok(()),
                 };
                 let wire_id = self.wire.control(request).await?;
@@ -693,7 +663,6 @@ impl Drive {
             // compaction request, and the command is advertised to SDK hosts
             // (probed 2026-09-04, claude 2.1.260).
             DriverCommand::Compact => {
-                self.resume_for_fast().await?;
                 self.send_user(&Input::text(COMPACT_COMMAND)).await?;
             }
             DriverCommand::Rollback(turns, scope) => self.rollback(turns, scope).await?,
@@ -712,21 +681,22 @@ impl Drive {
             "control_response" => self.on_control_response(&frame).await,
             "result" => self.on_result(&frame).await,
             "system" => self.on_system(&frame).await,
-            // Plan usage lands in P2; per-turn rate pushes are dropped for
-            // now. Lifecycle frames only narrate the CLI's own queue.
+            // Rate pushes are dropped (`get_usage` after each turn covers
+            // quota); lifecycle frames only narrate the CLI's own queue.
             "rate_limit_event" | "control_cancel_request" | "command_lifecycle" => Ok(()),
             other => {
                 let mut extensions = Extensions::new();
                 extensions.insert("claude/raw_frame".into(), frame.clone());
-                self.emit(DriverEvent::Event {
-                    kind: EventKind::Diagnostic(Diagnostic {
-                        level: DiagnosticLevel::Info,
-                        message: format!("unrecognized claude frame `{other}`"),
-                    }),
-                    parent_tool_id: None,
-                    extensions,
-                })
-                .await
+                self.events
+                    .send(DriverEvent::Event {
+                        kind: EventKind::Diagnostic(Diagnostic {
+                            level: DiagnosticLevel::Info,
+                            message: format!("unrecognized claude frame `{other}`"),
+                        }),
+                        parent_tool_id: None,
+                        extensions,
+                    })
+                    .await
             }
         }
     }
@@ -766,7 +736,8 @@ impl Drive {
                     extensions.insert("claude/fork_point".into(), Value::from(uuid.clone()));
                 }
                 return self
-                    .emit(DriverEvent::Event {
+                    .events
+                    .send(DriverEvent::Event {
                         kind: EventKind::MessageEnded { message_id },
                         parent_tool_id: parent.map(ToolId::new),
                         extensions,
@@ -776,7 +747,9 @@ impl Drive {
             _ => None,
         };
         if let Some(kind) = kind {
-            self.emit_content(kind, parent).await?;
+            self.events
+                .content(kind, parent.map(ToolId::new), Extensions::new())
+                .await?;
         }
         Ok(())
     }
@@ -790,9 +763,36 @@ impl Drive {
             && let login = login_methods(&self.request.installation)
             && !login.is_empty()
         {
-            return self.emit(DriverEvent::AuthLost { login }).await;
+            return self.events.send(DriverEvent::AuthLost { login }).await;
         }
         let parent = parent_of(frame);
+        // Synthetic messages (an unknown `/command`) never stream; their text
+        // is the CLI's own answer and is surfaced here. An API error's copy
+        // is skipped: the `result` frame already fails the turn with it.
+        if frame["message"]["model"].as_str() == Some("<synthetic>")
+            && frame["is_api_error_message"] != true
+        {
+            let message_id = MessageId::new(frame["uuid"].as_str().unwrap_or("m0"));
+            for block in frame["message"]["content"].as_array().into_iter().flatten() {
+                if let Some(text) = text(&block["text"]) {
+                    let kind = EventKind::TextDelta {
+                        message_id: message_id.clone(),
+                        text,
+                    };
+                    self.events
+                        .content(kind, parent.clone().map(ToolId::new), Extensions::new())
+                        .await?;
+                }
+            }
+            return self
+                .events
+                .content(
+                    EventKind::MessageEnded { message_id },
+                    parent.map(ToolId::new),
+                    Extensions::new(),
+                )
+                .await;
+        }
         // Main-transcript assistant frames are the valid rollback cut points.
         if parent.is_none()
             && let Some(uuid) = frame["uuid"].as_str()
@@ -802,8 +802,7 @@ impl Drive {
         if let Some(used) = context_tokens(&frame["message"]["usage"]) {
             self.last_usage = Some(used);
         }
-        let blocks = frame["message"]["content"].as_array().cloned();
-        for block in blocks.unwrap_or_default() {
+        for block in frame["message"]["content"].as_array().into_iter().flatten() {
             if block["type"].as_str() != Some("tool_use") {
                 continue;
             }
@@ -811,17 +810,19 @@ impl Drive {
             let kind = match name {
                 // The agent's task list is a plan, not a tool call.
                 "TodoWrite" => EventKind::PlanUpdated {
-                    entries: plan_entries(&block["input"]["todos"]),
+                    entries: plan_entries(&block["input"]["todos"], "content"),
                 },
                 // Questions surface through `can_use_tool`, not as a tool.
                 "AskUserQuestion" => continue,
                 _ => {
-                    let tool = fresh_tool(&block);
+                    let tool = fresh_tool(block);
                     self.tools.insert(tool.id.as_str().to_owned(), tool.clone());
                     EventKind::ToolUpdated(tool)
                 }
             };
-            self.emit_content(kind, parent.clone()).await?;
+            self.events
+                .content(kind, parent.clone().map(ToolId::new), Extensions::new())
+                .await?;
         }
         Ok(())
     }
@@ -837,12 +838,17 @@ impl Drive {
                     continue;
                 }
                 let id = block["tool_use_id"].as_str().unwrap_or_default();
-                let Some(mut tool) = self.tools.get(id).cloned() else {
+                let Some(tool) = self.tools.get_mut(id) else {
                     continue;
                 };
-                complete_tool(&mut tool, block, &frame["tool_use_result"]);
-                self.tools.insert(id.to_owned(), tool.clone());
-                self.emit_content(EventKind::ToolUpdated(tool), parent.clone())
+                complete_tool(tool, block, &frame["tool_use_result"]);
+                let tool = tool.clone();
+                self.events
+                    .content(
+                        EventKind::ToolUpdated(tool),
+                        parent.clone().map(ToolId::new),
+                        Extensions::new(),
+                    )
                     .await?;
             }
             return Ok(());
@@ -851,14 +857,16 @@ impl Drive {
         // own prompts also come back as replays (no parent) and are dropped.
         if let (Some(text), Some(_)) = (content.as_str(), &parent) {
             let message_id = MessageId::new(frame["uuid"].as_str().unwrap_or("m0"));
-            self.emit_content(
-                EventKind::UserMessage {
-                    message_id,
-                    text: text.to_owned(),
-                },
-                parent,
-            )
-            .await?;
+            self.events
+                .content(
+                    EventKind::UserMessage {
+                        message_id,
+                        text: text.to_owned(),
+                    },
+                    parent.map(ToolId::new),
+                    Extensions::new(),
+                )
+                .await?;
         }
         Ok(())
     }
@@ -874,6 +882,7 @@ impl Drive {
                 .respond_error(&wire_id, &format!("unsupported request: {subtype}"))
                 .await?;
             return self
+                .events
                 .diagnostic(
                     DiagnosticLevel::Warning,
                     format!("declined agent control request {subtype}"),
@@ -905,7 +914,8 @@ impl Drive {
                 questions,
             },
         );
-        self.emit(DriverEvent::event(EventKind::RequestOpened(open)))
+        self.events
+            .send(DriverEvent::event(EventKind::RequestOpened(open)))
             .await
     }
 
@@ -914,15 +924,23 @@ impl Drive {
     /// receipt confirms or rejects the pending mode change.
     async fn on_control_response(&mut self, frame: &Value) -> Result<(), Gone> {
         let response = &frame["response"];
-        let cancelled_queued = response["response"]["cancelled"]
-            .as_array()
-            .zip(self.turn_uuid.as_deref())
-            .is_some_and(|(cancelled, uuid)| cancelled.iter().any(|c| c.as_str() == Some(uuid)));
-        if cancelled_queued {
-            self.turn_uuid = None;
-            return self
-                .emit(DriverEvent::TurnEnded(StopReason::Cancelled))
-                .await;
+        let for_interrupt = self.interrupt_id.as_deref() == response["request_id"].as_str();
+        if for_interrupt {
+            self.interrupt_id = None;
+            let cancelled_queued = response["response"]["cancelled"]
+                .as_array()
+                .zip(self.turn_uuid.as_deref())
+                .is_some_and(|(cancelled, uuid)| {
+                    cancelled.iter().any(|c| c.as_str() == Some(uuid))
+                });
+            if cancelled_queued {
+                self.turn_uuid = None;
+                return self
+                    .events
+                    .send(DriverEvent::TurnEnded(StopReason::Cancelled))
+                    .await;
+            }
+            return Ok(());
         }
         let for_usage = self
             .usage_request
@@ -933,7 +951,8 @@ impl Drive {
             self.usage_request = None;
             if let Some(usage) = parse_plan_usage(&response["response"]) {
                 return self
-                    .emit(DriverEvent::event(EventKind::PlanUsageUpdated(usage)))
+                    .events
+                    .send(DriverEvent::event(EventKind::PlanUsageUpdated(usage)))
                     .await;
             }
             return Ok(());
@@ -947,6 +966,7 @@ impl Drive {
             if response["subtype"].as_str() == Some("error") {
                 let message = response["error"].as_str().unwrap_or("rejected");
                 return self
+                    .events
                     .diagnostic(
                         DiagnosticLevel::Warning,
                         format!("agent rejected configure `{config_id}`: {message}"),
@@ -954,15 +974,30 @@ impl Drive {
                     .await;
             }
             if crate::adapter::apply_selection(&mut self.info, &config_id, &value) {
+                // Fast and effort follow the model; an effort the new model
+                // does not offer is dropped.
                 if let ("model", ConfigValue::Text(model)) = (config_id.as_str(), &value) {
-                    crate::adapter::set_fast_option(
+                    let effort = selected(&self.info, "effort");
+                    set_effort_option(&mut self.info, effort_levels(&self.models, model), effort);
+                    // The relaunch options must not revive a dropped effort.
+                    self.request
+                        .options
+                        .configure
+                        .retain(|(key, _)| key.as_str() != "effort");
+                    if let Some(effort) = selected(&self.info, "effort") {
+                        self.remember_option(ConfigId::new("effort"), ConfigValue::Text(effort));
+                    }
+                    set_fast_option(
                         &mut self.info,
                         supports_fast(&self.models, model).then_some(requested_fast(&self.request)),
                         true,
                     );
                 }
                 self.remember_option(config_id, value);
-                return self.emit(DriverEvent::InfoChanged(self.info.clone())).await;
+                return self
+                    .events
+                    .send(DriverEvent::InfoChanged(self.info.clone()))
+                    .await;
             }
         }
         Ok(())
@@ -982,14 +1017,16 @@ impl Drive {
         // Backgrounded tools stay tracked; `task_notification` finishes them.
         self.tools.retain(|_, tool| tool.status.is_active());
         if let Some(used) = self.last_usage.take() {
-            self.emit(DriverEvent::event(EventKind::ContextUsage {
-                used_tokens: used,
-                window_tokens: context_window(&frame["modelUsage"]),
-                cost_usd: frame["total_cost_usd"].as_f64(),
-            }))
-            .await?;
+            self.events
+                .send(DriverEvent::event(EventKind::ContextUsage {
+                    used_tokens: used,
+                    window_tokens: context_window(&frame["modelUsage"]),
+                    cost_usd: frame["total_cost_usd"].as_f64(),
+                }))
+                .await?;
         }
-        self.emit(DriverEvent::TurnEnded(stop_reason(frame)))
+        self.events
+            .send(DriverEvent::TurnEnded(stop_reason(frame)))
             .await?;
         // Refresh plan quota after every turn; the receipt becomes
         // `PlanUsageUpdated` in `on_control_response`.
@@ -1003,76 +1040,10 @@ impl Drive {
         self.request.options.configure.push((id, value));
     }
 
-    /// Applies speed changes before a new turn, preserving the provider transcript.
-    async fn resume_for_fast(&mut self) -> Result<(), Gone> {
-        if requested_fast(&self.request) == self.launched_fast {
-            return Ok(());
-        }
-        // Finish pending model/mode receipts before copying the launch settings.
-        let settled = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-            while !self.configs.is_empty() {
-                let frame = self.wire.frames.recv().await.ok_or(Gone)?;
-                self.handle_frame(frame).await?;
-            }
-            Ok::<_, Gone>(())
-        })
-        .await;
-        if !matches!(settled, Ok(Ok(()))) {
-            self.diagnostic(
-                DiagnosticLevel::Error,
-                "fast mode change failed while waiting for settings",
-            )
-            .await?;
-            return Err(Gone);
-        }
-        // A background tool must finish before its process can be replaced.
-        if self.tools.values().any(|tool| tool.status.is_active())
-            || !self
-                .info
-                .configuration
-                .options
-                .contains_key(&ConfigId::new("fast"))
-        {
-            return Ok(());
-        }
-        let start = if self.history.is_empty() {
-            self.request.options.start.clone()
-        } else if let Some(token) = &self.info.resume_token {
-            SessionStart::Resume(token.clone())
-        } else {
-            return Ok(());
-        };
-        self.child.shutdown(CLOSE_GRACE).await;
-        match launch(&self.request, &start, self.recorder.clone()).await {
-            Ok((child, wire, info, models)) => {
-                self.child = child;
-                self.wire = wire;
-                self.info = info;
-                self.models = models;
-                self.launched_fast = requested_fast(&self.request);
-                self.messages.clear();
-                self.tools.clear();
-                self.usage_request = None;
-                self.emit(DriverEvent::InfoChanged(self.info.clone())).await
-            }
-            Err(error) => {
-                self.diagnostic(
-                    DiagnosticLevel::Error,
-                    format!("fast mode resume failed: {error}"),
-                )
-                .await?;
-                self.report_exit().await;
-                Err(Gone)
-            }
-        }
-    }
-
-    /// Emulated rollback (the CLI has none in place): respawn forked at the
-    /// last kept turn's final assistant message, dropping the last `turns`
-    /// completed turns. The engine guarantees the session is idle. The
-    /// resume token clears until the fork names itself on the next prompt's
-    /// `system/init`; the old session stays resumable on disk. A failed
-    /// respawn closes the session.
+    /// Emulated rollback: respawn forked at the last kept turn's assistant
+    /// message. The resume token clears until the fork names itself on the
+    /// next `system/init`; the old session stays on disk. A failed respawn
+    /// closes the session.
     async fn rollback(
         &mut self,
         turns: std::num::NonZeroU32,
@@ -1081,6 +1052,7 @@ impl Drive {
         let n = turns.get() as usize;
         if n >= self.history.len() {
             return self
+                .events
                 .diagnostic(
                     DiagnosticLevel::Warning,
                     format!(
@@ -1093,6 +1065,7 @@ impl Drive {
         }
         let Some(cut) = self.history[self.history.len() - n - 1].assistant.clone() else {
             return self
+                .events
                 .diagnostic(
                     DiagnosticLevel::Warning,
                     "rollback rejected: the turn at the cut point produced no assistant message",
@@ -1101,6 +1074,7 @@ impl Drive {
         };
         let Some(token) = self.info.resume_token.clone() else {
             return self
+                .events
                 .diagnostic(
                     DiagnosticLevel::Warning,
                     "rollback rejected: no provider session id yet",
@@ -1112,6 +1086,7 @@ impl Drive {
         if scope == RollbackScope::ConversationAndFiles {
             let Some(user) = self.history[self.history.len() - n].user.clone() else {
                 return self
+                    .events
                     .diagnostic(
                         DiagnosticLevel::Warning,
                         "rollback rejected: the first dropped turn has no user message to \
@@ -1121,6 +1096,7 @@ impl Drive {
             };
             if let Err(e) = self.rewind_files(&user).await? {
                 return self
+                    .events
                     .diagnostic(DiagnosticLevel::Warning, format!("rollback rejected: {e}"))
                     .await;
             }
@@ -1135,15 +1111,20 @@ impl Drive {
                 // its control ids, so stale ones would mis-match receipts.
                 self.messages.clear();
                 self.tools.clear();
+                self.requests.clear();
                 self.usage_request = None;
                 self.configs.clear();
+                self.interrupt_id = None;
                 self.info.resume_token = None;
-                self.emit(DriverEvent::InfoChanged(self.info.clone())).await
+                self.events
+                    .send(DriverEvent::InfoChanged(self.info.clone()))
+                    .await
             }
             Err(e) => {
-                self.diagnostic(DiagnosticLevel::Error, format!("rollback failed: {e}"))
+                self.events
+                    .diagnostic(DiagnosticLevel::Error, format!("rollback failed: {e}"))
                     .await?;
-                self.report_exit().await;
+                self.events.exited(&mut self.child).await;
                 Err(Gone)
             }
         }
@@ -1172,7 +1153,6 @@ impl Drive {
         self.child = child;
         self.wire = wire;
         self.models = models;
-        self.launched_fast = requested_fast(&request);
         Ok(())
     }
 
@@ -1188,11 +1168,12 @@ impl Drive {
             .await?;
         let deadline = tokio::time::Instant::now() + REWIND_TIMEOUT;
         loop {
-            let Ok(frame) = tokio::time::timeout_at(deadline, self.wire.frames.recv()).await else {
+            let Ok(frame) = tokio::time::timeout_at(deadline, self.wire.line.frames.recv()).await
+            else {
                 return Ok(Err("no rewind receipt from the agent".into()));
             };
             let Some(frame) = frame else {
-                self.report_exit().await;
+                self.events.exited(&mut self.child).await;
                 return Err(Gone);
             };
             let response = &frame["response"];
@@ -1225,12 +1206,24 @@ impl Drive {
                 let token = frame["session_id"].as_str().map(ResumeToken::new);
                 if token != self.info.resume_token {
                     self.info.resume_token = token;
-                    return self.emit(DriverEvent::InfoChanged(self.info.clone())).await;
+                    return self
+                        .events
+                        .send(DriverEvent::InfoChanged(self.info.clone()))
+                        .await;
                 }
                 Ok(())
             }
+            // The CLI pushes its whole slash-command list when it changes
+            // (2.1.261); it replaces the one from `initialize`.
+            "commands_changed" => {
+                self.info.details.commands = slash_commands(&frame["commands"]);
+                self.events
+                    .send(DriverEvent::InfoChanged(self.info.clone()))
+                    .await
+            }
             "status" if frame["status"].as_str() == Some("compacting") => {
-                self.emit(DriverEvent::event(EventKind::ContextCompacted))
+                self.events
+                    .send(DriverEvent::event(EventKind::ContextCompacted))
                     .await
             }
             // The compaction receipt trails the status frame. Only a refusal
@@ -1238,11 +1231,12 @@ impl Drive {
             // successful or unknown receipt stays silent.
             "status" if frame["compact_error"].as_str().is_some() => {
                 let reason = frame["compact_error"].as_str().unwrap_or_default();
-                self.diagnostic(
-                    DiagnosticLevel::Warning,
-                    format!("compaction refused: {reason}"),
-                )
-                .await
+                self.events
+                    .diagnostic(
+                        DiagnosticLevel::Warning,
+                        format!("compaction refused: {reason}"),
+                    )
+                    .await
             }
             // A background task finished: complete the tool it ran under.
             "task_notification" => {
@@ -1257,7 +1251,8 @@ impl Drive {
                 } else {
                     ToolStatus::Completed
                 };
-                self.emit(DriverEvent::event(EventKind::ToolUpdated(tool)))
+                self.events
+                    .send(DriverEvent::event(EventKind::ToolUpdated(tool)))
                     .await
             }
             // Hooks, task bookkeeping, statuses: nothing the engine needs.
@@ -1299,7 +1294,8 @@ impl Drive {
     async fn send_user(&mut self, input: &Input) -> Result<String, Gone> {
         let loaded = attach::load(&input.attachments).await;
         for problem in loaded.iter().filter_map(|l| l.problem.as_deref()) {
-            self.diagnostic(DiagnosticLevel::Warning, problem.to_owned())
+            self.events
+                .diagnostic(DiagnosticLevel::Warning, problem.to_owned())
                 .await?;
         }
         let content = if loaded.is_empty() {
@@ -1328,6 +1324,7 @@ impl Drive {
         let uuid = mint_uuid(self.next_uuid);
         self.next_uuid += 1;
         self.wire
+            .line
             .write(json!({
                 "type": "user",
                 "uuid": uuid,
@@ -1338,57 +1335,17 @@ impl Drive {
         Ok(uuid)
     }
 
+    /// The streaming message id for a transcript (main or subagent).
     fn message_id(&self, parent: &Option<String>) -> MessageId {
         self.messages
             .get(parent)
             .cloned()
             .unwrap_or_else(|| MessageId::new("m0"))
     }
-
-    /// The agent went away: report how it died before the stream closes.
-    async fn report_exit(&mut self) {
-        let status = self.child.exit_status(CLOSE_GRACE).await;
-        let stderr = self.child.stderr_tail();
-        self.emit(DriverEvent::Exited { status, stderr }).await.ok();
-    }
-
-    async fn diagnostic(
-        &mut self,
-        level: DiagnosticLevel,
-        message: impl Into<String>,
-    ) -> Result<(), Gone> {
-        self.emit(DriverEvent::event(EventKind::Diagnostic(Diagnostic {
-            level,
-            message: message.into(),
-        })))
-        .await
-    }
-
-    async fn emit_content(&mut self, kind: EventKind, parent: Option<String>) -> Result<(), Gone> {
-        self.emit(DriverEvent::Event {
-            kind,
-            parent_tool_id: parent.map(ToolId::new),
-            extensions: Extensions::new(),
-        })
-        .await
-    }
-
-    async fn emit(&mut self, event: DriverEvent) -> Result<(), Gone> {
-        self.events.send(event).await.map_err(|_| Gone)
-    }
-}
-
-/// The engine or the agent is gone; the drive task unwinds.
-struct Gone;
-
-impl From<std::io::Error> for Gone {
-    fn from(_: std::io::Error) -> Self {
-        Gone
-    }
 }
 
 // ---------------------------------------------------------------------------
-// Translation helpers
+// FRAME DECODING
 // ---------------------------------------------------------------------------
 
 /// Declared MCP servers as a `--mcp-config` inline JSON value. The CLI takes
@@ -1412,10 +1369,12 @@ fn mcp_config(servers: &[McpServer]) -> Value {
     json!({ "mcpServers": entries })
 }
 
+/// The subagent tool a frame belongs to, if any.
 fn parent_of(frame: &Value) -> Option<String> {
     frame["parent_tool_use_id"].as_str().map(str::to_owned)
 }
 
+/// A non-empty string value.
 fn text(value: &Value) -> Option<String> {
     value.as_str().filter(|t| !t.is_empty()).map(str::to_owned)
 }
@@ -1571,6 +1530,8 @@ fn permission_options(suggestions: &Value) -> Vec<PermissionChoice> {
     options
 }
 
+/// The `can_use_tool` response for a choice; `AllowAlways` applies the
+/// CLI's suggested rule.
 fn permission_response(pending: &PendingRequest, choice: PermissionChoice) -> Value {
     match choice {
         PermissionChoice::AllowOnce => {
@@ -1640,6 +1601,23 @@ fn question_response(
     let mut updated = pending.input.clone();
     updated["answers"] = Value::Object(map);
     json!({ "behavior": "allow", "updatedInput": updated })
+}
+
+/// The CLI's `commands` array (from `initialize` or `commands_changed`).
+fn slash_commands(commands: &Value) -> Vec<SlashCommand> {
+    commands
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|c| SlashCommand {
+            name: c["name"].as_str().unwrap_or_default().to_owned(),
+            description: c["description"].as_str().unwrap_or_default().to_owned(),
+            input_hint: c["argumentHint"]
+                .as_str()
+                .filter(|h| !h.is_empty())
+                .map(str::to_owned),
+        })
+        .collect()
 }
 
 /// Context occupancy of one assistant message.
@@ -1726,6 +1704,7 @@ fn parse_rfc3339(s: &str) -> Option<std::time::SystemTime> {
         .map(|secs| std::time::UNIX_EPOCH + Duration::from_secs(secs))
 }
 
+/// The largest context window among the models the turn used.
 fn context_window(model_usage: &Value) -> Option<u64> {
     model_usage
         .as_object()?
@@ -1751,9 +1730,9 @@ fn mint_uuid(seq: u64) -> String {
     )
 }
 
+/// The `result` frame's verdict. An API error still says `subtype:
+/// "success"`; `is_error` is the truth (probed 2026-08-23).
 fn stop_reason(frame: &Value) -> StopReason {
-    // An API-error result still says `subtype: "success"`; `is_error` is
-    // the real verdict (probed live 2026-08-23 with no stored login).
     let is_error = frame["is_error"].as_bool().unwrap_or(false);
     if !is_error && frame["subtype"].as_str() == Some("success") {
         return StopReason::Completed {
@@ -1772,44 +1751,20 @@ fn stop_reason(frame: &Value) -> StopReason {
 }
 
 // ---------------------------------------------------------------------------
-// Wire: line-delimited stream-json over the child's stdio
+// WIRE: control requests and responses over stream-json
 // ---------------------------------------------------------------------------
 
 struct Wire {
-    stdin: tokio::process::ChildStdin,
-    /// All frames the reader task saw, bounded; pipe backpressure beyond.
-    frames: mpsc::Receiver<Value>,
+    line: LineWire,
     next_id: u64,
-    recorder: Option<WireRecorder>,
 }
 
 impl Wire {
     /// Takes the child's stdio and starts the line-reader task.
     fn over(child: &mut process::Child, recorder: Option<WireRecorder>) -> Self {
-        use tokio::io::{AsyncBufReadExt, BufReader};
-        let stdin = child.stdin.take().expect("piped stdin");
-        let stdout = child.stdout.take().expect("piped stdout");
-        let (tx, frames) = mpsc::channel(FRAME_BUFFER);
-        let reader_recorder = recorder.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(frame) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                if let Some(recorder) = &reader_recorder {
-                    recorder.record("in", &frame);
-                }
-                if tx.send(frame).await.is_err() {
-                    break;
-                }
-            }
-        });
         Self {
-            stdin,
-            frames,
+            line: LineWire::over(child, recorder),
             next_id: 1,
-            recorder,
         }
     }
 
@@ -1817,26 +1772,29 @@ impl Wire {
     async fn control(&mut self, request: Value) -> std::io::Result<String> {
         let id = format!("c{}", self.next_id);
         self.next_id += 1;
-        self.write(json!({ "type": "control_request", "request_id": id, "request": request }))
+        self.line
+            .write(json!({ "type": "control_request", "request_id": id, "request": request }))
             .await?;
         Ok(id)
     }
 
     /// Answers one of the CLI's control requests.
     async fn respond(&mut self, request_id: &str, response: Value) -> std::io::Result<()> {
-        self.write(json!({
+        self.line.write(json!({
             "type": "control_response",
             "response": { "subtype": "success", "request_id": request_id, "response": response },
         }))
         .await
     }
 
+    /// Declines one of the CLI's control requests.
     async fn respond_error(&mut self, request_id: &str, message: &str) -> std::io::Result<()> {
-        self.write(json!({
-            "type": "control_response",
-            "response": { "subtype": "error", "request_id": request_id, "error": message },
-        }))
-        .await
+        self.line
+            .write(json!({
+                "type": "control_response",
+                "response": { "subtype": "error", "request_id": request_id, "error": message },
+            }))
+            .await
     }
 
     /// Handshake only: sends a control request and blocks on its response,
@@ -1844,7 +1802,7 @@ impl Wire {
     async fn roundtrip(&mut self, request: Value) -> Result<Value, WireError> {
         let id = self.control(request).await.map_err(|_| WireError::Closed)?;
         loop {
-            let frame = self.frames.recv().await.ok_or(WireError::Closed)?;
+            let frame = self.line.frames.recv().await.ok_or(WireError::Closed)?;
             if frame["type"].as_str() != Some("control_response") {
                 continue;
             }
@@ -1860,16 +1818,6 @@ impl Wire {
             return Ok(response["response"].clone());
         }
     }
-
-    async fn write(&mut self, frame: Value) -> std::io::Result<()> {
-        use tokio::io::AsyncWriteExt;
-        if let Some(recorder) = &self.recorder {
-            recorder.record("out", &frame);
-        }
-        let mut line = frame.to_string();
-        line.push('\n');
-        self.stdin.write_all(line.as_bytes()).await
-    }
 }
 
 enum WireError {
@@ -1878,6 +1826,7 @@ enum WireError {
 }
 
 impl WireError {
+    /// A handshake failure as the caller's error.
     fn into_error(self) -> AgentError {
         match self {
             WireError::Closed => AgentError::ProtocolFailed("agent closed the wire".into()),

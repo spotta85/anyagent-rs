@@ -14,9 +14,11 @@ macro_rules! string_id {
         pub struct $name(String);
 
         impl $name {
+            /// Wraps a string as this id.
             pub fn new(value: impl Into<String>) -> Self {
                 Self(value.into())
             }
+            /// The id as text.
             pub fn as_str(&self) -> &str {
                 &self.0
             }
@@ -250,6 +252,7 @@ impl McpServer {
         self
     }
 
+    /// Which transport this server's connection uses.
     pub(crate) fn transport(&self) -> McpTransport {
         match self.connection {
             McpConnection::Stdio { .. } => McpTransport::Stdio,
@@ -267,6 +270,7 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
+    /// A set of features with no MCP transports.
     pub fn new(features: impl IntoIterator<Item = Capability>) -> Self {
         Self {
             features: features.into_iter().collect(),
@@ -274,8 +278,19 @@ impl Capabilities {
         }
     }
 
+    /// Whether the agent or session offers this action.
     pub fn supports(&self, cap: Capability) -> bool {
         self.features.contains(&cap)
+    }
+
+    /// Every supported action, for listing.
+    pub fn iter(&self) -> impl Iterator<Item = &Capability> {
+        self.features.iter()
+    }
+
+    /// Adds an action an adapter discovered after the handshake.
+    pub(crate) fn add(&mut self, cap: Capability) {
+        self.features.insert(cap);
     }
 }
 
@@ -371,6 +386,7 @@ pub struct SessionOptions {
     pub(crate) permission_mode: PermissionMode,
     pub(crate) no_tools: bool,
     pub(crate) quiet_window: Option<Duration>,
+    pub(crate) stall_after: Option<Duration>,
     pub(crate) mcp_servers: Vec<McpServer>,
     pub(crate) configure: Vec<(ConfigId, ConfigValue)>,
     pub(crate) config_home: Option<PathBuf>,
@@ -398,6 +414,7 @@ impl SessionOptions {
             permission_mode: PermissionMode::Ask,
             no_tools: false,
             quiet_window: None,
+            stall_after: None,
             mcp_servers: Vec::new(),
             configure: Vec::new(),
             config_home: None,
@@ -437,6 +454,7 @@ impl SessionOptions {
         self
     }
 
+    /// How tool permission requests are handled; `Ask` by default.
     pub fn permission_mode(mut self, mode: PermissionMode) -> Self {
         self.permission_mode = mode;
         self
@@ -472,6 +490,15 @@ impl SessionOptions {
         self
     }
 
+    /// How long the agent may stay silent mid-turn before a stall warning
+    /// `Diagnostic` (default 120 s). It warns once per silence; never ends
+    /// the turn.
+    pub fn stall_after(mut self, after: Duration) -> Self {
+        self.stall_after = Some(after);
+        self
+    }
+
+    /// The working directory the agent runs in.
     pub fn cwd(&self) -> &PathBuf {
         &self.cwd
     }
@@ -485,6 +512,7 @@ pub struct Input {
 }
 
 impl Input {
+    /// A text-only prompt.
     pub fn text(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
@@ -500,6 +528,7 @@ impl Input {
         self
     }
 
+    /// The prompt text without attachments.
     pub fn as_text(&self) -> &str {
         &self.text
     }

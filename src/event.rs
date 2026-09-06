@@ -254,6 +254,7 @@ pub enum Request {
 }
 
 impl Request {
+    /// The id to answer with.
     pub fn id(&self) -> RequestId {
         match self {
             Request::Permission(r) => r.id.clone(),

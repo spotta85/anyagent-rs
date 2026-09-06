@@ -1076,13 +1076,21 @@ async fn kiro_effort_is_a_live_option_backed_by_the_effort_prompt() {
     // while the unrelated update sent alongside it still arrives.
     session.configure("effort", "low").await.unwrap();
     let mut usage_seen = false;
-    while effort(&session) != Some(ConfigValue::Text("low".into())) {
+    // Read the stream, not the snapshot: the snapshot can already be
+    // updated while earlier events are still queued.
+    loop {
         let event = next(&mut events).await;
         assert!(
             !matches!(event.kind, EventKind::TextDelta { .. }),
             "the effort ack leaked as text"
         );
         usage_seen |= matches!(event.kind, EventKind::ContextUsage { used_tokens: 7, .. });
+        if let EventKind::SessionUpdated(info) = &event.kind
+            && info.configuration.options.get(&ConfigId::new("effort"))
+                == Some(&ConfigValue::Text("low".into()))
+        {
+            break;
+        }
     }
     assert!(usage_seen, "the usage update mid-switch was dropped");
 
@@ -1196,5 +1204,44 @@ async fn kiro_effort_is_a_live_option_backed_by_the_effort_prompt() {
         .await
         .unwrap();
     assert_eq!(effort(&session), Some(ConfigValue::Text("medium".into())));
+    session.close().await.unwrap();
+}
+
+/// Kiro's cancel can race the next prompt and end it "cancelled" with
+/// nothing said; the adapter re-sends that prompt once, so the caller sees a
+/// normal turn. A cancel of our own is never retried.
+#[tokio::test]
+async fn kiro_spurious_cancel_is_retried_once_inside_the_adapter() {
+    let (session, mut events) = open(&["--kiro", "--spurious-cancel"]).await;
+    session.prompt("one").await.unwrap();
+    loop {
+        if let EventKind::RequestOpened(_) = next(&mut events).await.kind {
+            break;
+        }
+    }
+    session.cancel(false).await.unwrap();
+    loop {
+        if let EventKind::TurnEnded { stop, .. } = next(&mut events).await.kind {
+            assert_eq!(stop, StopReason::Cancelled);
+            break;
+        }
+    }
+    // The fixture kills this prompt "cancelled" first; the retry runs it.
+    session.prompt("two").await.unwrap();
+    let mut text = String::new();
+    loop {
+        match next(&mut events).await.kind {
+            EventKind::TextDelta { text: t, .. } => text.push_str(&t),
+            EventKind::RequestOpened(request) => {
+                session.answer(request.id(), allow()).await.unwrap()
+            }
+            EventKind::TurnEnded { stop, .. } => {
+                assert!(matches!(stop, StopReason::Completed { .. }), "{stop:?}");
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(text.contains("Hello"), "{text:?}");
     session.close().await.unwrap();
 }
