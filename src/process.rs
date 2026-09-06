@@ -113,23 +113,17 @@ impl Child {
         }
     }
 
-    /// SIGTERM to the group, then SIGKILL when the grace period expires.
+    /// SIGTERM to the group, a grace period for the leader, then SIGKILL to
+    /// the group: workers that ignored the SIGTERM must not outlive it.
     pub async fn shutdown(&mut self, grace: Duration) {
         #[cfg(unix)]
-        let terminated = match self.pgid {
-            Some(pgid) => {
-                // Negative pid signals the whole group; the child leads its own.
-                unsafe { libc::kill(-pgid, libc::SIGTERM) };
-                tokio::time::timeout(grace, self.inner.wait()).await.is_ok()
-            }
-            None => false,
-        };
-        #[cfg(not(unix))]
-        let terminated = false;
-        if !terminated {
-            self.kill_group();
-            let _ = self.inner.kill().await;
+        if let Some(pgid) = self.pgid {
+            // Negative pid signals the whole group; the child leads its own.
+            unsafe { libc::kill(-pgid, libc::SIGTERM) };
         }
+        let _ = tokio::time::timeout(grace, self.inner.wait()).await;
+        self.kill_group();
+        let _ = self.inner.kill().await;
         self.finished = true;
         // The reader ends at stderr EOF; joining it here makes `stderr_tail`
         // complete for error reports (a child that dies at spawn can lose the

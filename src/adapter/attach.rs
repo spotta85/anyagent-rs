@@ -28,23 +28,14 @@ pub(crate) struct Inline {
     pub base64: String,
 }
 
-/// Reads each attachment under the cap; sniffs images and encodes them.
-/// Larger files are never read: they ride as path refs only.
+/// Reads each attachment up to the cap; sniffs images and encodes them.
+/// Anything past the cap rides as a path ref only, however large the file.
 pub(crate) async fn load(paths: &[PathBuf]) -> Vec<Loaded> {
     let mut loaded = Vec::with_capacity(paths.len());
     for path in paths {
         let absolute = std::path::absolute(path).unwrap_or_else(|_| path.clone());
         let path = absolute.display().to_string();
-        let size = tokio::fs::metadata(&absolute).await.map(|m| m.len());
-        if size.is_ok_and(|n| n > INLINE_CAP as u64) {
-            loaded.push(Loaded {
-                path,
-                image: None,
-                problem: None,
-            });
-            continue;
-        }
-        match tokio::fs::read(&absolute).await {
+        match read_capped(&absolute).await {
             Ok(bytes) => loaded.push(Loaded {
                 path,
                 image: sniff(&bytes)
@@ -63,6 +54,18 @@ pub(crate) async fn load(paths: &[PathBuf]) -> Vec<Loaded> {
         }
     }
     loaded
+}
+
+/// At most `INLINE_CAP + 1` bytes of the file: one over marks it as too big.
+async fn read_capped(path: &PathBuf) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    tokio::fs::File::open(path)
+        .await?
+        .take(INLINE_CAP as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    Ok(bytes)
 }
 
 /// The prompt text with a trailer naming every attached path.

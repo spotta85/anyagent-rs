@@ -457,7 +457,10 @@ impl Engine {
         while !self.done {
             let deadline = self.deadline.unwrap_or_else(Instant::now);
             let stall = self.stall.unwrap_or_else(Instant::now);
+            // Biased: a queued driver event re-arms the deadline before the
+            // quiet timer can end the turn under it.
             tokio::select! {
+                biased;
                 cmd = commands.recv(), if commands_open => match cmd {
                     Some(cmd) => self.handle_command(cmd).await,
                     None => {

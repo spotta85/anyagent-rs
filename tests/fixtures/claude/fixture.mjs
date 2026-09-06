@@ -168,6 +168,7 @@ async function runTurn(m) {
     send({ type: 'assistant', message: { id: 'syn_1', model: '<synthetic>', role: 'assistant', content: [{ type: 'text', text: `Unknown command: ${name}` }], usage: USAGE }, session_id: S, uuid: uid(), parent_tool_use_id: null });
     resultFrame({ result: `Unknown command: ${name}`, user_message_uuid: u });
     turn = null;
+    if (queue.length) runTurn(queue.shift()).catch(() => process.exit(1));
     return;
   }
   // `/compact` (probed 2026-09-04, 2.1.260). Success is silent: status

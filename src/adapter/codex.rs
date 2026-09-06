@@ -158,6 +158,15 @@ fn mcp_overrides(servers: &[McpServer]) -> Result<Vec<String>, AgentError> {
     };
     let mut args = Vec::new();
     for server in servers {
+        // The name is a bare TOML key segment; anything else would split or
+        // break the override.
+        let bare = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+        if server.name.is_empty() || !server.name.chars().all(bare) {
+            return Err(AgentError::InvalidConfiguration(format!(
+                "codex MCP server name `{}` must be [A-Za-z0-9_-]",
+                server.name
+            )));
+        }
         let key = |field: &str| format!("mcp_servers.{}.{field}", server.name);
         let mut push = |field: &str, value: String| {
             args.push("-c".to_owned());

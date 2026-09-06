@@ -1585,3 +1585,43 @@ async fn rollback_after_a_model_switch_keeps_fast_model_gating() {
     );
     session.close().await.unwrap();
 }
+
+/// The effort choices follow the model: a level the new model does not
+/// offer is dropped instead of lingering as a stale selection.
+#[tokio::test]
+async fn effort_choices_follow_a_live_model_switch() {
+    let agent = AgentInstallation::at("claude", wrapper("effort-follows", ""));
+    let (session, mut events) = Runtime::new()
+        .open(
+            &agent,
+            SessionOptions::in_dir(std::env::temp_dir()).configure("effort", "max"),
+        )
+        .await
+        .unwrap();
+    // The fixture's sonnet offers only low/high.
+    session.configure("model", "sonnet").await.unwrap();
+    let info = loop {
+        if let EventKind::SessionUpdated(info) = next(&mut events).await.kind
+            && info.configuration.options.get(&ConfigId::new("model"))
+                == Some(&ConfigValue::from("sonnet"))
+        {
+            break info;
+        }
+    };
+    let effort = info
+        .details
+        .config_options
+        .iter()
+        .find(|o| o.id.as_str() == "effort")
+        .expect("effort stays advertised");
+    let ConfigKind::Select { choices } = &effort.kind else {
+        panic!("expected Select, got {:?}", effort.kind);
+    };
+    let levels: Vec<&str> = choices.iter().map(|c| c.value.as_str()).collect();
+    assert_eq!(levels, ["low", "high"]);
+    assert_eq!(
+        info.configuration.options.get(&ConfigId::new("effort")),
+        None
+    );
+    session.close().await.unwrap();
+}

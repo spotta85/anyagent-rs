@@ -16,7 +16,8 @@ use tokio::sync::mpsc;
 use crate::adapter::{
     Adapter, CLOSE_GRACE, ConnectRequest, DriverCommand, DriverConnection, DriverEvent, DriverInfo,
     Emitter, FRAME_BUFFER, Gone, HANDSHAKE_TIMEOUT, LineWire, OUTPUT_CAP, WireRecorder, attach,
-    cap, login_methods, plan_entries, with_stderr,
+    cap, level_choices, login_methods, plan_entries, selected, set_effort_option, set_fast_option,
+    with_stderr,
 };
 use crate::agent::{
     AccountInfo, AgentDetails, AuthKind, AuthStatus, Capabilities, Capability, ConfigChoice,
@@ -311,31 +312,20 @@ fn supports_fast(models: &Value, model: &str) -> bool {
 
 /// The current model's effort levels as a live option (`apply_flag_settings`
 /// switches it); `None` when the catalog has none.
-fn effort_option(models: &Value, model: &str, configured: Option<String>) -> Option<ConfigOption> {
-    let entries = models.as_array()?;
+fn effort_levels(models: &Value, model: &str) -> Vec<ConfigChoice> {
+    let Some(entries) = models.as_array() else {
+        return Vec::new();
+    };
     let entry = entries
         .iter()
         .find(|m| m["value"].as_str() == Some(model))
-        .or_else(|| entries.first())?;
-    let choices: Vec<ConfigChoice> = entry["supportedEffortLevels"]
-        .as_array()?
-        .iter()
-        .filter_map(|level| level.as_str())
-        .map(|level| ConfigChoice {
-            value: level.to_owned(),
-            label: level.to_owned(),
-            description: None,
-        })
-        .collect();
-    (!choices.is_empty()).then(|| ConfigOption {
-        id: ConfigId::new("effort"),
-        name: "Reasoning effort".into(),
-        category: Some("thought_level".into()),
-        kind: ConfigKind::Select { choices },
-        // `None`: the CLI keeps its own default and never reports it.
-        current: configured.map(ConfigValue::Text),
-        live: true,
-    })
+        .or_else(|| entries.first());
+    let levels = entry
+        .and_then(|e| e["supportedEffortLevels"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str);
+    level_choices(levels)
 }
 
 /// The `initialize` model catalog as config choices.
@@ -457,8 +447,6 @@ fn driver_info(init: &Value, version: Option<String>, request: &ConnectRequest) 
         current: Some(ConfigValue::Text(model.clone())),
         live: true,
     };
-    // Effort rides `--effort` at launch and `apply_flag_settings` live.
-    let effort_option = effort_option(&init["models"], &model, creation_option(request, "effort"));
     let mut configuration = SessionConfiguration::default();
     configuration
         .options
@@ -466,11 +454,6 @@ fn driver_info(init: &Value, version: Option<String>, request: &ConnectRequest) 
     configuration
         .options
         .insert(ConfigId::new("model"), ConfigValue::Text(model.clone()));
-    if let Some(current) = effort_option.as_ref().and_then(|o| o.current.clone()) {
-        configuration
-            .options
-            .insert(ConfigId::new("effort"), current);
-    }
     let mut info = DriverInfo {
         details: AgentDetails {
             version,
@@ -497,10 +480,7 @@ fn driver_info(init: &Value, version: Option<String>, request: &ConnectRequest) 
                     vec![McpTransport::Stdio, McpTransport::Http, McpTransport::Sse];
                 capabilities
             },
-            config_options: [Some(mode_option), Some(model_option), effort_option]
-                .into_iter()
-                .flatten()
-                .collect(),
+            config_options: vec![mode_option, model_option],
             commands,
         },
         configuration,
@@ -516,7 +496,14 @@ fn driver_info(init: &Value, version: Option<String>, request: &ConnectRequest) 
         deterministic_turn_end: true,
         deterministic_agent_turn_end: true,
     };
-    crate::adapter::set_fast_option(
+    // Effort rides `--effort` at launch and `apply_flag_settings` live. No
+    // selection: the CLI keeps its own default and never reports it.
+    set_effort_option(
+        &mut info,
+        effort_levels(&init["models"], &model),
+        creation_option(request, "effort"),
+    );
+    set_fast_option(
         &mut info,
         supports_fast(&init["models"], &model).then_some(requested_fast(request)),
         true,
@@ -987,8 +974,12 @@ impl Drive {
                     .await;
             }
             if crate::adapter::apply_selection(&mut self.info, &config_id, &value) {
+                // Fast and effort follow the model; an effort the new model
+                // does not offer is dropped.
                 if let ("model", ConfigValue::Text(model)) = (config_id.as_str(), &value) {
-                    crate::adapter::set_fast_option(
+                    let effort = selected(&self.info, "effort");
+                    set_effort_option(&mut self.info, effort_levels(&self.models, model), effort);
+                    set_fast_option(
                         &mut self.info,
                         supports_fast(&self.models, model).then_some(requested_fast(&self.request)),
                         true,
@@ -1115,6 +1106,7 @@ impl Drive {
                 self.requests.clear();
                 self.usage_request = None;
                 self.configs.clear();
+                self.interrupt_id = None;
                 self.info.resume_token = None;
                 self.events
                     .send(DriverEvent::InfoChanged(self.info.clone()))
