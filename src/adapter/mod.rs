@@ -26,6 +26,7 @@ use crate::event::{
 };
 
 pub(crate) mod acp;
+pub(crate) mod antigravity;
 pub(crate) mod attach;
 pub(crate) mod claude;
 pub(crate) mod codex;

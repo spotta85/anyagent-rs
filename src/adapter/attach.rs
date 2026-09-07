@@ -2,14 +2,14 @@
 //!
 //! The rule (proven by Comet, T3, and laptop-agent): every attachment rides
 //! the prompt text as a path ref — any file type works because the agent can
-//! open it with its own tools. Images under the cap are additionally inlined
-//! as base64 blocks so vision works without a tool call. Nothing here is
-//! fatal: an unreadable file becomes a problem report, everything else
-//! degrades to the path ref.
+//! open it with its own tools. Images, audio, and PDFs under the cap are
+//! additionally inlined as base64 so a wire that takes them gets the bytes
+//! without a tool call. Nothing here is fatal: an unreadable file becomes a
+//! problem report, everything else degrades to the path ref.
 
 use std::path::PathBuf;
 
-/// Above this, an image is not inlined and rides as a path ref only
+/// Above this, a file is not inlined and rides as a path ref only
 /// (Comet's cap, verified against the real claude CLI).
 const INLINE_CAP: usize = 5 * 1024 * 1024;
 
@@ -17,15 +17,30 @@ const INLINE_CAP: usize = 5 * 1024 * 1024;
 pub(crate) struct Loaded {
     /// Absolute path, for the text ref.
     pub path: String,
-    /// Present when the file is an image under the inline cap.
-    pub image: Option<Inline>,
+    /// Present when the file is a known media type under the inline cap.
+    pub inline: Option<Inline>,
     /// Present when the file could not be read.
     pub problem: Option<String>,
 }
 
+impl Loaded {
+    /// The inlined bytes when they are an image (every wire takes those).
+    pub fn image(&self) -> Option<&Inline> {
+        self.inline.as_ref().filter(|i| i.media == Media::Image)
+    }
+}
+
 pub(crate) struct Inline {
+    pub media: Media,
     pub mime: &'static str,
     pub base64: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Media {
+    Image,
+    Audio,
+    Pdf,
 }
 
 /// Reads each attachment up to the cap; sniffs images and encodes them.
@@ -38,9 +53,10 @@ pub(crate) async fn load(paths: &[PathBuf]) -> Vec<Loaded> {
         match read_capped(&absolute).await {
             Ok(bytes) => loaded.push(Loaded {
                 path,
-                image: sniff(&bytes)
+                inline: sniff(&bytes)
                     .filter(|_| bytes.len() <= INLINE_CAP)
-                    .map(|mime| Inline {
+                    .map(|(media, mime)| Inline {
+                        media,
                         mime,
                         base64: base64(&bytes),
                     }),
@@ -49,7 +65,7 @@ pub(crate) async fn load(paths: &[PathBuf]) -> Vec<Loaded> {
             Err(error) => loaded.push(Loaded {
                 problem: Some(format!("attachment unreadable ({path}): {error}")),
                 path,
-                image: None,
+                inline: None,
             }),
         }
     }
@@ -77,29 +93,25 @@ pub(crate) fn with_refs(text: &str, loaded: &[Loaded]) -> String {
     format!("{text}\n\nAttached files:\n{}", refs.join("\n"))
 }
 
-/// Image mime by magic bytes; anything else is not inlined.
-fn sniff(bytes: &[u8]) -> Option<&'static str> {
-    match bytes {
-        [0x89, b'P', b'N', b'G', ..] => Some("image/png"),
-        [0xFF, 0xD8, 0xFF, ..] => Some("image/jpeg"),
-        [b'G', b'I', b'F', b'8', ..] => Some("image/gif"),
-        [
-            b'R',
-            b'I',
-            b'F',
-            b'F',
-            _,
-            _,
-            _,
-            _,
-            b'W',
-            b'E',
-            b'B',
-            b'P',
-            ..,
-        ] => Some("image/webp"),
-        _ => None,
-    }
+/// Media kind and mime by magic bytes; anything else is not inlined.
+fn sniff(bytes: &[u8]) -> Option<(Media, &'static str)> {
+    use Media::*;
+    let riff = |tag: &[u8; 4]| bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == tag;
+    Some(match bytes {
+        [0x89, b'P', b'N', b'G', ..] => (Image, "image/png"),
+        [0xFF, 0xD8, 0xFF, ..] => (Image, "image/jpeg"),
+        [b'G', b'I', b'F', b'8', ..] => (Image, "image/gif"),
+        _ if riff(b"WEBP") => (Image, "image/webp"),
+        _ if riff(b"WAVE") => (Audio, "audio/wav"),
+        [b'I', b'D', b'3', ..] | [0xFF, 0xFB, ..] | [0xFF, 0xF3, ..] | [0xFF, 0xF2, ..] => {
+            (Audio, "audio/mpeg")
+        }
+        [b'O', b'g', b'g', b'S', ..] => (Audio, "audio/ogg"),
+        [b'f', b'L', b'a', b'C', ..] => (Audio, "audio/flac"),
+        [_, _, _, _, b'f', b't', b'y', b'p', b'M', b'4', b'A', ..] => (Audio, "audio/mp4"),
+        [b'%', b'P', b'D', b'F', ..] => (Pdf, "application/pdf"),
+        _ => return None,
+    })
 }
 
 /// Standard base64 with padding. Encoding only, so a dependency is not worth it.
@@ -140,18 +152,39 @@ mod tests {
         assert_eq!(base64(&[0xFF, 0x00, 0xFF]), "/wD/");
     }
 
-    /// sniff detects PNG/JPEG/GIF/WEBP magic bytes and returns None for PDF/empty.
+    /// sniff detects image, audio, and PDF magic bytes; anything else is None.
     #[test]
     fn sniff_knows_the_inline_formats() {
-        assert_eq!(sniff(b"\x89PNG\r\n\x1a\n"), Some("image/png"));
-        assert_eq!(sniff(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
-        assert_eq!(sniff(b"GIF89a"), Some("image/gif"));
-        assert_eq!(sniff(b"RIFF\x00\x00\x00\x00WEBP"), Some("image/webp"));
-        assert_eq!(sniff(b"%PDF-1.7"), None);
+        assert_eq!(
+            sniff(b"\x89PNG\r\n\x1a\n"),
+            Some((Media::Image, "image/png"))
+        );
+        assert_eq!(
+            sniff(&[0xFF, 0xD8, 0xFF, 0xE0]),
+            Some((Media::Image, "image/jpeg"))
+        );
+        assert_eq!(sniff(b"GIF89a"), Some((Media::Image, "image/gif")));
+        assert_eq!(
+            sniff(b"RIFF\x00\x00\x00\x00WEBP"),
+            Some((Media::Image, "image/webp"))
+        );
+        assert_eq!(
+            sniff(b"RIFF\x00\x00\x00\x00WAVEfmt "),
+            Some((Media::Audio, "audio/wav"))
+        );
+        assert_eq!(sniff(b"ID3\x04"), Some((Media::Audio, "audio/mpeg")));
+        assert_eq!(sniff(b"OggS"), Some((Media::Audio, "audio/ogg")));
+        assert_eq!(
+            sniff(b"\x00\x00\x00\x20ftypM4A "),
+            Some((Media::Audio, "audio/mp4"))
+        );
+        assert_eq!(sniff(b"%PDF-1.7"), Some((Media::Pdf, "application/pdf")));
+        assert_eq!(sniff(b"RIFF\x00\x00"), None);
+        assert_eq!(sniff(b"hello"), None);
         assert_eq!(sniff(b""), None);
     }
 
-    /// load inlines small PNG, leaves PDF as ref, and reports unreadable/missing files with problem.
+    /// load inlines a small PNG as an image and a PDF as a pdf, keeps both as refs, and reports unreadable files.
     #[tokio::test]
     async fn load_inlines_images_and_reports_unreadable_files() {
         let dir = std::env::temp_dir().join(format!("anyagent-attach-{}", std::process::id()));
@@ -160,8 +193,9 @@ mod tests {
         std::fs::write(dir.join("b.pdf"), b"%PDF-1.7 data").unwrap();
         let paths = [dir.join("a.png"), dir.join("b.pdf"), dir.join("missing")];
         let loaded = load(&paths).await;
-        assert_eq!(loaded[0].image.as_ref().unwrap().mime, "image/png");
-        assert!(loaded[1].image.is_none() && loaded[1].problem.is_none());
+        assert_eq!(loaded[0].image().unwrap().mime, "image/png");
+        assert!(loaded[1].image().is_none() && loaded[1].problem.is_none());
+        assert_eq!(loaded[1].inline.as_ref().unwrap().media, Media::Pdf);
         assert!(loaded[2].problem.is_some());
         let text = with_refs("look", &loaded);
         assert!(text.starts_with("look\n\nAttached files:\n- "));

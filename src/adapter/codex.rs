@@ -1393,7 +1393,7 @@ impl Drive {
         }
         let mut items =
             vec![json!({ "type": "text", "text": attach::with_refs(input.as_text(), &loaded) })];
-        for image in loaded.iter().filter(|l| l.image.is_some()) {
+        for image in loaded.iter().filter(|l| l.image().is_some()) {
             items.push(json!({ "type": "localImage", "path": image.path }));
         }
         Ok(items)

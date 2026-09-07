@@ -7,6 +7,7 @@
 //! notifications into events (`handle_frame`, `translate`, `on_*`).
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use agent_client_protocol_schema::v1 as acp;
 use async_trait::async_trait;
@@ -33,6 +34,8 @@ use crate::event::{
 use crate::process::{self, Spawn};
 
 const AUTH_REQUIRED_CODE: i64 = -32000;
+/// Adopting an existing login is ~2 s; a browser flow would never return.
+const ADOPT_LOGIN_WAIT: Duration = Duration::from_secs(10);
 
 /// One instance per ACP agent; `args` put the CLI in protocol mode.
 pub(crate) struct AcpAdapter {
@@ -43,12 +46,13 @@ pub(crate) struct AcpAdapter {
 }
 
 impl AcpAdapter {
-    /// An ad-hoc ACP agent: protocol args only, no catalog facts.
-    pub(crate) fn new(args: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        Self {
-            args: args.into_iter().map(Into::into).collect(),
-            profile: None,
-        }
+    /// Explicit protocol args, with the catalog's auth facts when the agent
+    /// has an entry (an ACP upgrade) and none for an ad-hoc install.
+    pub(crate) fn with_args(
+        profile: Option<&'static crate::catalog::AgentProfile>,
+        args: Vec<String>,
+    ) -> Self {
+        Self { args, profile }
     }
 
     /// A catalog agent: protocol args and auth facts from its profile.
@@ -82,11 +86,16 @@ impl Adapter for AcpAdapter {
         let mut wire = Wire::over(&mut child, recorder);
 
         let open_auth_kind = self.profile.and_then(|p| p.open_auth_kind.clone());
+        let adopt_login = self
+            .profile
+            .and_then(|p| p.upgrade.as_ref())
+            .and_then(|u| u.acp_auth_method);
         let handshake = tokio::time::timeout(
             HANDSHAKE_TIMEOUT,
-            handshake(&mut wire, &request, open_auth_kind),
+            handshake(&mut wire, &request, open_auth_kind, adopt_login),
         );
-        let (info, session_id, login, first_class_model, kiro) = match handshake.await {
+        let (info, session_id, login, first_class_model, kiro, prompt_media) = match handshake.await
+        {
             Ok(Ok(ok)) => ok,
             Ok(Err(e)) => {
                 // Shutdown first: it joins the stderr reader, so the tail is
@@ -123,6 +132,7 @@ impl Adapter for AcpAdapter {
                 configs: Vec::new(),
                 first_class_model,
                 kiro,
+                prompt_media,
                 effort_id: None,
                 pending_effort: None,
                 held_prompt: None,
@@ -150,7 +160,18 @@ async fn handshake(
     wire: &mut Wire,
     request: &ConnectRequest,
     open_auth_kind: Option<AuthKind>,
-) -> Result<(DriverInfo, String, Vec<LoginMethod>, bool, bool), AgentError> {
+    adopt_login: Option<&'static str>,
+) -> Result<
+    (
+        DriverInfo,
+        String,
+        Vec<LoginMethod>,
+        bool,
+        bool,
+        PromptMedia,
+    ),
+    AgentError,
+> {
     let init = wire
         .roundtrip(
             "initialize",
@@ -191,9 +212,23 @@ async fn handshake(
             String::new(),
         ),
     };
-    let response = wire
-        .roundtrip(method, params)
-        .await
+    let mut response = wire.roundtrip(method, params.clone()).await;
+    // An ACP upgrade with its own auth choice (antigravity's server) adopts
+    // the CLI's login in-protocol: one `authenticate`, then the same call
+    // again. A logged-out login would block on a browser instead, so the
+    // wait is short and the original refusal stands on any other outcome.
+    if let (Err(WireError::Rpc { code, .. }), Some(method_id)) = (&response, adopt_login)
+        && *code == AUTH_REQUIRED_CODE
+    {
+        let authenticate = wire.roundtrip("authenticate", json!({ "methodId": method_id }));
+        if matches!(
+            tokio::time::timeout(ADOPT_LOGIN_WAIT, authenticate).await,
+            Ok(Ok(_))
+        ) {
+            response = wire.roundtrip(method, params).await;
+        }
+    }
+    let response = response
         .map_err(|e| e.into_error(&init.auth_methods, &request.installation.executable_path))?;
 
     let mut info = driver_info(&init, &request.installation.auth, open_auth_kind);
@@ -217,6 +252,10 @@ async fn handshake(
     let first_class_model =
         first_class_models.is_some_and(|models| apply_first_class_models(&mut info, &models));
     let kiro = is_kiro(&init);
+    let prompt_media = PromptMedia {
+        audio: init.agent_capabilities.prompt_capabilities.audio,
+        embedded_context: init.agent_capabilities.prompt_capabilities.embedded_context,
+    };
     info.resume_token = Some(ResumeToken::new(&session_id));
     // Creation-time config: apply each requested option before the first
     // turn; a refusal fails the open instead of silently running misconfigured.
@@ -259,7 +298,14 @@ async fn handshake(
         .iter()
         .filter_map(|m| login_method(m, &request.installation.executable_path))
         .collect();
-    Ok((info, session_id, login, first_class_model, kiro))
+    Ok((
+        info,
+        session_id,
+        login,
+        first_class_model,
+        kiro,
+        prompt_media,
+    ))
 }
 
 /// Kiro is the one ACP agent with a prompt-driven effort switch.
@@ -635,6 +681,13 @@ struct PendingQuestion {
     questions: Vec<Value>,
 }
 
+/// Prompt content the agent advertised beyond text and images.
+#[derive(Clone, Copy)]
+struct PromptMedia {
+    audio: bool,
+    embedded_context: bool,
+}
+
 struct Drive {
     wire: Wire,
     child: process::Child,
@@ -660,6 +713,8 @@ struct Drive {
     first_class_model: bool,
     /// The agent is kiro: `effort` selections ride a `/effort` prompt.
     kiro: bool,
+    /// Which inlined media the agent takes in prompts, from `initialize`.
+    prompt_media: PromptMedia,
     /// Wire id of an in-flight `/effort` prompt; its chunks stay internal.
     effort_id: Option<u64>,
     /// An effort switch requested mid-turn, sent once the turn ends.
@@ -1385,8 +1440,9 @@ impl Drive {
         (tool.clone(), appended)
     }
 
-    /// Content blocks for one prompt: inlined images first (when the agent
-    /// takes them), then the text carrying every attachment's path ref.
+    /// Content blocks for one prompt: inlined media first, each kind only
+    /// when the agent advertised it (images, audio, PDFs as embedded
+    /// resources), then the text carrying every attachment's path ref.
     async fn prompt_blocks(&mut self, input: &Input) -> Result<Value, Gone> {
         let loaded = attach::load(&input.attachments).await;
         for problem in loaded.iter().filter_map(|l| l.problem.as_deref()) {
@@ -1394,15 +1450,28 @@ impl Drive {
                 .diagnostic(DiagnosticLevel::Warning, problem.to_owned())
                 .await?;
         }
+        let images = self.info.details.capabilities.supports(Capability::Images);
         let mut blocks = Vec::new();
-        if self.info.details.capabilities.supports(Capability::Images) {
-            for image in loaded.iter().filter_map(|l| l.image.as_ref()) {
-                blocks.push(json!({
-                    "type": "image",
-                    "data": image.base64,
-                    "mimeType": image.mime,
-                }));
-            }
+        for l in &loaded {
+            let Some(inline) = &l.inline else { continue };
+            let block = match inline.media {
+                attach::Media::Image if images => {
+                    json!({ "type": "image", "data": inline.base64, "mimeType": inline.mime })
+                }
+                attach::Media::Audio if self.prompt_media.audio => {
+                    json!({ "type": "audio", "data": inline.base64, "mimeType": inline.mime })
+                }
+                attach::Media::Pdf if self.prompt_media.embedded_context => json!({
+                    "type": "resource",
+                    "resource": {
+                        "uri": format!("file://{}", l.path),
+                        "mimeType": inline.mime,
+                        "blob": inline.base64,
+                    },
+                }),
+                _ => continue,
+            };
+            blocks.push(block);
         }
         blocks.push(json!({
             "type": "text",

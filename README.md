@@ -88,7 +88,7 @@ against the agents on your machine:
 |---|---|
 | Claude Code | native (stream-json) |
 | Codex | native (app-server) |
-| Antigravity | native (adapter in progress) |
+| Antigravity | native (stream-json), or ACP through its optional server |
 | pi | native (pi RPC) |
 | opencode | native (HTTP + SSE) |
 | Grok, Hermes Agent, Kiro CLI, Qwen Code | ACP |

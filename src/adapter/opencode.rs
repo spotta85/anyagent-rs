@@ -750,7 +750,7 @@ impl Drive {
         if let Some((command, arguments)) =
             slash_command(&text).filter(|(name, _)| self.has_command(name))
         {
-            if loaded.iter().any(|l| l.image.is_some()) {
+            if loaded.iter().any(|l| l.image().is_some()) {
                 self.events
                     .diagnostic(
                         DiagnosticLevel::Warning,
@@ -761,7 +761,7 @@ impl Drive {
             return self.start_command(command, arguments);
         }
         let mut parts = vec![json!({ "type": "text", "text": text })];
-        for image in loaded.iter().filter_map(|l| l.image.as_ref()) {
+        for image in loaded.iter().filter_map(|l| l.image()) {
             parts.push(json!({
                 "type": "file",
                 "mime": image.mime,

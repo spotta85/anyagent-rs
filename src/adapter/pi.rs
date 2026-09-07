@@ -858,7 +858,7 @@ impl Drive {
         }
         let images: Vec<Value> = loaded
             .iter()
-            .filter_map(|l| l.image.as_ref())
+            .filter_map(|l| l.image())
             .map(|image| json!({ "type": "image", "data": image.base64, "mimeType": image.mime }))
             .collect();
         let mut body = json!({ "message": attach::with_refs(input.as_text(), &loaded) });

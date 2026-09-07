@@ -24,6 +24,15 @@ async fn main() {
         println!("{line}");
     }
 
+    // Installed agents with a richer runtime still to install.
+    for agent in &report.agents {
+        if let Some(upgrade) = &agent.upgrade {
+            println!(
+                "{:<10} works without {} — install it for more: {}",
+                agent.id, upgrade.name, upgrade.install_hint
+            );
+        }
+    }
     // Agents anyagent supports but did not find, with how to install them.
     for missing in &report.missing {
         println!(

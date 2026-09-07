@@ -1303,7 +1303,7 @@ impl Drive {
         } else {
             let mut blocks: Vec<Value> = loaded
                 .iter()
-                .filter_map(|l| l.image.as_ref())
+                .filter_map(|l| l.image())
                 .map(|image| {
                     json!({
                         "type": "image",

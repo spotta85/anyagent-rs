@@ -8,7 +8,8 @@
 //! ```
 //!
 //! Rules the suite enforces itself: the ANTHROPIC_* env hijack is stripped
-//! in-process, pi auto-skips without OPENROUTER_API_KEY, capability
+//! in-process, a selected harness whose CLI is not installed is warned about
+//! and skipped (never a failure) and named again by `zz_summary`, capability
 //! gates print SKIP (which is a pass), and every event wait names the step
 //! it hung at. Model-output flakes (wrong word from a weak model) are the
 //! operator's judgment call; structural failures fail hard.
@@ -22,11 +23,21 @@ use futures::StreamExt;
 
 use anyagent::{
     AgentError, Answer, AuthStatus, Capability, ConfigKind, ConfigValue, DeliveryKind, Event,
-    EventKind, Events, MessageId, PermissionChoice, PromptId, QuestionAnswer, Request, RequestId,
-    ResumeToken, RollbackScope, Runtime, Session, SessionOptions, StopReason, ToolStatus,
-    TurnOrigin,
+    EventKind, Events, MessageId, PermissionChoice, PermissionMode, PromptId, QuestionAnswer,
+    Request, RequestId, ResumeToken, RollbackScope, Runtime, Session, SessionOptions, StopReason,
+    ToolStatus, TurnOrigin,
 };
 
+/// Every harness the shared matrix covers, in report order.
+const HARNESSES: &[&str] = &[
+    "claude",
+    "codex",
+    "opencode",
+    "hermes",
+    "kiro",
+    "pi",
+    "antigravity",
+];
 const EVENT_TIMEOUT: Duration = Duration::from_secs(120);
 const OPENCODE_MODEL: &str = "opencode/big-pickle";
 /// The host config's default (`gpt-6-astra`) needs a newer CLI; luna is cheap and available.
@@ -41,42 +52,101 @@ const CLAUDE_MODEL: &str = "haiku";
 
 // -- gate -------------------------------------------------------------------
 
-/// Harnesses picked by ANYAGENT_LIVE, with the env hijack stripped first.
-fn enabled() -> Vec<&'static str> {
-    static STRIP: std::sync::Once = std::sync::Once::new();
-    STRIP.call_once(|| {
-        for var in [
-            "ANTHROPIC_BASE_URL",
-            "ANTHROPIC_AUTH_TOKEN",
-            "ANTHROPIC_API_KEY",
-            "ANTHROPIC_MODEL",
-            "CLAUDECODE",
-        ] {
-            // Safe here: called once, before any session spawns threads that
-            // read the environment.
-            unsafe { std::env::remove_var(var) };
-        }
-        // The host's settings.json may route the CLI through a proxy; the
-        // process env wins over it, so pin the real API for the suite.
-        unsafe { std::env::set_var("ANTHROPIC_BASE_URL", "https://api.anthropic.com") };
-    });
+/// Harnesses selected by ANYAGENT_LIVE whose CLI is actually installed.
+/// The roster is built once; harnesses that are missing are warned about
+/// there and listed again by the `summary` test at the end of the run.
+async fn enabled() -> Vec<&'static str> {
+    roster().await.installed.clone()
+}
+
+/// Which harnesses the run covers, and the ones it had to leave out.
+struct Roster {
+    installed: Vec<&'static str>,
+    /// One human line per skipped harness, for the warning and the summary.
+    skipped: Vec<String>,
+}
+
+/// Whether the discovered `antigravity` is the headless `agy` CLI (its ACP
+/// server not installed), which cannot ask and needs AutoApprove.
+static HEADLESS_AGY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// The roster, built on first use and shared by every test.
+async fn roster() -> &'static Roster {
+    static ROSTER: tokio::sync::OnceCell<Roster> = tokio::sync::OnceCell::const_new();
+    ROSTER.get_or_init(build_roster).await
+}
+
+/// Strips the env hijack, reads ANYAGENT_LIVE, then splits the selection
+/// into installed and missing by one discovery pass. Warns about the
+/// missing ones so a "not discovered" failure can never be mistaken for a
+/// broken adapter.
+async fn build_roster() -> Roster {
+    for var in [
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_MODEL",
+        "CLAUDECODE",
+    ] {
+        // Safe here: runs once, before any session spawns threads that read
+        // the environment.
+        unsafe { std::env::remove_var(var) };
+    }
+    // The host's settings.json may route the CLI through a proxy; the
+    // process env wins over it, so pin the real API for the suite.
+    unsafe { std::env::set_var("ANTHROPIC_BASE_URL", "https://api.anthropic.com") };
+
     let Ok(list) = std::env::var("ANYAGENT_LIVE") else {
         println!("SKIP all: ANYAGENT_LIVE is not set");
-        return Vec::new();
+        return Roster {
+            installed: Vec::new(),
+            skipped: Vec::new(),
+        };
     };
-    ["claude", "codex", "opencode", "hermes", "kiro", "pi"]
-        .into_iter()
+    let selected: Vec<&'static str> = HARNESSES
+        .iter()
+        .copied()
         .filter(|h| list == "all" || list.split(',').any(|p| p.trim() == *h))
-        .filter(|h| {
-            // pi is pinned to an openrouter model; opencode uses its own
-            // cost-free zen model, so it needs no key.
-            let keyless = *h == "pi" && std::env::var("OPENROUTER_API_KEY").is_err();
-            if keyless {
-                println!("SKIP {h}: OPENROUTER_API_KEY is not set");
-            }
-            !keyless
-        })
-        .collect()
+        .collect();
+
+    let report = Runtime::new().discover().await;
+    let _ = HEADLESS_AGY.set(
+        report
+            .require("antigravity")
+            .map(|a| a.upgrade.is_some())
+            .unwrap_or(false),
+    );
+    let mut installed = Vec::new();
+    let mut skipped = Vec::new();
+    for h in selected {
+        match report.require(h) {
+            Ok(_) => installed.push(h),
+            Err(_) => skipped.push(missing_line(&report, h)),
+        }
+    }
+    if !skipped.is_empty() {
+        println!(
+            "\nWARN: {} selected harness(es) not installed:",
+            skipped.len()
+        );
+        for line in &skipped {
+            println!("  {line}");
+        }
+        println!("Their tests are skipped, not failed.\n");
+    }
+    Roster { installed, skipped }
+}
+
+/// "codex: not installed (searched 14 dirs) — install: npm i -g ..."
+fn missing_line(report: &anyagent::DiscoveryReport, harness: &str) -> String {
+    match report.missing.iter().find(|m| m.id.as_str() == harness) {
+        Some(m) => format!(
+            "{harness}: not installed (searched {} dirs) - install: {}",
+            m.searched.len(),
+            m.install_hint
+        ),
+        None => format!("{harness}: not installed"),
+    }
 }
 
 // -- the features -----------------------------------------------------------
@@ -85,7 +155,7 @@ fn enabled() -> Vec<&'static str> {
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn discovery_finds_authenticated_harnesses() {
-    for h in enabled() {
+    for h in enabled().await {
         let report = Runtime::new().discover().await;
         let agent = report
             .require(h)
@@ -132,7 +202,7 @@ async fn discovery_finds_authenticated_harnesses() {
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn open_reports_token_capabilities_and_options() {
-    for h in enabled() {
+    for h in enabled().await {
         let (session, _events, _dir) = open(h).await;
         let info = session.info();
         assert!(info.resume_token.is_some(), "{h}: no resume token at open");
@@ -153,13 +223,12 @@ async fn open_reports_token_capabilities_and_options() {
                 .any(|o| o.id.as_str() == id)
         };
         // pi has no permission protocol on its wire and no permission mode:
-        // its `mode`-shaped knob is the model's thinking level.
-        if h == "pi" {
-            assert!(
-                !caps.supports(Capability::Permissions),
-                "{h}: has Permissions"
-            );
-            assert!(caps.supports(Capability::Steer), "{h}: no Steer");
+        // its `mode`-shaped knob is the model's thinking level. agy's
+        // headless wire cannot prompt at all; its ACP server (the upgrade,
+        // used when installed) can, and then reads like any ACP agent.
+        let headless_agy = h == "antigravity" && !caps.supports(Capability::Permissions);
+        if h == "pi" || headless_agy {
+            assert_eq!(caps.supports(Capability::Steer), h == "pi", "{h}: Steer");
             assert!(has_option("model"), "{h}: no `model` config option");
         } else {
             assert!(
@@ -211,8 +280,9 @@ async fn effort_switches_live() {
         .filter(|h| named(h))
     {
         let runtime = Runtime::new();
-        if runtime.discover().await.require(h).is_err() {
-            println!("SKIP {h}: not discovered");
+        let report = runtime.discover().await;
+        if report.require(h).is_err() {
+            println!("SKIP {}", missing_line(&report, h));
             continue;
         }
         let (session, mut events, _dir) = open(h).await;
@@ -296,7 +366,7 @@ async fn effort_switches_live() {
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn probe_reports_details_without_a_session() {
-    for h in enabled() {
+    for h in enabled().await {
         let runtime = Runtime::new();
         let report = runtime.discover().await;
         let agent = report
@@ -352,17 +422,23 @@ async fn probe_reports_details_without_a_session() {
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn generate_returns_text_without_a_session() {
-    for h in enabled() {
+    for h in enabled().await {
         let dir = tempfile::tempdir().unwrap();
         let runtime = Runtime::new();
         let report = runtime.discover().await;
         let agent = report
             .require(h)
             .unwrap_or_else(|_| panic!("{h}: not discovered"));
-        let text = runtime
-            .generate(agent, options(h, dir.path()), TITLE)
-            .await
-            .unwrap_or_else(|e| panic!("{h}: generate failed: {e}"));
+        let text = match runtime.generate(agent, options(h, dir.path()), TITLE).await {
+            Ok(text) => text,
+            // A wire with neither tool disabling nor permission requests
+            // cannot be hands-off; the refusal is typed (agy).
+            Err(AgentError::UnsupportedFeature(why)) => {
+                println!("SKIP {h}: generate unsupported (typed): {why}");
+                continue;
+            }
+            Err(e) => panic!("{h}: generate failed: {e}"),
+        };
         assert!(text.to_lowercase().contains("branch"), "{h}: got {text:?}");
         assert!(
             text.split_whitespace().count() <= 8,
@@ -386,7 +462,10 @@ async fn pi_generate_stays_text_only() {
     let log = dir.path().join("wire.jsonl");
     let runtime = Runtime::new();
     let report = runtime.discover().await;
-    let agent = report.require("pi").expect("pi not discovered");
+    let Ok(agent) = report.require("pi") else {
+        println!("SKIP {}", missing_line(&report, "pi"));
+        return;
+    };
     let text = tokio::time::timeout(EVENT_TIMEOUT, runtime.generate(
         agent, options("pi", dir.path()).record_wire(&log),
         "Read context.txt using a tool, then return a short summary. If no tools are available, say that briefly.",
@@ -408,7 +487,7 @@ async fn pi_generate_stays_text_only() {
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn turn_events_are_bracketed_ordered_and_quiet_after_end() {
-    for h in enabled() {
+    for h in enabled().await {
         let (session, mut events, _dir) = open(h).await;
         session
             .prompt("Say only the word PINEAPPLE. Do not use any tools.")
@@ -492,7 +571,7 @@ async fn turn_events_are_bracketed_ordered_and_quiet_after_end() {
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn tools_run_to_completion_and_the_file_lands() {
-    for h in enabled() {
+    for h in enabled().await {
         let (session, mut events, dir) = open(h).await;
         session
             .prompt("Create a file named note.txt containing exactly the word HELLO. Use your file tools.")
@@ -536,7 +615,7 @@ async fn tools_run_to_completion_and_the_file_lands() {
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn permissions_gate_the_write_and_deny_holds() {
-    for h in enabled() {
+    for h in enabled().await {
         let write =
             "Create a file named note.txt containing exactly the word HELLO. Use your file tools.";
         // Session A: allow — the request closes and the file lands.
@@ -620,7 +699,7 @@ async fn permissions_gate_the_write_and_deny_holds() {
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn an_unknown_slash_prompt_is_plain_text() {
-    for h in enabled() {
+    for h in enabled().await {
         let (session, mut events, _dir) = open(h).await;
         session
             .prompt("/definitely-not-a-command Reply with only the word KUMQUAT.")
@@ -649,7 +728,7 @@ async fn an_unknown_slash_prompt_is_plain_text() {
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn opencode_child_session_permissions_reach_the_caller() {
-    if !enabled().contains(&"opencode") {
+    if !enabled().await.contains(&"opencode") {
         println!("SKIP: opencode not enabled");
         return;
     }
@@ -686,7 +765,7 @@ async fn opencode_child_session_permissions_reach_the_caller() {
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn a_question_round_trips() {
-    for h in enabled() {
+    for h in enabled().await {
         // codex runs as a probe: `item/tool/requestUserInput` is
         // schema-confirmed but has never fired live (ticket 10) — the
         // translation is exercised if it ever does, without failing the run.
@@ -756,7 +835,7 @@ async fn a_question_round_trips() {
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn steering_is_absent_on_claude_and_folds_where_advertised() {
-    for h in enabled() {
+    for h in enabled().await {
         let (session, mut events, _dir) = open(h).await;
         let steers = session
             .info()
@@ -796,7 +875,7 @@ async fn steering_is_absent_on_claude_and_folds_where_advertised() {
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn the_queue_is_fifo_and_ids_stay_aligned() {
-    for h in enabled() {
+    for h in enabled().await {
         let (session, mut events, _dir) = open(h).await;
         session.prompt(COUNT).await.unwrap();
         // On a steering harness (codex) a lone mid-turn prompt folds into
@@ -848,7 +927,7 @@ async fn the_queue_is_fifo_and_ids_stay_aligned() {
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn cancel_ends_the_turn_in_every_queue_shape() {
-    for h in enabled() {
+    for h in enabled().await {
         // The claude wedge was a timing race (interrupt vs the CLI's own
         // queued→started window), so repeat the raced variant there.
         let reps = if h == "claude" { 3 } else { 1 };
@@ -907,7 +986,7 @@ async fn cancel_ends_the_turn_in_every_queue_shape() {
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn resume_recalls_without_replaying() {
-    for h in enabled() {
+    for h in enabled().await {
         let (session, mut events, dir) = open(h).await;
         if !session
             .info()
@@ -974,7 +1053,7 @@ async fn resume_recalls_without_replaying() {
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn plan_usage_arrives_after_a_turn() {
-    for h in enabled() {
+    for h in enabled().await {
         let (session, mut events, _dir) = open(h).await;
         if !session
             .info()
@@ -1051,7 +1130,7 @@ async fn plan_usage_arrives_after_a_turn() {
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn compact_summarizes_the_session_without_losing_it() {
-    for h in enabled() {
+    for h in enabled().await {
         let (session, mut events, _dir) = open(h).await;
         if !session
             .info()
@@ -1104,7 +1183,7 @@ async fn compact_summarizes_the_session_without_losing_it() {
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn rollback_forgets_the_rolled_back_turn() {
-    for h in enabled() {
+    for h in enabled().await {
         let (session, mut events, _dir) = open(h).await;
         if !session
             .info()
@@ -1153,7 +1232,7 @@ async fn rollback_forgets_the_rolled_back_turn() {
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn files_rollback_restores_agent_written_files() {
-    for h in enabled() {
+    for h in enabled().await {
         let (session, mut events, dir) = open(h).await;
         if !session
             .info()
@@ -1203,7 +1282,7 @@ async fn files_rollback_restores_agent_written_files() {
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn fork_from_branches_at_a_point_and_at_the_tip() {
-    for h in enabled() {
+    for h in enabled().await {
         let (session, mut events, dir) = open(h).await;
         if !session
             .info()
@@ -1291,7 +1370,7 @@ async fn fork_from_branches_at_a_point_and_at_the_tip() {
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn runtime_plan_usage_probes_without_a_session() {
-    for h in enabled() {
+    for h in enabled().await {
         let runtime = Runtime::new();
         let report = runtime.discover().await;
         let agent = report.require(h).unwrap();
@@ -1317,7 +1396,7 @@ async fn runtime_plan_usage_probes_without_a_session() {
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn a_killed_agent_fails_the_turn_and_closes_the_session() {
-    for h in enabled() {
+    for h in enabled().await {
         if h == "hermes" {
             println!("SKIP hermes: agent death (messy process tree; two harnesses prove the path)");
             continue;
@@ -1359,7 +1438,7 @@ async fn a_killed_agent_fails_the_turn_and_closes_the_session() {
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn close_returns_promptly_and_ends_the_stream() {
-    for h in enabled() {
+    for h in enabled().await {
         let (session, mut events, _dir) = open(h).await;
         session.prompt("Say only OK. No tools.").await.unwrap();
         drain_to_turn_end(&session, &mut events, &format!("{h}: short turn")).await;
@@ -1382,7 +1461,7 @@ async fn close_returns_promptly_and_ends_the_stream() {
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn errors_are_typed() {
-    for h in enabled() {
+    for h in enabled().await {
         if h == "hermes" {
             println!("SKIP hermes: typed errors (excluded by plan)");
             continue;
@@ -1475,6 +1554,11 @@ fn options(harness: &str, dir: &std::path::Path) -> SessionOptions {
     }
     if harness == "pi" {
         options = options.configure("model", PI_MODEL);
+    }
+    // Headless agy auto-denies every gated tool in Ask mode; its ACP server
+    // asks like any ACP agent.
+    if harness == "antigravity" && HEADLESS_AGY.get().copied().unwrap_or(false) {
+        options = options.permission_mode(PermissionMode::AutoApprove);
     }
     if harness == "codex" {
         // Deterministic approvals regardless of the host config: a write
@@ -1633,6 +1717,11 @@ fn kill_child(harness: &str, session: &Session) {
         // pi overwrites its argv with its own process title, so there is no
         // command line to match: the exact name plus newest-first is ours.
         "pi" => (&["-n", "-x"], "pi".to_owned()),
+        // The CLI's wire flag, or the ACP server's own executable name.
+        "antigravity" => (
+            &["-n", "-f"],
+            "agy( --input-format=stream-json|_acp_server)".to_owned(),
+        ),
         _ => (&["-n", "-f"], "opencode serve".to_owned()),
     };
     let out = std::process::Command::new("pgrep")
@@ -1720,7 +1809,7 @@ fn claude_transcripts() -> std::collections::BTreeSet<std::path::PathBuf> {
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn config_home_isolates_login() {
-    for h in enabled() {
+    for h in enabled().await {
         if h != "claude" && h != "codex" && h != "pi" {
             println!("SKIP {h}: config-home isolation asserted on claude, codex and pi");
             continue;
@@ -1770,7 +1859,7 @@ async fn config_home_isolates_login() {
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn record_wire_captures_a_live_turn() {
-    for h in enabled() {
+    for h in enabled().await {
         if h != "claude" {
             println!("SKIP {h}: recording smoke asserted on claude");
             continue;
@@ -1800,4 +1889,33 @@ async fn record_wire_captures_a_live_turn() {
         }
         pass(h, &format!("recorded {count} wire frames over a live turn"));
     }
+}
+
+// -- summary ----------------------------------------------------------------
+
+/// Closing roster: which harnesses the run covered and which were skipped
+/// because their CLI is not installed. Runs last by name so it lands at the
+/// bottom of the output.
+#[tokio::test]
+#[ignore = "live: talks to real agents"]
+async fn zz_summary() {
+    let roster = roster().await;
+    println!("\n--- live run summary ---");
+    println!(
+        "ran: {}",
+        if roster.installed.is_empty() {
+            "none".to_owned()
+        } else {
+            roster.installed.join(", ")
+        }
+    );
+    if roster.skipped.is_empty() {
+        println!("skipped (not installed): none");
+    } else {
+        println!("skipped (not installed):");
+        for line in &roster.skipped {
+            println!("  {line}");
+        }
+    }
+    println!("------------------------\n");
 }

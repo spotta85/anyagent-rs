@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::agent::{AgentId, AgentInstallation, AuthStatus, InstallationSource, LoginMethod};
-use crate::catalog::{AgentProfile, AuthMarker};
+use crate::catalog::{AgentProfile, AuthMarker, Upgrade};
 use crate::event::{Diagnostic, DiagnosticLevel};
 use crate::process::login_shell_path;
 use crate::runtime::{DiscoveryReport, MissingAgent};
@@ -42,7 +42,8 @@ pub(crate) async fn discover(profiles: &[AgentProfile]) -> DiscoveryReport {
 }
 
 /// One profile's scan: the installation or the missing record, plus any
-/// diagnostics raised on the way.
+/// diagnostics raised on the way. An installed upgrade wins over the base
+/// CLI; a missing one rides the installation as `upgrade`.
 async fn scan(
     profile: &AgentProfile,
     home: &Path,
@@ -55,9 +56,22 @@ async fn scan(
         return (Ok(agent), diagnostics);
     }
     let dirs = search_dirs(profile, home, path, login);
-    let found = match resolve(profile.cli, &dirs) {
-        Some((exe, source)) => Ok(installation(profile, exe, source, home).await),
-        None => Err(MissingAgent {
+    let upgrade = profile
+        .upgrade
+        .as_ref()
+        .map(|upgrade| resolve_upgrade(profile, upgrade, &dirs, home));
+    let found = match (resolve(profile.cli, &dirs), upgrade) {
+        (_, Some(Ok((exe, source, args)))) => {
+            let mut agent = installation(profile, exe, source, home).await;
+            agent.acp_args = Some(args);
+            Ok(agent)
+        }
+        (Some((exe, source)), upgrade) => {
+            let mut agent = installation(profile, exe, source, home).await;
+            agent.upgrade = upgrade.and_then(Result::err);
+            Ok(agent)
+        }
+        (None, _) => Err(MissingAgent {
             id: AgentId::new(profile.id),
             name: profile.name.into(),
             searched: dirs.into_iter().map(|(dir, _)| dir).collect(),
@@ -65,6 +79,37 @@ async fn scan(
         }),
     };
     (found, diagnostics)
+}
+
+/// The upgrade's executable and ACP args, or the missing record naming it.
+/// Searched in the base dirs plus its own extras.
+#[allow(clippy::type_complexity)]
+fn resolve_upgrade(
+    profile: &AgentProfile,
+    upgrade: &Upgrade,
+    dirs: &[(PathBuf, InstallationSource)],
+    home: &Path,
+) -> Result<(PathBuf, InstallationSource, Vec<String>), MissingAgent> {
+    let mut dirs = dirs.to_vec();
+    dirs.extend(
+        upgrade
+            .extra_paths
+            .iter()
+            .map(|extra| (home.join(extra), InstallationSource::KnownLocation)),
+    );
+    match resolve(upgrade.cli, &dirs) {
+        Some((exe, source)) => Ok((
+            exe,
+            source,
+            upgrade.acp_args.iter().map(|a| (*a).to_owned()).collect(),
+        )),
+        None => Err(MissingAgent {
+            id: AgentId::new(profile.id),
+            name: upgrade.name.into(),
+            searched: dirs.into_iter().map(|(dir, _)| dir).collect(),
+            install_hint: upgrade.install_hint.into(),
+        }),
+    }
 }
 
 /// The executable named by the profile's env var, when set and valid.
@@ -218,6 +263,7 @@ async fn installation(
         auth: read_auth(profile, home, &executable).await,
         executable_path: executable,
         source,
+        upgrade: None,
         acp_args: None,
     }
 }
@@ -327,6 +373,7 @@ mod tests {
             login_args: &["login"],
             install_hint: "install fake",
             extra_paths: &["custom/bin"],
+            upgrade: None,
         }
     }
 
