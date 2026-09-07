@@ -765,7 +765,7 @@ impl Drive {
             parts.push(json!({
                 "type": "file",
                 "mime": image.mime,
-                "url": format!("data:{};base64,{}", image.mime, image.base64),
+                "url": format!("data:{};base64,{}", image.mime, image.base64()),
             }));
         }
         let mut body = json!({ "parts": parts });

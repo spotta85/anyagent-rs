@@ -94,15 +94,21 @@ impl Adapter for AcpAdapter {
             HANDSHAKE_TIMEOUT,
             handshake(&mut wire, &request, open_auth_kind, adopt_login),
         );
-        let (info, session_id, login, first_class_model, kiro, prompt_media) = match handshake.await
-        {
+        let Handshake {
+            info,
+            session_id,
+            login,
+            first_class_model,
+            kiro,
+            prompt_media,
+        } = match handshake.await {
             Ok(Ok(ok)) => ok,
             Ok(Err(e)) => {
                 // Shutdown first: it joins the stderr reader, so the tail is
                 // complete before the error is rendered and hint-matched.
                 child.shutdown(CLOSE_GRACE).await;
                 let e = crate::adapter::with_stderr(e, &child);
-                return Err(auth_hinted(
+                return Err(crate::adapter::auth_hinted(
                     e,
                     self.profile,
                     &request.installation.executable_path,
@@ -153,25 +159,25 @@ impl Adapter for AcpAdapter {
 // LAUNCH AND HANDSHAKE
 // ---------------------------------------------------------------------------
 
+/// What the handshake settled, for the drive task.
+struct Handshake {
+    info: DriverInfo,
+    session_id: String,
+    /// Runnable login methods, for auth failures later in the session.
+    login: Vec<LoginMethod>,
+    first_class_model: bool,
+    kiro: bool,
+    prompt_media: PromptMedia,
+}
+
 /// `initialize`, then `session/new` or `session/load`. A `session/new` error
-/// with the auth code becomes `AuthRequired` with runnable login methods;
-/// the same methods ride along for auth failures later in the session.
+/// with the auth code becomes `AuthRequired` with runnable login methods.
 async fn handshake(
     wire: &mut Wire,
     request: &ConnectRequest,
     open_auth_kind: Option<AuthKind>,
     adopt_login: Option<&'static str>,
-) -> Result<
-    (
-        DriverInfo,
-        String,
-        Vec<LoginMethod>,
-        bool,
-        bool,
-        PromptMedia,
-    ),
-    AgentError,
-> {
+) -> Result<Handshake, AgentError> {
     let init = wire
         .roundtrip(
             "initialize",
@@ -215,8 +221,9 @@ async fn handshake(
     let mut response = wire.roundtrip(method, params.clone()).await;
     // An ACP upgrade with its own auth choice (antigravity's server) adopts
     // the CLI's login in-protocol: one `authenticate`, then the same call
-    // again. A logged-out login would block on a browser instead, so the
-    // wait is short and the original refusal stands on any other outcome.
+    // again. Logged out of the CLI too, the server starts Google's browser
+    // login instead (probed 2026-09-07), so the wait is short and the
+    // original refusal stands on any other outcome.
     if let (Err(WireError::Rpc { code, .. }), Some(method_id)) = (&response, adopt_login)
         && *code == AUTH_REQUIRED_CODE
     {
@@ -298,14 +305,14 @@ async fn handshake(
         .iter()
         .filter_map(|m| login_method(m, &request.installation.executable_path))
         .collect();
-    Ok((
+    Ok(Handshake {
         info,
         session_id,
         login,
         first_class_model,
         kiro,
         prompt_media,
-    ))
+    })
 }
 
 /// Kiro is the one ACP agent with a prompt-driven effort switch.
@@ -1456,17 +1463,17 @@ impl Drive {
             let Some(inline) = &l.inline else { continue };
             let block = match inline.media {
                 attach::Media::Image if images => {
-                    json!({ "type": "image", "data": inline.base64, "mimeType": inline.mime })
+                    json!({ "type": "image", "data": inline.base64(), "mimeType": inline.mime })
                 }
                 attach::Media::Audio if self.prompt_media.audio => {
-                    json!({ "type": "audio", "data": inline.base64, "mimeType": inline.mime })
+                    json!({ "type": "audio", "data": inline.base64(), "mimeType": inline.mime })
                 }
                 attach::Media::Pdf if self.prompt_media.embedded_context => json!({
                     "type": "resource",
                     "resource": {
                         "uri": format!("file://{}", l.path),
                         "mimeType": inline.mime,
-                        "blob": inline.base64,
+                        "blob": inline.base64(),
                     },
                 }),
                 _ => continue,
@@ -1853,45 +1860,6 @@ impl WireError {
             }
         }
     }
-}
-
-/// Maps an agent's own logged-out error to `AuthRequired` using the
-/// profile's probed fingerprints (kiro exits before speaking ACP, hermes
-/// fails session/new with a plain internal error); other failures pass.
-fn auth_hinted(
-    error: AgentError,
-    profile: Option<&crate::catalog::AgentProfile>,
-    exe: &std::path::Path,
-) -> AgentError {
-    let Some(profile) = profile else { return error };
-    // Only failure shapes carry the agent's own words; typed errors
-    // (AuthRequired, UnsupportedFeature, …) must pass through untouched.
-    if !matches!(
-        error,
-        AgentError::ProtocolFailed(_) | AgentError::ProcessExited { .. }
-    ) {
-        return error;
-    }
-    let text = error.to_string();
-    if !profile.auth_error_hints.iter().any(|h| text.contains(h)) {
-        return error;
-    }
-    let mut login = crate::discovery::login_methods(profile, exe);
-    // No login command in the catalog (grok): the agent's own TUI is the flow.
-    if !login
-        .iter()
-        .any(|m| matches!(m, LoginMethod::Terminal { .. }))
-    {
-        login.insert(
-            0,
-            LoginMethod::Terminal {
-                description: format!("{} logs in on launch; run it in a terminal", profile.name),
-                command: vec![exe.to_string_lossy().into_owned()],
-                env: std::collections::BTreeMap::new(),
-            },
-        );
-    }
-    AgentError::AuthRequired { login }
 }
 
 /// A terminal auth method becomes a runnable command; agent-driven auth is

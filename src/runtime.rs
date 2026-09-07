@@ -67,9 +67,9 @@ impl Runtime {
                 Connection::Native(NativeKind::Opencode) => {
                     Arc::new(crate::adapter::opencode::OpencodeAdapter::new())
                 }
-                Connection::Native(NativeKind::Antigravity) => {
-                    Arc::new(crate::adapter::antigravity::AntigravityAdapter::new())
-                }
+                Connection::Native(NativeKind::Antigravity) => Arc::new(
+                    crate::adapter::antigravity::AntigravityAdapter::new(profile),
+                ),
             };
             adapters.insert(AgentId::new(profile.id), adapter);
         }
@@ -664,6 +664,30 @@ mod tests {
         ));
         assert!(info.details.capabilities.supports(Capability::Permissions));
         session.close().await.unwrap();
+
+        // Refused for good (the server's capitalised "Authentication
+        // required", no runnable method of its own): typed, and the login
+        // it names is the CLI's TUI, not the server.
+        std::fs::write(
+            &server,
+            format!(
+                "#!/bin/sh\nexec node {} --auth-required --capitalized-auth --no-auth-methods \"$@\"\n",
+                fixture.display()
+            ),
+        )
+        .unwrap();
+        let err = Runtime::new()
+            .open(agent, SessionOptions::in_dir(home.path()))
+            .await
+            .err()
+            .expect("refused");
+        let AgentError::AuthRequired { login } = err else {
+            panic!("expected AuthRequired, got {err:?}");
+        };
+        assert!(
+            matches!(&login[0], crate::agent::LoginMethod::Terminal { command, .. } if command == &["agy"]),
+            "{login:?}"
+        );
 
         unsafe {
             if let Some(v) = orig_home {

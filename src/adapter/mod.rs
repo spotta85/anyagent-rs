@@ -10,6 +10,7 @@
 //! and error mapping.
 
 use std::num::NonZeroU32;
+use std::path::Path;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -18,7 +19,7 @@ use tokio::sync::mpsc;
 
 use crate::agent::{
     AgentDetails, AgentInstallation, ConfigChoice, ConfigId, ConfigKind, ConfigOption, ConfigValue,
-    Input, ResumeToken, RollbackScope, SessionConfiguration, SessionOptions,
+    Input, LoginMethod, ResumeToken, RollbackScope, SessionConfiguration, SessionOptions,
 };
 use crate::error::AgentError;
 use crate::event::{
@@ -429,6 +430,56 @@ pub(crate) fn with_stderr(error: AgentError, child: &crate::process::Child) -> A
         }
         (error, _) => error,
     }
+}
+
+/// Maps an agent's own logged-out error to `AuthRequired` using the
+/// profile's probed fingerprints (kiro exits before speaking ACP, hermes
+/// fails session/new with a plain internal error, agy exits before `init`);
+/// other failures pass.
+pub(crate) fn auth_hinted(
+    error: AgentError,
+    profile: Option<&crate::catalog::AgentProfile>,
+    exe: &Path,
+) -> AgentError {
+    let Some(profile) = profile else { return error };
+    // Only failure shapes carry the agent's own words; typed errors
+    // (AuthRequired, UnsupportedFeature, …) must pass through untouched.
+    if !matches!(
+        error,
+        AgentError::ProtocolFailed(_) | AgentError::ProcessExited { .. }
+    ) {
+        return error;
+    }
+    let text = error.to_string().to_lowercase();
+    if !profile
+        .auth_error_hints
+        .iter()
+        .any(|h| text.contains(&h.to_lowercase()))
+    {
+        return error;
+    }
+    // An ACP upgrade has no login of its own: the base CLI's is the flow.
+    let exe = match &profile.upgrade {
+        Some(u) if exe.file_name().is_some_and(|n| n == u.cli) => Path::new(profile.cli),
+        _ => exe,
+    };
+    let mut login = crate::discovery::login_methods(profile, exe);
+    // No login command in the catalog (grok, agy): the agent's own TUI is
+    // the flow.
+    if !login
+        .iter()
+        .any(|m| matches!(m, LoginMethod::Terminal { .. }))
+    {
+        login.insert(
+            0,
+            LoginMethod::Terminal {
+                description: format!("{} logs in on launch; run it in a terminal", profile.name),
+                command: vec![exe.to_string_lossy().into_owned()],
+                env: std::collections::BTreeMap::new(),
+            },
+        );
+    }
+    AgentError::AuthRequired { login }
 }
 
 /// Truncates to `at` bytes on a char boundary; tool output stays bounded.

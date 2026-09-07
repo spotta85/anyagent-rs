@@ -267,6 +267,35 @@ async fn cancel_kills_and_resumes_the_conversation() {
     session.close().await.unwrap();
 }
 
+/// The kill ends the running tool: it is reported cancelled rather than
+/// left in `background`, and the interrupted turn's usage does not ride
+/// into the next one.
+#[tokio::test]
+async fn cancel_settles_the_tool_and_drops_its_usage() {
+    let (session, mut events) = open("cancel-settle").await;
+    session.prompt("sleep a while").await.unwrap();
+    while !matches!(next(&mut events).await.kind, EventKind::ToolUpdated(_)) {}
+    session.cancel(true).await.unwrap();
+    let kinds = drain_turn(&mut events).await;
+    assert!(
+        matches!(tools_of(&kinds)[..], [t] if t.status == ToolStatus::Cancelled),
+        "{kinds:?}"
+    );
+    assert!(
+        matches!(kinds.last(), Some(EventKind::TurnEnded { background, .. }) if background.is_empty())
+    );
+
+    session.prompt("fail").await.unwrap();
+    let kinds = drain_turn(&mut events).await;
+    assert!(
+        !kinds
+            .iter()
+            .any(|k| matches!(k, EventKind::ContextUsage { .. })),
+        "stale usage: {kinds:?}"
+    );
+    session.close().await.unwrap();
+}
+
 /// Resume passes the token as `--conversation`; the session keeps that token.
 #[tokio::test]
 async fn resume_passes_the_conversation() {

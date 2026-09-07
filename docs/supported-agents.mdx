@@ -58,7 +58,9 @@ as `antigravity-acp`: a 314 MB download, 854 MB unpacked, searched in
 `~/.local/agy-acp-server` and on `PATH`. It reuses the `agy` login: anyagent
 calls its `authenticate` once per open when the server has no auth choice of
 its own (about 2 seconds, no browser), or set `auth.type` in
-`~/.gemini/antigravity-acp/settings.json` to skip that. When `agy` is found
+`~/.gemini/antigravity-acp/settings.json` to skip that. With no `agy` login
+either, the server opens Google's browser login and the open fails
+`AuthRequired` naming `agy`, like the CLI does. When `agy` is found
 but the server is not, the installation carries
 `upgrade: Some(MissingAgent)` with the download hint, so an app can offer the
 richer path without hard-coding anything:

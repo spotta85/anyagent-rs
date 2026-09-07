@@ -1310,7 +1310,7 @@ impl Drive {
                         "source": {
                             "type": "base64",
                             "media_type": image.mime,
-                            "data": image.base64,
+                            "data": image.base64(),
                         },
                     })
                 })

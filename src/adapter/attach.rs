@@ -3,9 +3,10 @@
 //! The rule (proven by Comet, T3, and laptop-agent): every attachment rides
 //! the prompt text as a path ref — any file type works because the agent can
 //! open it with its own tools. Images, audio, and PDFs under the cap are
-//! additionally inlined as base64 so a wire that takes them gets the bytes
-//! without a tool call. Nothing here is fatal: an unreadable file becomes a
-//! problem report, everything else degrades to the path ref.
+//! additionally kept inline so a wire that takes them gets the bytes without
+//! a tool call; each wire encodes only what it sends. Nothing here is fatal:
+//! an unreadable file becomes a problem report, everything else degrades to
+//! the path ref.
 
 use std::path::PathBuf;
 
@@ -33,7 +34,14 @@ impl Loaded {
 pub(crate) struct Inline {
     pub media: Media,
     pub mime: &'static str,
-    pub base64: String,
+    pub bytes: Vec<u8>,
+}
+
+impl Inline {
+    /// The bytes as standard base64, for the wires that take them so.
+    pub fn base64(&self) -> String {
+        base64(&self.bytes)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,7 +51,7 @@ pub(crate) enum Media {
     Pdf,
 }
 
-/// Reads each attachment up to the cap; sniffs images and encodes them.
+/// Reads each attachment up to the cap and sniffs the media it holds.
 /// Anything past the cap rides as a path ref only, however large the file.
 pub(crate) async fn load(paths: &[PathBuf]) -> Vec<Loaded> {
     let mut loaded = Vec::with_capacity(paths.len());
@@ -55,11 +63,7 @@ pub(crate) async fn load(paths: &[PathBuf]) -> Vec<Loaded> {
                 path,
                 inline: sniff(&bytes)
                     .filter(|_| bytes.len() <= INLINE_CAP)
-                    .map(|(media, mime)| Inline {
-                        media,
-                        mime,
-                        base64: base64(&bytes),
-                    }),
+                    .map(|(media, mime)| Inline { media, mime, bytes }),
                 problem: None,
             }),
             Err(error) => loaded.push(Loaded {

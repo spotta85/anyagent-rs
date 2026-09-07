@@ -7,7 +7,7 @@
 // Flags: --logged-out (no init, an ERROR result plus the stderr line agy
 // prints). Prompt words steer scenarios: "tool" (a run_command call, denied
 // unless --dangerously-skip-permissions), "ask" (a skipped question),
-// "sleep" (a tool only a kill ends), "subagent", "fail" (the model errors),
+// "sleep" (a spoken step, then a tool only a kill ends), "subagent", "fail" (the model errors),
 // "die" (the process exits mid-turn), "recall" (echoes the conversation id
 // and the launch flags), "chunks" (text in two deltas).
 import { createInterface } from 'node:readline';
@@ -78,6 +78,8 @@ async function onUser(frame) {
   if (prompt.includes('die')) process.exit(1);
   if (prompt.includes('fail')) return result('', 'ERROR', 'model exploded');
   if (prompt.includes('sleep')) {
+    text('On it.\n');
+    step += 1;
     update({ state: 'ACTIVE', step_type: 'tool', tool_name: 'run_command', tool_info: { name: 'run_command', parameters: { CommandLine: 'sleep 25' } } });
     await new Promise((r) => setTimeout(r, 30_000));
     return result('slept');

@@ -11,11 +11,12 @@
 //! separate ACP server has the interactive features; discovery prefers it
 //! when installed (see the catalog's `Upgrade`).
 //!
-//! High level: `connect` → `launch` (spawn + `handshake`: wait for `init`,
-//! model catalog and version side processes) → `driver_info`; then
+//! High level: `connect` → `launch` (`start`: spawn and wait for `init`,
+//! beside the model catalog and version side processes) → `driver_info`; then
 //! `Drive::run` turns commands into `user` frames (`handle_command`) and
 //! frames into events (`handle_frame`, `on_*`).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -27,13 +28,14 @@ use tokio::sync::mpsc;
 use crate::adapter::{
     Adapter, CLOSE_GRACE, ConnectRequest, DriverCommand, DriverConnection, DriverEvent, DriverInfo,
     Emitter, FRAME_BUFFER, Gone, HANDSHAKE_TIMEOUT, LineWire, OUTPUT_CAP, WireRecorder, attach,
-    cap, with_stderr,
+    auth_hinted, cap, with_stderr,
 };
 use crate::agent::{
     AgentDetails, AuthKind, AuthStatus, Capabilities, Capability, ConfigChoice, ConfigId,
-    ConfigKind, ConfigOption, ConfigValue, Input, LoginMethod, PermissionMode, ResumeToken,
+    ConfigKind, ConfigOption, ConfigValue, Input, PermissionMode, ResumeToken,
     SessionConfiguration, SessionOptions, SessionStart,
 };
+use crate::catalog::AgentProfile;
 use crate::error::AgentError;
 use crate::event::{
     CompletionSource, DiagnosticLevel, EventKind, MessageId, RawTool, StopReason, ToolId,
@@ -48,23 +50,32 @@ const SIDE_PROCESS_TIMEOUT: Duration = Duration::from_secs(15);
 const MODES: &[&str] = &["accept-edits", "plan"];
 
 /// Launches `agy` in stream-json mode.
-pub(crate) struct AntigravityAdapter;
+pub(crate) struct AntigravityAdapter {
+    /// The catalog entry: its logged-out fingerprints type the open failure.
+    profile: &'static AgentProfile,
+}
 
 impl AntigravityAdapter {
     /// One instance drives every antigravity session.
-    pub(crate) fn new() -> Self {
-        Self
+    pub(crate) fn new(profile: &'static AgentProfile) -> Self {
+        Self { profile }
     }
 }
 
 #[async_trait]
 impl Adapter for AntigravityAdapter {
     /// Spawns the CLI, waits for `init`, and hands the wire to the drive task.
-    async fn connect(&self, request: ConnectRequest) -> Result<DriverConnection, AgentError> {
+    async fn connect(&self, mut request: ConnectRequest) -> Result<DriverConnection, AgentError> {
         let (ev_tx, ev_rx) = mpsc::channel(FRAME_BUFFER);
         let events = Emitter::new(ev_tx);
         let recorder = WireRecorder::for_session(&request.options, &events).await;
-        let (child, wire, info) = launch(&request, recorder.clone()).await?;
+        let (child, wire, info) = launch(&request, recorder.clone()).await.map_err(|e| {
+            auth_hinted(e, Some(self.profile), &request.installation.executable_path)
+        })?;
+        // A cancel respawns on the conversation this open landed on.
+        if let Some(token) = &info.resume_token {
+            request.options.start = SessionStart::Resume(token.clone());
+        }
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         tokio::spawn(
             Drive {
@@ -73,9 +84,9 @@ impl Adapter for AntigravityAdapter {
                 events,
                 recorder,
                 request,
-                token: info.resume_token.clone(),
                 message: None,
                 next_message: 0,
+                tools: BTreeMap::new(),
                 last_usage: None,
             }
             .run(cmd_rx),
@@ -98,19 +109,32 @@ async fn launch(
     request: &ConnectRequest,
     recorder: Option<WireRecorder>,
 ) -> Result<(process::Child, LineWire, DriverInfo), AgentError> {
+    let exe = &request.installation.executable_path;
+    let (started, models, version) =
+        tokio::join!(start(request, recorder), models(exe), version(exe));
+    let (child, wire, init) = started?;
+    Ok((
+        child,
+        wire,
+        driver_info(&init, models, version, &request.options),
+    ))
+}
+
+/// A process past `init`, or the reason it stopped short with its stderr
+/// attached. A cancel uses this alone to resume the conversation.
+async fn start(
+    request: &ConnectRequest,
+    recorder: Option<WireRecorder>,
+) -> Result<(process::Child, LineWire, Value), AgentError> {
     let mut child = spawn(request).await?;
     let mut wire = LineWire::over(&mut child, recorder);
-    let exe = &request.installation.executable_path;
-    let handshake = async {
-        let (init, models, version) = tokio::join!(wait_init(&mut wire), models(exe), version(exe));
-        init.map(|init| driver_info(&init, models, version, &request.options))
-    };
-    match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
-        Ok(Ok(info)) => Ok((child, wire, info)),
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, wait_init(&mut wire)).await {
+        Ok(Ok(init)) => Ok((child, wire, init)),
         Ok(Err(e)) => {
-            let e = auth_error(with_stderr(e, &child), exe);
+            // Shutdown first: it joins the stderr reader, so the tail is
+            // complete before the error is rendered and hint-matched.
             child.shutdown(CLOSE_GRACE).await;
-            Err(e)
+            Err(with_stderr(e, &child))
         }
         Err(_) => {
             child.shutdown(CLOSE_GRACE).await;
@@ -209,32 +233,6 @@ async fn wait_init(wire: &mut LineWire) -> Result<Value, AgentError> {
             _ => continue,
         }
     }
-}
-
-/// A logged-out failure becomes `AuthRequired` naming the TUI as the login
-/// command; anything else passes through.
-fn auth_error(error: AgentError, exe: &Path) -> AgentError {
-    let text = error.to_string().to_lowercase();
-    let hints = crate::catalog::PROFILES
-        .iter()
-        .find(|p| p.id == "antigravity")
-        .map(|p| p.auth_error_hints)
-        .unwrap_or_default();
-    match hints.iter().any(|h| text.contains(h)) {
-        true => AgentError::AuthRequired {
-            login: login_methods(exe),
-        },
-        false => error,
-    }
-}
-
-/// `agy` has no login verb: running it in a terminal is the flow.
-fn login_methods(exe: &Path) -> Vec<LoginMethod> {
-    vec![LoginMethod::Terminal {
-        description: "Antigravity logs in on launch; run it in a terminal".into(),
-        command: vec![exe.to_string_lossy().into_owned()],
-        env: Default::default(),
-    }]
 }
 
 /// `agy --output-format=json models` (the flag is global, before the
@@ -363,13 +361,14 @@ struct Drive {
     child: process::Child,
     events: Emitter,
     recorder: Option<WireRecorder>,
-    /// The open request and the conversation it landed on, for respawning
-    /// after a cancel.
+    /// The open request, pointed at this conversation for the respawn a
+    /// cancel needs.
     request: ConnectRequest,
-    token: Option<ResumeToken>,
     /// The assistant message being streamed.
     message: Option<MessageId>,
     next_message: u64,
+    /// Tools still running: a kill ends them without a DONE frame.
+    tools: BTreeMap<ToolId, ToolUpdate>,
     /// Context occupancy from the turn's last model call: `result.usage`
     /// sums every step's snapshot instead (recorded), so it is not the size.
     last_usage: Option<u64>,
@@ -411,10 +410,11 @@ impl Drive {
                 self.events.send(DriverEvent::TurnAck).await?;
                 self.send_user(&input).await
             }
-            // Never sent: `Steer` is not advertised. Refusing requeues it.
+            // Never sent: `Steer`, `Answer`, and `Compact` are not
+            // advertised. Refusing a steer requeues it.
             DriverCommand::Steer { .. } => self.events.send(DriverEvent::Steered(false)).await,
-            DriverCommand::Cancel => self.cancel().await,
             DriverCommand::Answer { .. } | DriverCommand::Compact => Ok(()),
+            DriverCommand::Cancel => self.cancel().await,
             DriverCommand::Configure(id, _) => {
                 self.events
                     .diagnostic(
@@ -438,15 +438,13 @@ impl Drive {
     async fn cancel(&mut self) -> Result<(), Gone> {
         self.child.shutdown(CLOSE_GRACE).await;
         self.message = None;
+        self.last_usage = None;
+        self.settle_tools().await?;
         self.events
             .send(DriverEvent::TurnEnded(StopReason::Cancelled))
             .await?;
-        let mut request = self.request.clone();
-        if let Some(token) = &self.token {
-            request.options.start = SessionStart::Resume(token.clone());
-        }
-        match respawn(&request, self.recorder.clone()).await {
-            Ok((child, wire)) => {
+        match start(&self.request, self.recorder.clone()).await {
+            Ok((child, wire, _)) => {
                 self.child = child;
                 self.wire = wire;
                 Ok(())
@@ -499,7 +497,14 @@ impl Drive {
                 }
                 Ok(())
             }
-            "tool" | "subagent" => self.events.event(EventKind::ToolUpdated(tool(step))).await,
+            "tool" | "subagent" => {
+                let tool = tool(step);
+                match tool.status.is_active() {
+                    true => self.tools.insert(tool.id.clone(), tool.clone()),
+                    false => self.tools.remove(&tool.id),
+                };
+                self.events.event(EventKind::ToolUpdated(tool)).await
+            }
             // `ask_question` in headless mode: the agent moves on without
             // an answer, and the wire only shows an unnamed step.
             "unknown" => {
@@ -518,6 +523,7 @@ impl Drive {
     /// Exactly one `result` per turn: usage, then the turn's end.
     async fn on_result(&mut self, result: &Value) -> Result<(), Gone> {
         self.message = None;
+        self.settle_tools().await?;
         if let Some(used) = self.last_usage.take() {
             self.events
                 .event(EventKind::ContextUsage {
@@ -557,6 +563,16 @@ impl Drive {
         Ok(())
     }
 
+    /// Tools the wire never finished (a kill, or a turn ending around
+    /// them) are cancelled so the caller's tool view drains.
+    async fn settle_tools(&mut self) -> Result<(), Gone> {
+        for (_, mut tool) in std::mem::take(&mut self.tools) {
+            tool.status = ToolStatus::Cancelled;
+            self.events.event(EventKind::ToolUpdated(tool)).await?;
+        }
+        Ok(())
+    }
+
     /// The message being streamed, minting one if a delta arrives first.
     fn message(&mut self) -> MessageId {
         self.message
@@ -565,27 +581,6 @@ impl Drive {
                 MessageId::new(format!("m{}", self.next_message))
             })
             .clone()
-    }
-}
-
-/// A fresh process on the same conversation, ready past `init`.
-async fn respawn(
-    request: &ConnectRequest,
-    recorder: Option<WireRecorder>,
-) -> Result<(process::Child, LineWire), AgentError> {
-    let mut child = spawn(request).await?;
-    let mut wire = LineWire::over(&mut child, recorder);
-    match tokio::time::timeout(HANDSHAKE_TIMEOUT, wait_init(&mut wire)).await {
-        Ok(Ok(_)) => Ok((child, wire)),
-        Ok(Err(e)) => {
-            let e = with_stderr(e, &child);
-            child.shutdown(CLOSE_GRACE).await;
-            Err(e)
-        }
-        Err(_) => {
-            child.shutdown(CLOSE_GRACE).await;
-            Err(AgentError::HandshakeTimeout)
-        }
     }
 }
 
