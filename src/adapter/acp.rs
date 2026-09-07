@@ -7,6 +7,7 @@
 //! notifications into events (`handle_frame`, `translate`, `on_*`).
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use agent_client_protocol_schema::v1 as acp;
 use async_trait::async_trait;
@@ -16,12 +17,13 @@ use tokio::sync::mpsc;
 use crate::adapter::{
     Adapter, CLOSE_GRACE, ConnectRequest, DriverCommand, DriverConnection, DriverEvent, DriverInfo,
     Emitter, FRAME_BUFFER, Gone, HANDSHAKE_TIMEOUT, LineWire, WireRecorder, attach, level_choices,
-    offers, selected, set_effort_option, set_select_option,
+    offers, plan_entries, selected, set_effort_option, set_select_option,
 };
 use crate::agent::{
-    AgentDetails, AuthKind, AuthStatus, Capabilities, Capability, ConfigChoice, ConfigId,
-    ConfigKind, ConfigOption, ConfigValue, Input, LoginMethod, McpConnection, McpServer,
-    McpTransport, ResumeToken, SessionConfiguration, SessionStart, SlashCommand,
+    AccountInfo, AgentDetails, AgentInstallation, AuthKind, AuthStatus, Capabilities, Capability,
+    ConfigChoice, ConfigId, ConfigKind, ConfigOption, ConfigValue, Input, LoginMethod,
+    McpConnection, McpServer, McpTransport, ResumeToken, SessionConfiguration, SessionStart,
+    SlashCommand,
 };
 use crate::error::AgentError;
 use crate::event::{
@@ -72,6 +74,12 @@ impl Adapter for AcpAdapter {
         let (ev_tx, ev_rx) = mpsc::channel(FRAME_BUFFER);
         let events = Emitter::new(ev_tx);
         let recorder = WireRecorder::for_session(&request.options, &events).await;
+        // Cursor's version and login come from `about` (0.5s): its ACP
+        // `authenticate` opens a browser login when logged out.
+        let about = match self.profile {
+            Some(p) if p.id == "cursor" => cursor_about(&request.installation).await?,
+            _ => CursorAbout::default(),
+        };
         let mut child = process::spawn(Spawn {
             exec_path: request.installation.executable_path.clone(),
             args: self.args.clone(),
@@ -86,7 +94,8 @@ impl Adapter for AcpAdapter {
             HANDSHAKE_TIMEOUT,
             handshake(&mut wire, &request, open_auth_kind),
         );
-        let (info, session_id, login, first_class_model, kiro) = match handshake.await {
+        let (mut info, session_id, login, first_class_model, kiro, estimate) = match handshake.await
+        {
             Ok(Ok(ok)) => ok,
             Ok(Err(e)) => {
                 // Shutdown first: it joins the stderr reader, so the tail is
@@ -104,6 +113,16 @@ impl Adapter for AcpAdapter {
                 return Err(AgentError::HandshakeTimeout);
             }
         };
+
+        if about.version.is_some() {
+            info.details.version = about.version;
+        }
+        if let Some(account) = about.account {
+            info.details.auth = AuthStatus::Authenticated {
+                kind: AuthKind::Subscription,
+                account: Some(account),
+            };
+        }
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         tokio::spawn(
@@ -123,6 +142,9 @@ impl Adapter for AcpAdapter {
                 configs: Vec::new(),
                 first_class_model,
                 kiro,
+                estimate,
+                usage_chars: 0,
+                todos: Vec::new(),
                 effort_id: None,
                 pending_effort: None,
                 held_prompt: None,
@@ -146,23 +168,39 @@ impl Adapter for AcpAdapter {
 /// `initialize`, then `session/new` or `session/load`. A `session/new` error
 /// with the auth code becomes `AuthRequired` with runnable login methods;
 /// the same methods ride along for auth failures later in the session.
+/// Returns the info, session id, login methods, and the first-class-model,
+/// kiro, and usage-estimate flags.
 async fn handshake(
     wire: &mut Wire,
     request: &ConnectRequest,
     open_auth_kind: Option<AuthKind>,
-) -> Result<(DriverInfo, String, Vec<LoginMethod>, bool, bool), AgentError> {
+) -> Result<(DriverInfo, String, Vec<LoginMethod>, bool, bool, bool), AgentError> {
+    // `parameterizedModelPicker` makes Cursor list the selected model's own
+    // options (effort, fast, thinking, context) in every config response;
+    // spec-conformant agents ignore `_meta` (probed 2026-09-07).
     let init = wire
         .roundtrip(
             "initialize",
             json!({
                 "protocolVersion": 1,
-                "clientCapabilities": {},
+                "clientCapabilities": { "_meta": { "parameterizedModelPicker": true } },
                 "clientInfo": { "name": "anyagent", "version": env!("CARGO_PKG_VERSION") },
             }),
         )
         .await
         .map_err(|e| e.into_error(&[], &request.installation.executable_path))?;
     let init: acp::InitializeResponse = parse(init, "initialize response")?;
+    let cursor = is_cursor(&init);
+    // A resumed cursor session carries history the wire never replays, so
+    // there is no baseline to estimate usage from: no estimate at all.
+    let estimate = cursor && matches!(request.options.start, SessionStart::New);
+    // Cursor refuses every session call until `authenticate` has read its
+    // keychain login (0.8–7s, probed 2026-09-07).
+    if cursor {
+        wire.roundtrip("authenticate", json!({ "methodId": "cursor_login" }))
+            .await
+            .map_err(|e| e.into_error(&init.auth_methods, &request.installation.executable_path))?;
+    }
 
     let resume = match &request.options.start {
         SessionStart::Resume(token) => Some(token),
@@ -231,12 +269,13 @@ async fn handshake(
             .then(|| selected(&info, "model"))
             .flatten();
         let (method, params) = config_call(&session_id, id, value, first_class.as_deref());
-        wire.roundtrip(method, params).await.map_err(|e| match e {
+        let result = wire.roundtrip(method, params).await.map_err(|e| match e {
             WireError::Rpc { message, .. } => {
                 AgentError::InvalidConfiguration(format!("agent rejected `{id}`: {message}"))
             }
             e => e.into_error(&init.auth_methods, &request.installation.executable_path),
         })?;
+        adopt_config_options(&mut info, &result, first_class_model, kiro);
         crate::adapter::apply_selection(&mut info, id, value);
     }
     if kiro {
@@ -259,7 +298,7 @@ async fn handshake(
         .iter()
         .filter_map(|m| login_method(m, &request.installation.executable_path))
         .collect();
-    Ok((info, session_id, login, first_class_model, kiro))
+    Ok((info, session_id, login, first_class_model, kiro, estimate))
 }
 
 /// Kiro is the one ACP agent with a prompt-driven effort switch.
@@ -267,6 +306,116 @@ fn is_kiro(init: &acp::InitializeResponse) -> bool {
     init.agent_info
         .as_ref()
         .is_some_and(|i| i.name.starts_with("Kiro"))
+}
+
+/// Cursor is the ACP agent whose login method is `cursor_login`.
+fn is_cursor(init: &acp::InitializeResponse) -> bool {
+    init.auth_methods
+        .iter()
+        .any(|m| m.id().0.as_ref() == "cursor_login")
+}
+
+/// What `cursor-agent about --format json` knows: the CLI version and the
+/// logged-in account (email and subscription tier).
+#[derive(Default)]
+struct CursorAbout {
+    version: Option<String>,
+    account: Option<AccountInfo>,
+}
+
+/// Runs `about` before the ACP handshake. `userEmail: null` means logged
+/// out and fails typed with the catalog login command, since Cursor's own
+/// `authenticate` would start a browser login instead (read from the
+/// 2026.09.02 bundle). A failed or unparseable `about` reports nothing.
+async fn cursor_about(installation: &AgentInstallation) -> Result<CursorAbout, AgentError> {
+    let output = tokio::process::Command::new(&installation.executable_path)
+        .args(["about", "--format", "json"])
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(10), output).await else {
+        return Ok(CursorAbout::default());
+    };
+    let Ok(json) = serde_json::from_slice::<Value>(&output.stdout) else {
+        return Ok(CursorAbout::default());
+    };
+    if json.get("userEmail").is_some_and(Value::is_null) {
+        return Err(AgentError::AuthRequired {
+            login: crate::adapter::login_methods(installation),
+        });
+    }
+    Ok(CursorAbout {
+        version: json["cliVersion"].as_str().map(str::to_owned),
+        account: json["userEmail"].as_str().map(|email| AccountInfo {
+            email: Some(email.to_owned()),
+            plan: json["subscriptionTier"].as_str().map(str::to_owned),
+        }),
+    })
+}
+
+/// A config response's `configOptions` (the full list, per spec) replaces
+/// the advertised options; Cursor's includes the selected model's own
+/// (probed 2026-09-07). Returns whether anything was adopted.
+fn adopt_config_options(
+    info: &mut DriverInfo,
+    result: &Value,
+    first_class: bool,
+    kiro: bool,
+) -> bool {
+    let Some(options) = result.get("configOptions") else {
+        return false;
+    };
+    let Ok(options) = serde_json::from_value::<Vec<acp::SessionConfigOption>>(options.clone())
+    else {
+        return false;
+    };
+    replace_config_options(info, &options, first_class, kiro);
+    true
+}
+
+/// The wire replaces its own options; `mode` (from the mode state),
+/// first-class `model`/`effort` (from `models`), and kiro's synthesized
+/// `effort` are ours to keep.
+fn replace_config_options(
+    info: &mut DriverInfo,
+    options: &[acp::SessionConfigOption],
+    first_class: bool,
+    kiro: bool,
+) {
+    let ours = move |id: &str| id == "mode" || (first_class && matches!(id, "model" | "effort"));
+    info.details.config_options.retain(|o| ours(o.id.as_str()));
+    info.configuration.options.retain(|id, _| ours(id.as_str()));
+    apply_session_config(info, None, Some(options));
+    if kiro {
+        sync_effort(info);
+    }
+}
+
+/// Characters a prompt costs for the usage estimate: its text (attachment
+/// refs included) plus a flat allowance per inlined image (~1.5k tokens).
+fn prompt_chars(blocks: &Value) -> usize {
+    const IMAGE_CHARS: usize = 6_000;
+    blocks
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|b| match b["type"].as_str() {
+            Some("image") => IMAGE_CHARS,
+            _ => b["text"].as_str().map_or(0, str::len),
+        })
+        .sum()
+}
+
+/// Cursor's `context` option value ("300k", "1m") as a token count.
+fn context_window(info: &DriverInfo) -> Option<u64> {
+    let value = selected(info, "context")?.to_lowercase();
+    let digits = value.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let n: u64 = digits.parse().ok()?;
+    Some(match &value[digits.len()..] {
+        "k" => n * 1_000,
+        "m" => n * 1_000_000,
+        _ => n,
+    })
 }
 
 /// Makes kiro's `effort` option match the selected model; kiro advertises
@@ -557,6 +706,15 @@ fn apply_session_config(
         );
     }
     for option in options.unwrap_or_default() {
+        // Cursor lists `mode` here as well as in the mode state.
+        if info
+            .details
+            .config_options
+            .iter()
+            .any(|o| o.id.as_str() == option.id.0.as_ref())
+        {
+            continue;
+        }
         let (kind, current) = match &option.kind {
             acp::SessionConfigKind::Select(select) => (
                 ConfigKind::Select {
@@ -628,11 +786,13 @@ struct PendingPermission {
     options: Vec<(PermissionChoice, String)>,
 }
 
-/// A grok `_x.ai/ask_user_question` waiting for `answer`: its wire id and the
-/// raw question objects, so choice ids map back to the labels grok expects.
+/// A question request waiting for `answer`: its wire id and the raw
+/// question objects, so choice ids map back to what the agent expects
+/// (grok: option labels; cursor: option ids).
 struct PendingQuestion {
     wire_id: Value,
     questions: Vec<Value>,
+    cursor: bool,
 }
 
 struct Drive {
@@ -660,6 +820,12 @@ struct Drive {
     first_class_model: bool,
     /// The agent is kiro: `effort` selections ride a `/effort` prompt.
     kiro: bool,
+    /// A new cursor session: context usage is estimated (it sends none).
+    estimate: bool,
+    /// Characters that crossed the wire this session, for the estimate.
+    usage_chars: usize,
+    /// Cursor's todo list, kept across `cursor/update_todos` merges.
+    todos: Vec<Value>,
     /// Wire id of an in-flight `/effort` prompt; its chunks stay internal.
     effort_id: Option<u64>,
     /// An effort switch requested mid-turn, sent once the turn ends.
@@ -712,9 +878,11 @@ impl Drive {
                 // this exact prompt; spec-conformant agents ignore `_meta`.
                 self.prompt_seq += 1;
                 let pid = format!("p{}", self.prompt_seq);
+                let blocks = self.prompt_blocks(&input).await?;
+                self.usage_chars += prompt_chars(&blocks);
                 let params = json!({
                     "sessionId": self.session_id,
-                    "prompt": self.prompt_blocks(&input).await?,
+                    "prompt": blocks,
                     "_meta": { "promptId": pid, "requestId": pid },
                 });
                 // One prompt on the wire at a time: a turn that lands while
@@ -759,7 +927,7 @@ impl Drive {
                 }
                 for (_, pending) in std::mem::take(&mut self.questions) {
                     self.wire
-                        .respond(pending.wire_id, json!({ "outcome": "cancelled" }))
+                        .respond(pending.wire_id, cancelled_question(pending.cursor))
                         .await?;
                 }
             }
@@ -833,8 +1001,18 @@ impl Drive {
             Some("_x.ai/ask_user_question" | "x.ai/ask_user_question")
                 if frame.get("id").is_some() =>
             {
-                self.on_question(frame).await
+                self.on_question(frame, false).await
             }
+            // Cursor extensions (docs.cursor.com/cli/acp; verified 2026-09-07).
+            Some("cursor/ask_question") if frame.get("id").is_some() => {
+                self.on_question(frame, true).await
+            }
+            Some(
+                "cursor/create_plan"
+                | "cursor/update_todos"
+                | "cursor/task"
+                | "cursor/generate_image",
+            ) => self.on_cursor_extension(frame).await,
             Some("_x.ai/session/prompt_complete") => self.on_prompt_complete(&frame).await,
             Some("_x.ai/models/update") => self.on_models_update(&frame).await,
             Some("_x.ai/session_notification")
@@ -937,7 +1115,14 @@ impl Drive {
                 Some(EventKind::ToolUpdated(tool))
             }
             U::ToolCallUpdate(update) => {
+                // Tool results reach the model as `rawOutput` on cursor.
+                let raw = update
+                    .fields
+                    .raw_output
+                    .as_ref()
+                    .map_or(0, |v| v.to_string().len());
                 let (tool, appended) = self.merge_tool(update);
+                self.usage_chars += appended.len() + raw;
                 if !appended.is_empty() {
                     self.events
                         .event(EventKind::ToolOutputDelta {
@@ -986,25 +1171,12 @@ impl Drive {
                 return Ok(());
             }
             U::ConfigOptionUpdate(update) => {
-                // The wire replaces its own options; `mode` (from the mode
-                // state), first-class `model`/`effort` (from `models`), and
-                // kiro's synthesized `effort` are ours to keep.
-                let first_class = self.first_class_model;
-                let ours = move |id: &str| {
-                    id == "mode" || (first_class && matches!(id, "model" | "effort"))
-                };
-                self.info
-                    .details
-                    .config_options
-                    .retain(|o| ours(o.id.as_str()));
-                self.info
-                    .configuration
-                    .options
-                    .retain(|id, _| ours(id.as_str()));
-                apply_session_config(&mut self.info, None, Some(&update.config_options));
-                if self.kiro {
-                    sync_effort(&mut self.info);
-                }
+                replace_config_options(
+                    &mut self.info,
+                    &update.config_options,
+                    self.first_class_model,
+                    self.kiro,
+                );
                 return self
                     .events
                     .send(DriverEvent::InfoChanged(self.info.clone()))
@@ -1023,6 +1195,11 @@ impl Drive {
             })),
         };
         if let Some(kind) = kind {
+            if let EventKind::TextDelta { text, .. } | EventKind::ReasoningDelta { text, .. } =
+                &kind
+            {
+                self.usage_chars += text.len();
+            }
             self.events
                 .send(DriverEvent::Event {
                     kind,
@@ -1081,10 +1258,10 @@ impl Drive {
             .await
     }
 
-    /// Grok's `_x.ai/ask_user_question` extension request: typed questions
-    /// the agent blocks on (params sometimes arrive wrapped as
-    /// `{method, params}`; both shapes are in the field).
-    async fn on_question(&mut self, frame: Value) -> Result<(), Gone> {
+    /// Grok's `_x.ai/ask_user_question` or cursor's `cursor/ask_question`:
+    /// typed questions the agent blocks on (grok's params sometimes arrive
+    /// wrapped as `{method, params}`; both shapes are in the field).
+    async fn on_question(&mut self, frame: Value, cursor: bool) -> Result<(), Gone> {
         let wire_id = frame["id"].clone();
         let params = &frame["params"];
         let params = params.get("params").unwrap_or(params);
@@ -1098,19 +1275,103 @@ impl Drive {
                 .await;
         };
         self.advertise(Capability::Questions).await?;
-        let questions = list.iter().map(typed_question).collect();
+        let questions = list.iter().map(|q| typed_question(q, cursor)).collect();
         let id = RequestId::new(format!("r{wire_id}"));
         self.questions.insert(
             id.clone(),
             PendingQuestion {
                 wire_id,
                 questions: list,
+                cursor,
             },
         );
         self.events
             .send(DriverEvent::event(EventKind::RequestOpened(
                 Request::Question(QuestionRequest { id, questions }),
             )))
+            .await
+    }
+
+    /// Cursor's other extension methods. They arrive as requests with an id
+    /// (the docs call them notifications), so each is answered: todos become
+    /// the plan, a plan proposal is accepted, a subagent task header is
+    /// acknowledged, image generation is declined. Everything but todos is
+    /// also surfaced raw under its method name for apps that want the
+    /// plan markdown or the subagent header.
+    async fn on_cursor_extension(&mut self, frame: Value) -> Result<(), Gone> {
+        let method = frame["method"].as_str().unwrap_or_default().to_owned();
+        let params = frame["params"].clone();
+        let outcome = match method.as_str() {
+            "cursor/update_todos" => {
+                self.merge_todos(&params);
+                let entries = plan_entries(&Value::Array(self.todos.clone()), "content");
+                self.events
+                    .event(EventKind::PlanUpdated { entries })
+                    .await?;
+                json!({ "outcome": "accepted", "todos": self.todos })
+            }
+            "cursor/create_plan" => json!({ "outcome": "accepted" }),
+            "cursor/task" => json!({ "outcome": "completed" }),
+            _ => json!({ "outcome": "rejected", "reason": "not supported by this client" }),
+        };
+        if let Some(id) = frame.get("id") {
+            self.wire
+                .respond(id.clone(), json!({ "outcome": outcome }))
+                .await?;
+        }
+        if method == "cursor/update_todos" {
+            return Ok(());
+        }
+        let mut extensions = Extensions::new();
+        extensions.insert(method.clone(), params);
+        self.events
+            .content(
+                EventKind::Diagnostic(Diagnostic {
+                    level: DiagnosticLevel::Info,
+                    message: format!("extension request {method}"),
+                }),
+                None,
+                extensions,
+            )
+            .await
+    }
+
+    /// Cursor's todo list: `merge: true` updates by id, else it replaces.
+    fn merge_todos(&mut self, params: &Value) {
+        let incoming = params["todos"].as_array().cloned().unwrap_or_default();
+        if params["merge"].as_bool() != Some(true) {
+            self.todos = incoming;
+            return;
+        }
+        for todo in incoming {
+            match self.todos.iter_mut().find(|t| t["id"] == todo["id"]) {
+                Some(existing) => *existing = todo,
+                None => self.todos.push(todo),
+            }
+        }
+    }
+
+    /// Cursor sends no usage frames (probed 2026-09-07), so every turn ends
+    /// with an estimate from what crossed the wire (4 chars ≈ 1 token),
+    /// labelled `anyagent/estimated` in the event's extensions. The window
+    /// is the selected model's `context` option; Auto has none.
+    async fn report_estimate(&mut self) -> Result<(), Gone> {
+        if !self.estimate {
+            return Ok(());
+        }
+        self.advertise(Capability::ContextUsage).await?;
+        let mut extensions = Extensions::new();
+        extensions.insert("anyagent/estimated".into(), Value::Bool(true));
+        self.events
+            .content(
+                EventKind::ContextUsage {
+                    used_tokens: (self.usage_chars / 4) as u64,
+                    window_tokens: context_window(&self.info),
+                    cost_usd: None,
+                },
+                None,
+                extensions,
+            )
             .await
     }
 
@@ -1277,6 +1538,7 @@ impl Drive {
                 };
                 return self.events.send(ev).await;
             }
+            self.report_estimate().await?;
             return self
                 .events
                 .send(DriverEvent::TurnEnded(stop_reason(&frame)))
@@ -1297,14 +1559,23 @@ impl Drive {
                         format!("agent rejected configure `{config_id}`: {message}"),
                     )
                     .await?;
-            } else if crate::adapter::apply_selection(&mut self.info, &config_id, &value) {
+            } else {
+                let adopted = adopt_config_options(
+                    &mut self.info,
+                    &frame["result"],
+                    self.first_class_model,
+                    self.kiro,
+                );
+                let changed = crate::adapter::apply_selection(&mut self.info, &config_id, &value);
                 // Kiro's effort choices follow the model.
-                if self.kiro && config_id.as_str() == "model" {
+                if changed && self.kiro && config_id.as_str() == "model" {
                     sync_effort(&mut self.info);
                 }
-                self.events
-                    .send(DriverEvent::InfoChanged(self.info.clone()))
-                    .await?;
+                if adopted || changed {
+                    self.events
+                        .send(DriverEvent::InfoChanged(self.info.clone()))
+                        .await?;
+                }
             }
             if Some(id) == self.effort_id {
                 self.effort_id = None;
@@ -1363,13 +1634,16 @@ impl Drive {
         let Some(pending) = self.questions.remove(&request) else {
             return Ok(());
         };
-        let response = match answer {
-            crate::event::Answer::Question(answers) => {
+        let response = match (answer, pending.cursor) {
+            (crate::event::Answer::Question(answers), false) => {
                 question_response(&pending.questions, &answers)
             }
-            crate::event::Answer::Permission(_) => None,
+            (crate::event::Answer::Question(answers), true) => {
+                cursor_question_response(&pending.questions, &answers)
+            }
+            (crate::event::Answer::Permission(_), _) => None,
         };
-        let response = response.unwrap_or(json!({ "outcome": "cancelled" }));
+        let response = response.unwrap_or_else(|| cancelled_question(pending.cursor));
         self.wire.respond(pending.wire_id, response).await?;
         Ok(())
     }
@@ -1504,13 +1778,14 @@ fn apply_content(tool: &mut ToolUpdate, content: Vec<acp::ToolCallContent>) -> S
     appended
 }
 
-/// Keeps the agent's own input when the wire carries it.
+/// Keeps the agent's own input when the wire carries it, named when the
+/// agent names the tool inside it (cursor's `_toolName`). Cursor's `task`
+/// stays `Other`: it runs a subagent but reports only a header, never the
+/// nested events `ToolKind::Subagent` promises (probed 2026-09-07).
 fn apply_raw_input(tool: &mut ToolUpdate, raw_input: Option<Value>) {
     if let Some(input) = raw_input {
-        tool.raw = Some(RawTool {
-            name: String::new(),
-            input,
-        });
+        let name = input["_toolName"].as_str().unwrap_or_default().to_owned();
+        tool.raw = Some(RawTool { name, input });
     }
 }
 
@@ -1583,10 +1858,15 @@ fn option_for(choice: PermissionChoice, options: &[(PermissionChoice, String)]) 
         .map(|(_, id)| id.clone())
 }
 
-/// One raw grok question object as the typed [`Question`]. Ids fall back to
-/// the question/label text (grok marks them optional).
-fn typed_question(q: &Value) -> Question {
-    let text = q["question"].as_str().unwrap_or_default();
+/// One raw question object as the typed [`Question`]: grok's
+/// `question`/`multiSelect` or cursor's `prompt`/`allowMultiple`. Ids fall
+/// back to the question/label text (grok marks them optional). A cursor
+/// question without options takes free text (it rides as the option id).
+fn typed_question(q: &Value, cursor: bool) -> Question {
+    let text = q["question"]
+        .as_str()
+        .or(q["prompt"].as_str())
+        .unwrap_or_default();
     Question {
         id: QuestionId::new(q["id"].as_str().unwrap_or(text)),
         text: text.to_owned(),
@@ -1607,8 +1887,42 @@ fn typed_question(q: &Value) -> Question {
                     .collect()
             })
             .unwrap_or_default(),
-        multi_select: q["multiSelect"].as_bool().unwrap_or(false),
-        allows_free_text: false,
+        multi_select: q["multiSelect"]
+            .as_bool()
+            .or(q["allowMultiple"].as_bool())
+            .unwrap_or(false),
+        allows_free_text: cursor && q["options"].as_array().is_none_or(Vec::is_empty),
+    }
+}
+
+/// Cursor's accepted answer (docs.cursor.com/cli/acp): per question, the
+/// selected option ids (the engine only lets offered ids through); free
+/// text rides as the id itself. `None` (mismatched shapes) degrades to
+/// `cancelled`.
+fn cursor_question_response(questions: &[Value], answers: &[QuestionAnswer]) -> Option<Value> {
+    if answers.len() != questions.len() {
+        return None;
+    }
+    let answers: Vec<Value> = questions
+        .iter()
+        .zip(answers)
+        .map(|(q, answer)| {
+            let ids: Vec<&str> = match answer {
+                QuestionAnswer::Choices(ids) => ids.iter().map(ChoiceId::as_str).collect(),
+                QuestionAnswer::Text(text) => vec![text.as_str()],
+            };
+            json!({ "questionId": q["id"], "selectedOptionIds": ids })
+        })
+        .collect();
+    Some(json!({ "outcome": { "outcome": "answered", "answers": answers } }))
+}
+
+/// The cancelled answer in the agent's own shape.
+fn cancelled_question(cursor: bool) -> Value {
+    if cursor {
+        json!({ "outcome": { "outcome": "cancelled" } })
+    } else {
+        json!({ "outcome": "cancelled" })
     }
 }
 

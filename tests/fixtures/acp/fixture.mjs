@@ -3,7 +3,11 @@
 //        --late-ms=N (late noise delay), --auth-required (session/new fails),
 //        --commands-on-open (push availableCommands right after session/new),
 //        --kiro (the kiro shape: agentInfo name, effort in _kiro.dev/metadata,
-//        `/effort <level>` prompts answered with an ack chunk).
+//        `/effort <level>` prompts answered with an ack chunk),
+//        --cursor (the cursor shape: `about` preflight, `authenticate` before
+//        session/new, per-model options in config responses, the cursor/*
+//        extension requests, no usage frames), --logged-out (with --cursor:
+//        `about` reports no email and `authenticate` hangs in a browser flow).
 import { createInterface } from 'node:readline';
 
 const flag = (name) => process.argv.includes(name);
@@ -22,6 +26,25 @@ const grokModels = () => ({ currentModelId: grokModel, availableModels: [
   { modelId: 'grok-basic', name: 'Grok Basic' },
 ] });
 const kiroMetadata = (sessionId) => send({ jsonrpc: '2.0', method: '_kiro.dev/metadata', params: { sessionId, contextUsagePercentage: 0.5, effort } });
+// --cursor state: the selected model and its own options (shapes recorded
+// from cursor-agent 2026.09.02 with parameterizedModelPicker).
+let authed = false, cursorModel = 'default', cursorOpts = { fast: 'true', thinking: 'true', context: '300k', effort: 'high' };
+const sel = (id, name, category, current, values) => ({ id, name, category, type: 'select', currentValue: current, options: values.map(v => ({ value: v, name: v })) });
+const cursorPerModel = () => ({
+  'default': [],
+  'composer-2.5': [sel('fast', 'Fast', 'model_config', cursorOpts.fast, ['false', 'true'])],
+  'claude-opus-5': [sel('thinking', 'Thinking', 'thought_level', cursorOpts.thinking, ['false', 'true']), sel('context', 'Context', 'model_config', cursorOpts.context, ['300k', '1m']), sel('effort', 'Effort', 'thought_level', cursorOpts.effort, ['low', 'medium', 'high', 'xhigh'])],
+})[cursorModel];
+const cursorModes = () => ({ currentModeId: 'agent', availableModes: [{ id: 'agent', name: 'Agent' }, { id: 'plan', name: 'Plan' }, { id: 'ask', name: 'Ask' }] });
+const cursorConfig = () => [
+  { id: 'mode', name: 'Mode', category: 'mode', type: 'select', currentValue: 'agent', options: [{ value: 'agent', name: 'Agent' }, { value: 'plan', name: 'Plan' }, { value: 'ask', name: 'Ask' }] },
+  { id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: cursorModel, options: [{ value: 'default', name: 'Auto' }, { value: 'composer-2.5', name: 'Composer 2.5' }, { value: 'claude-opus-5', name: 'Claude Opus 5' }] },
+  ...cursorPerModel(),
+];
+const cursorSession = () => ({ sessionId: 'sess-1', modes: cursorModes(), models: { currentModelId: cursorModel, availableModels: [{ modelId: 'default', name: 'Auto' }] }, configOptions: cursorConfig() });
+
+// `cursor-agent about --format json`: the version/login preflight.
+if (flag('about')) { console.log(JSON.stringify({ cliVersion: '0.0.1', subscriptionTier: 'Free', userEmail: flag('--logged-out') ? null : 'dev@example.com' })); process.exit(0); }
 
 // --die-not-logged-in: the kiro shape — complain on stderr and exit before
 // ever speaking ACP.
@@ -48,9 +71,21 @@ async function onRequest(m) {
         : flag('--meta-auth-methods')
         ? [{ id: 'openai', name: 'Use OpenAI API key', _meta: { type: 'terminal', args: ['--auth-type=openai'] } }]
         : [{ id: 'fixture-login', name: 'Log in', type: 'terminal', args: ['auth', 'login'] }];
+      // The cursor shape: no agentInfo, no steering, an agent-driven method.
+      if (flag('--cursor')) return reply({ protocolVersion: 1, agentCapabilities: { loadSession: true, promptCapabilities: { image: true }, mcpCapabilities: { http: true, sse: true } }, authMethods: [{ id: 'cursor_login', name: 'Cursor Login', description: "Run 'agent login' first if not logged in." }] });
       return reply({ protocolVersion: 1, agentCapabilities: { loadSession: !flag('--no-load'), promptCapabilities: { image: true }, mcpCapabilities: { http: true, sse: false }, _meta: { steering: { supported: true } } }, authMethods, agentInfo: { name: flag('--kiro') ? 'Kiro CLI Agent' : 'fixture', version: '0.0.1' }, _meta: { vendor: 'spike' } });
     }
+    case 'authenticate': {
+      if (!flag('--cursor')) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32601, message: 'method not found' } });
+      if (m.params.methodId !== 'cursor_login') return send({ jsonrpc: '2.0', id: m.id, error: { code: -32602, message: `Unknown authentication method: ${m.params.methodId}` } });
+      // Logged out, cursor starts a browser login and waits for it.
+      if (flag('--logged-out')) return;
+      authed = true;
+      return reply({});
+    }
     case 'session/new': {
+      if (flag('--cursor') && !authed) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32000, message: "Authentication required. Please run 'agent login' first, then call authenticate() with methodId 'cursor_login'." } });
+      if (flag('--cursor')) return reply(cursorSession());
       if (flag('--auth-required')) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32000, message: flag('--capitalized-auth') ? 'Authentication required' : 'authentication required' } });
       // The hermes shape: a plain internal error whose data carries the words.
       if (flag('--auth-hint-error')) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32603, message: 'Internal error', data: { details: 'No LLM provider configured. Run `fixture login` first.' } } });
@@ -67,12 +102,20 @@ async function onRequest(m) {
       if (flag('--kiro')) kiroMetadata('sess-1');
       return;
     }
-    case 'session/load': return reply({ _meta: { loaded: m.params.sessionId } });
+    case 'session/load': return reply(flag('--cursor') ? cursorSession() : { _meta: { loaded: m.params.sessionId } });
     case 'session/set_mode': {
       reply({});
       return notify(m.params.sessionId, { sessionUpdate: 'current_mode_update', currentModeId: m.params.modeId });
     }
     case 'session/set_config_option':
+      // Cursor answers every switch with the full option list, including
+      // the newly selected model's own options.
+      if (flag('--cursor')) {
+        const known = m.params.configId === 'model' ? ['default', 'composer-2.5', 'claude-opus-5'] : cursorPerModel().find(o => o.id === m.params.configId)?.options.map(o => o.value);
+        if (!known?.includes(m.params.value)) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32602, message: `unknown ${m.params.configId} ${m.params.value}` } });
+        if (m.params.configId === 'model') cursorModel = m.params.value; else cursorOpts[m.params.configId] = m.params.value;
+        return reply({ configOptions: cursorConfig() });
+      }
       // Under --grok-models there is no model configOption: only set_model works.
       if (m.params.configId !== 'model' || flag('--grok-models')) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32602, message: `unknown config ${m.params.configId}` } });
       // --config-slow=N: delay the reply so a second configure overlaps it.
@@ -129,6 +172,33 @@ async function runTurn(m) {
     done('end_turn');
     return;
   }
+  // Cursor extensions (shapes from docs.cursor.com/cli/acp; every one
+  // arrives as a request with an id on 2026.09.02).
+  if (ptext.includes('cursor-question')) {
+    // `cursor-question-free`: no options, so the answer is free text.
+    const options = ptext.includes('free') ? [] : [{ id: 'r', label: 'Red' }, { id: 'b', label: 'Blue' }];
+    const q = await request('cursor/ask_question', { toolCallId: 'call_q', title: 'Need input', questions: [{ id: 'color', prompt: 'Red or blue?', options, allowMultiple: false }] });
+    notify(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `q=${JSON.stringify(q.result?.outcome ?? 'error')} ` } });
+    done('end_turn');
+    return;
+  }
+  if (ptext.includes('cursor-plan')) {
+    notify(sid, { sessionUpdate: 'plan', entries: [{ content: 'write README', priority: 'medium', status: 'pending' }] });
+    const p = await request('cursor/create_plan', { toolCallId: 'call_p', name: 'Add README', plan: '# Plan\n1. write', todos: [{ id: 't1', content: 'write README', status: 'pending' }] });
+    notify(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `plan=${p.result?.outcome?.outcome ?? 'error'} ` } });
+    done('end_turn');
+    return;
+  }
+  if (ptext.includes('cursor-todos')) {
+    notify(sid, { sessionUpdate: 'tool_call', toolCallId: 'call_s', title: 'Task: List files', kind: 'other', status: 'pending', rawInput: { _toolName: 'task', description: 'List files' } });
+    await request('cursor/update_todos', { toolCallId: 'call_t', todos: [{ id: '1', content: 'first', status: 'completed' }, { id: '2', content: 'second', status: 'pending' }], merge: false });
+    const t = await request('cursor/update_todos', { toolCallId: 'call_t', todos: [{ id: '2', content: 'second', status: 'in_progress' }], merge: true });
+    const s = await request('cursor/task', { toolCallId: 'call_s', description: 'List files', prompt: 'ls', subagentType: 'explore', durationMs: 5 });
+    const i = await request('cursor/generate_image', { toolCallId: 'call_i', description: 'icon' });
+    notify(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `todos=${t.result?.outcome?.todos?.length} task=${s.result?.outcome?.outcome} image=${i.result?.outcome?.outcome} ` } });
+    done('end_turn');
+    return;
+  }
   if (ptext.includes('grok-hang')) {
     // A stale prompt_complete (wrong promptId; refusal would be visible in
     // the stop reason) must be ignored; the frame echoing _meta.promptId ends
@@ -151,7 +221,8 @@ async function runTurn(m) {
   notify(sid, { sessionUpdate: 'tool_call_update', toolCallId: 'call_1', status: 'completed', rawOutput: { ok: true }, content: [{ type: 'content', content: { type: 'text', text: 'done' } }] });
   notify(sid, { sessionUpdate: 'plan', entries: [{ content: 'step 1', priority: 'high', status: 'in_progress' }] });
   notify(sid, { sessionUpdate: 'available_commands_update', availableCommands: [{ name: 'compact', description: 'Compact context' }] });
-  notify(sid, { sessionUpdate: 'usage_update', used: 1200, size: 200000, cost: { amount: 0.01, currency: 'USD' }, _meta: { '_claude/rateLimit': { status: 'allowed', resetsAt: 1 } } });
+  // Cursor sends no usage frames.
+  if (!flag('--cursor')) notify(sid, { sessionUpdate: 'usage_update', used: 1200, size: 200000, cost: { amount: 0.01, currency: 'USD' }, _meta: { '_claude/rateLimit': { status: 'allowed', resetsAt: 1 } } });
   notify(sid, { sessionUpdate: 'some_future_update_kind', payload: { x: 1 } }); // unknown kind
   send({ jsonrpc: '2.0', method: '_claude/rateLimit', params: { sessionId: sid, status: 'allowed_warning' } }); // ext notification
   const perm = await request('session/request_permission', { sessionId: sid, toolCall: { toolCallId: 'call_2', title: 'Run tests' }, options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }, { optionId: 'reject', name: 'Reject', kind: 'reject_once' }] });
