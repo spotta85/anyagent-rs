@@ -1637,20 +1637,34 @@ fn context_tokens(usage: &Value) -> Option<u64> {
     Some(sum)
 }
 
-/// `get_usage` receipt → quota windows, from `rate_limits.limits`; the plan
-/// name is the receipt's own `subscription_type`.
+/// `get_usage` receipt → quota windows; the plan name is the receipt's own
+/// `subscription_type`. Two shapes seen in the wild: a rich `limits` array,
+/// and (2.1.261) a slim `rate_limits` keyed by window name.
 fn parse_plan_usage(response: &Value) -> Option<PlanUsage> {
-    let limits = response["rate_limits"]["limits"].as_array()?;
-    let windows: Vec<UsageWindow> = limits
-        .iter()
-        .filter_map(|limit| {
-            Some(UsageWindow {
-                label: window_label(limit),
-                used_percent: limit["percent"].as_u64()?.min(100) as u8,
-                resets_at: limit["resets_at"].as_str().and_then(parse_rfc3339),
+    let rate_limits = &response["rate_limits"];
+    let windows: Vec<UsageWindow> = match rate_limits["limits"].as_array() {
+        Some(limits) => limits
+            .iter()
+            .filter_map(|limit| {
+                Some(UsageWindow {
+                    label: window_label(limit),
+                    used_percent: limit["percent"].as_u64()?.min(100) as u8,
+                    resets_at: limit["resets_at"].as_str().and_then(parse_rfc3339),
+                })
             })
-        })
-        .collect();
+            .collect(),
+        None => [("five_hour", "Session"), ("seven_day", "Week")]
+            .iter()
+            .filter_map(|(key, label)| {
+                let window = &rate_limits[*key];
+                Some(UsageWindow {
+                    label: (*label).to_owned(),
+                    used_percent: window["utilization"].as_u64()?.min(100) as u8,
+                    resets_at: window["resets_at"].as_str().and_then(parse_rfc3339),
+                })
+            })
+            .collect(),
+    };
     (!windows.is_empty()).then(|| PlanUsage {
         plan: response["subscription_type"].as_str().map(str::to_owned),
         windows,

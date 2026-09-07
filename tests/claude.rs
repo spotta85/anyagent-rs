@@ -394,6 +394,30 @@ async fn plan_usage_is_refreshed_after_each_turn() {
     session.close().await.unwrap();
 }
 
+/// The slim `rate_limits` shape (2.1.261, no `limits` array) still yields windows.
+#[tokio::test]
+async fn plan_usage_reads_the_slim_rate_limits_shape() {
+    let (session, mut events) = open("usage-slim", "--slim-usage").await;
+    session.prompt("hi").await.unwrap();
+    let usage = loop {
+        match next(&mut events).await.kind {
+            EventKind::RequestOpened(Request::Permission(request)) => {
+                session.answer(request.id, allow()).await.unwrap();
+            }
+            EventKind::PlanUsageUpdated(usage) => break usage,
+            _ => {}
+        }
+    };
+    let windows: Vec<_> = usage
+        .windows
+        .iter()
+        .map(|w| (w.label.as_str(), w.used_percent))
+        .collect();
+    assert_eq!(windows, vec![("Session", 20), ("Week", 37)]);
+    assert!(usage.windows[0].resets_at.is_some());
+    session.close().await.unwrap();
+}
+
 /// Plan usage probed without session and cached for 60s TTL (same fetched_at).
 #[tokio::test]
 async fn runtime_plan_usage_probes_without_a_session_and_caches() {

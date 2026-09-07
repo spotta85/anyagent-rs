@@ -56,6 +56,9 @@ fn enabled() -> Vec<&'static str> {
             // read the environment.
             unsafe { std::env::remove_var(var) };
         }
+        // The host's settings.json may route the CLI through a proxy; the
+        // process env wins over it, so pin the real API for the suite.
+        unsafe { std::env::set_var("ANTHROPIC_BASE_URL", "https://api.anthropic.com") };
     });
     let Ok(list) = std::env::var("ANYAGENT_LIVE") else {
         println!("SKIP all: ANYAGENT_LIVE is not set");

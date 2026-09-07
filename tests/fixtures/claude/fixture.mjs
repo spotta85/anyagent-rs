@@ -103,6 +103,12 @@ function onControl(m) {
     case 'get_binary_version':
       return reply({ version: '2.1.241', buildTime: '2026-08-22T22:46:48Z' });
     case 'get_usage':
+      // Slim shape recorded 2026-09-06 (2.1.261): no `limits` array.
+      if (flag('--slim-usage'))
+        return reply({ subscription_type: 'max', rate_limits_available: true, rate_limits: {
+          five_hour: { utilization: 20, resets_at: '2026-09-07T04:50:00.000Z' },
+          seven_day: { utilization: 37, resets_at: '2026-09-07T19:00:00.000Z' },
+        } });
       // Recorded 2026-08-23 (issue 04); only `rate_limits.limits` matters.
       return reply({ subscription_type: 'max', rate_limits_available: true, rate_limits: { limits: [
         { kind: 'session', group: 'session', percent: 42, severity: 'normal', resets_at: '2026-08-23T08:59:59.746028+00:00', scope: null, is_active: true },
