@@ -23,9 +23,9 @@ use futures::StreamExt;
 
 use anyagent::{
     AgentError, Answer, AuthStatus, Capability, ConfigKind, ConfigValue, DeliveryKind, Event,
-    EventKind, Events, MessageId, PermissionChoice, PermissionMode, PromptId, QuestionAnswer,
-    Request, RequestId, ResumeToken, RollbackScope, Runtime, Session, SessionOptions, StopReason,
-    ToolStatus, TurnOrigin,
+    EventKind, Events, Input, MessageId, PermissionChoice, PermissionMode, PromptId,
+    QuestionAnswer, Request, RequestId, ResumeToken, RollbackScope, Runtime, Session,
+    SessionOptions, StopReason, ToolStatus, TurnOrigin,
 };
 
 /// Every harness the shared matrix covers, in report order.
@@ -208,6 +208,110 @@ async fn discovery_finds_authenticated_harnesses() {
             agent.auth
         );
         pass(h, "discovered and authenticated");
+    }
+}
+
+/// A live `mode` option switches mid-session without leaking text, and the
+/// choice holds across the next turn.
+#[tokio::test]
+#[ignore = "live: talks to real agents"]
+async fn mode_switches_live() {
+    for h in enabled().await {
+        let (session, mut events, _dir) = open(h).await;
+        let option = |session: &Session| {
+            session
+                .info()
+                .details
+                .config_options
+                .into_iter()
+                .find(|o| o.id.as_str() == "mode")
+        };
+        let Some(mode) = option(&session).filter(|o| o.live) else {
+            println!("SKIP {h}: no live mode option");
+            session.close().await.unwrap();
+            continue;
+        };
+        let ConfigKind::Select { choices } = &mode.kind else {
+            panic!("{h}: mode is not a select");
+        };
+        let target = choices
+            .iter()
+            .map(|c| c.value.clone())
+            .find(|v| Some(ConfigValue::Text(v.clone())) != mode.current)
+            .expect("a mode other than the current one");
+        session.configure("mode", target.as_str()).await.unwrap();
+        while option(&session).and_then(|o| o.current) != Some(ConfigValue::Text(target.clone())) {
+            let event = next(&mut events, "mode switch").await;
+            assert!(
+                !matches!(event.kind, EventKind::TextDelta { .. }),
+                "{h}: a switch leaked text"
+            );
+        }
+        session
+            .prompt("Reply with just the word ok.")
+            .await
+            .unwrap();
+        let text = drain_to_turn_end(&session, &mut events, "turn after mode switch").await;
+        assert!(text.to_lowercase().contains("ok"), "{h}: got {text:?}");
+        assert_eq!(
+            option(&session).and_then(|o| o.current),
+            Some(ConfigValue::Text(target.clone())),
+            "{h}: mode changed under us after the turn"
+        );
+        session.close().await.unwrap();
+        pass(h, &format!("mode switched live to {target}"));
+    }
+}
+
+/// An attached image reaches the model wherever `Images` is advertised; a
+/// PDF reaches antigravity's server, the one wire that takes PDFs inline.
+#[tokio::test]
+#[ignore = "live: talks to real agents"]
+async fn attachments_reach_the_model() {
+    let fixtures =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/attachments");
+    for h in enabled().await {
+        let (session, mut events, _dir) = open(h).await;
+        if !session
+            .info()
+            .details
+            .capabilities
+            .supports(Capability::Images)
+        {
+            println!("SKIP {h}: images not advertised");
+            session.close().await.unwrap();
+            continue;
+        }
+        session
+            .prompt(
+                Input::text("What colour is the attached image? Reply with one word.")
+                    .attach(fixtures.join("red.png")),
+            )
+            .await
+            .unwrap();
+        let text = drain_to_turn_end(&session, &mut events, "image").await;
+        assert!(
+            text.to_lowercase().contains("red"),
+            "{h}: image answer was {text:?}"
+        );
+        if h == "antigravity" {
+            session
+                .prompt(
+                    Input::text(
+                        "What is the secret word in the attached PDF? Reply with one word.",
+                    )
+                    .attach(fixtures.join("secret.pdf")),
+                )
+                .await
+                .unwrap();
+            let text = drain_to_turn_end(&session, &mut events, "pdf").await;
+            assert!(
+                text.to_lowercase().contains("pineapple"),
+                "{h}: pdf answer was {text:?}"
+            );
+        }
+        session.close().await.unwrap();
+        pass(h, "attachments reached the model");
     }
 }
 
@@ -786,14 +890,22 @@ async fn a_question_round_trips() {
         // schema-confirmed but has never fired live (ticket 10) — the
         // translation is exercised if it ever does, without failing the run.
         // cursor's Auto model has not fired `cursor/ask_question` in any
-        // probe (2026-09-07); same best-effort arm as codex.
-        if !matches!(h, "claude" | "codex" | "opencode" | "cursor") {
-            println!("SKIP {h}: questions (claude, codex, opencode, cursor)");
+        // probe (2026-09-07); same best-effort arm as codex. Antigravity
+        // asks over its ACP server; the headless CLI cannot prompt.
+        if !matches!(
+            h,
+            "claude" | "codex" | "opencode" | "cursor" | "antigravity"
+        ) {
+            println!("SKIP {h}: questions (claude, codex, opencode, cursor, antigravity)");
+            continue;
+        }
+        if h == "antigravity" && HEADLESS_AGY.get().copied().unwrap_or(false) {
+            println!("SKIP antigravity: headless agy cannot ask");
             continue;
         }
         let (session, mut events, _dir) = open(h).await;
         session
-            .prompt("Ask me whether I prefer red or blue using your question tool (claude: AskUserQuestion; codex: request_user_input; opencode: question; cursor: ask_question), then answer with just my choice.")
+            .prompt("Ask me whether I prefer red or blue using your question tool (claude: AskUserQuestion; codex: request_user_input; opencode: question; cursor: ask_question; antigravity: ask_question), then answer with just my choice.")
             .await
             .unwrap();
         let mut text = String::new();

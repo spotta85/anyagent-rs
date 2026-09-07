@@ -173,6 +173,17 @@ async function runTurn(m) {
   // Errored prompts: "die-auth" loses the credentials, "die-rpc" is a plain failure.
   if (ptext.includes('die-auth')) { send({ jsonrpc: '2.0', id: m.id, error: { code: -32000, message: 'credentials expired' } }); turn = null; return; }
   if (ptext.includes('die-rpc')) { send({ jsonrpc: '2.0', id: m.id, error: { code: -32603, message: 'kaput' } }); turn = null; return; }
+  // Antigravity's ACP server asks as an `interaction_*` tool call plus a
+  // permission whose options are the choices (recorded 2026-09-07).
+  if (ptext.includes('interaction-question')) {
+    const toolCall = { toolCallId: 'interaction_1', title: 'Red or blue?', status: 'pending', rawInput: {} };
+    notify(sid, { sessionUpdate: 'tool_call', ...toolCall });
+    const q = await request('session/request_permission', { sessionId: sid, toolCall, options: [{ optionId: '1', name: 'Red', kind: 'allow_once' }, { optionId: '2', name: 'Blue', kind: 'allow_once' }] });
+    notify(sid, { sessionUpdate: 'tool_call_update', toolCallId: 'interaction_1', status: 'completed', rawOutput: 'Response received' });
+    notify(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `q=${JSON.stringify(q.result?.outcome ?? 'error')} ` } });
+    done('end_turn');
+    return;
+  }
   // Grok extensions (wire shapes cross-checked against comet + t3code).
   if (ptext.includes('grok-question')) {
     const q = await request('_x.ai/ask_user_question', { sessionId: sid, toolCallId: 'call_q', mode: 'default', questions: [{ id: 'q1', question: 'Pick a fruit', options: [{ id: 'g', label: 'Grape', description: 'purple' }, { label: 'Mango' }], multiSelect: false }] });

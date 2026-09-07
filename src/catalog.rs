@@ -146,8 +146,10 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         install_hint: "install Antigravity from https://antigravity.google, then run `agy install`",
         extra_paths: &[".local/bin"],
         // Google's ACP server (registry id `antigravity-acp`): permissions,
-        // questions, steer, and in-process cancel that the CLI's headless
-        // wire lacks. Gemini models only.
+        // questions, in-process cancel, and live mode and model switches
+        // that the CLI's headless wire lacks. No steer: a second prompt
+        // mid-turn breaks its agent connection (probed 2026-09-07), so
+        // those queue. Gemini models only.
         upgrade: Some(Upgrade {
             name: "Antigravity ACP server",
             cli: "agy_acp_server.par",
