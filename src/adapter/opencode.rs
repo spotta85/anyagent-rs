@@ -79,7 +79,7 @@ impl Adapter for OpencodeAdapter {
                 session_id: launched.session_id,
                 windows: launched.windows,
                 variants: launched.variants,
-                login: login_methods(&request.installation),
+                login: login_methods(&request.installation, Some(&request.options)),
                 scratch: TurnScratch::default(),
                 tide: String::new(),
                 cost: 0.0,
@@ -315,7 +315,7 @@ fn auth_status(request: &ConnectRequest, connected: &Value) -> AuthStatus {
     let any = connected.as_array().is_some_and(|c| !c.is_empty());
     if !any {
         return AuthStatus::Unauthenticated {
-            login: login_methods(&request.installation),
+            login: login_methods(&request.installation, Some(&request.options)),
         };
     }
     match &request.installation.auth {

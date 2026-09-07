@@ -411,13 +411,31 @@ pub(crate) fn config_home_env(
 }
 
 /// Runnable login methods from the catalog, for a logged-out handshake and
-/// for mid-session auth loss.
-pub(crate) fn login_methods(installation: &AgentInstallation) -> Vec<crate::agent::LoginMethod> {
-    crate::catalog::PROFILES
+/// for mid-session auth loss. Given the session's options they carry its
+/// config-home variable, so the login lands where the session looks.
+pub(crate) fn login_methods(
+    installation: &AgentInstallation,
+    options: Option<&SessionOptions>,
+) -> Vec<LoginMethod> {
+    let login = crate::catalog::PROFILES
         .iter()
         .find(|p| p.id == installation.id.as_str())
         .map(|p| crate::discovery::login_methods(p, &installation.executable_path))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let env = options
+        .and_then(|o| config_home_env(installation, o).ok())
+        .unwrap_or_default();
+    login_in(login, &env)
+}
+
+/// Terminal login methods with the session's config-home variable attached.
+pub(crate) fn login_in(mut login: Vec<LoginMethod>, env: &[(String, String)]) -> Vec<LoginMethod> {
+    for method in &mut login {
+        if let LoginMethod::Terminal { env: vars, .. } = method {
+            vars.extend(env.iter().cloned());
+        }
+    }
+    login
 }
 
 /// Adds the child's stderr to a handshake failure (a logged-out CLI prints
@@ -432,18 +450,25 @@ pub(crate) fn with_stderr(error: AgentError, child: &crate::process::Child) -> A
     }
 }
 
-/// Maps an agent's own logged-out error to `AuthRequired` using the
-/// profile's probed fingerprints (kiro exits before speaking ACP, hermes
-/// fails session/new with a plain internal error, agy exits before `init`);
-/// other failures pass.
+/// Types a logged-out open as `AuthRequired` with login methods that carry
+/// the session's config-home variable. An error already typed is stamped;
+/// a failure is matched against the profile's probed fingerprints (kiro
+/// exits before speaking ACP, hermes fails session/new with a plain
+/// internal error, agy exits before `init`); anything else passes.
 pub(crate) fn auth_hinted(
     error: AgentError,
     profile: Option<&crate::catalog::AgentProfile>,
     exe: &Path,
+    env: &[(String, String)],
 ) -> AgentError {
+    if let AgentError::AuthRequired { login } = error {
+        return AgentError::AuthRequired {
+            login: login_in(login, env),
+        };
+    }
     let Some(profile) = profile else { return error };
-    // Only failure shapes carry the agent's own words; typed errors
-    // (AuthRequired, UnsupportedFeature, …) must pass through untouched.
+    // Only failure shapes carry the agent's own words; other typed errors
+    // (UnsupportedFeature, …) must pass through untouched.
     if !matches!(
         error,
         AgentError::ProtocolFailed(_) | AgentError::ProcessExited { .. }
@@ -479,7 +504,9 @@ pub(crate) fn auth_hinted(
             },
         );
     }
-    AgentError::AuthRequired { login }
+    AgentError::AuthRequired {
+        login: login_in(login, env),
+    }
 }
 
 /// Truncates to `at` bytes on a char boundary; tool output stays bounded.

@@ -80,7 +80,7 @@ impl Adapter for AcpAdapter {
             exec_path: request.installation.executable_path.clone(),
             args: self.args.clone(),
             cwd: request.options.cwd().clone(),
-            env,
+            env: env.clone(),
         })
         .await?;
         let mut wire = Wire::over(&mut child, recorder);
@@ -112,6 +112,7 @@ impl Adapter for AcpAdapter {
                     e,
                     self.profile,
                     &request.installation.executable_path,
+                    &env,
                 ));
             }
             Err(_) => {
@@ -143,7 +144,7 @@ impl Adapter for AcpAdapter {
                 pending_effort: None,
                 held_prompt: None,
                 retry: None,
-                login,
+                login: crate::adapter::login_in(login, &env),
             }
             .run(cmd_rx),
         );

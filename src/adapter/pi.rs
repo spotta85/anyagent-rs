@@ -211,7 +211,7 @@ async fn auth_status(
     env: &[(String, String)],
 ) -> AuthStatus {
     let unauthenticated = || AuthStatus::Unauthenticated {
-        login: login_methods(&request.installation),
+        login: login_methods(&request.installation, Some(&request.options)),
     };
     // No credentials anywhere means no model resolves, and pi says so.
     if provider.is_empty() || provider == "unknown" {
