@@ -9,7 +9,7 @@
 
 ### One Up-to-date, feature-rich Rust interface to the agents already on a users machine.
 
-Users have Claude Code, Codex, Grok, OpenCode, Kiro, and friends on their
+Users have Claude Code, Codex, Cursor, Grok, OpenCode, Kiro, and friends on their
 machines — each with its own CLI, protocol, and quirks. If you're building an
 app on top of them, you end up writing and maintaining a driver per agent.
 anyagent is that layer, **once: it finds the agents, speaks each one's protocol
@@ -91,7 +91,7 @@ against the agents on your machine:
 | Antigravity | native (adapter in progress) |
 | pi | native (pi RPC) |
 | opencode | native (HTTP + SSE) |
-| Grok, Hermes Agent, Kiro CLI, Qwen Code | ACP |
+| Cursor CLI, Grok, Hermes Agent, Kiro CLI, Qwen Code | ACP |
 
 Any other ACP agent works without a catalog entry via
 `AgentInstallation::acp(name, path, args)`.
