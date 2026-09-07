@@ -36,6 +36,7 @@ const HARNESSES: &[&str] = &[
     "hermes",
     "kiro",
     "pi",
+    "cursor",
     "antigravity",
 ];
 const EVENT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -107,6 +108,15 @@ async fn build_roster() -> Roster {
         .iter()
         .copied()
         .filter(|h| list == "all" || list.split(',').any(|p| p.trim() == *h))
+        .filter(|h| {
+            // pi is pinned to an openrouter model; opencode uses its own
+            // cost-free zen model, so it needs no key.
+            let keyless = *h == "pi" && std::env::var("OPENROUTER_API_KEY").is_err();
+            if keyless {
+                println!("SKIP {h}: OPENROUTER_API_KEY is not set");
+            }
+            !keyless
+        })
         .collect();
 
     let report = Runtime::new().discover().await;
@@ -278,7 +288,7 @@ async fn effort_switches_live() {
     // fail on it); this test names its own harnesses.
     let list = std::env::var("ANYAGENT_LIVE").unwrap_or_default();
     let named = |h: &str| list == "all" || list.split(',').any(|p| p.trim() == h);
-    for h in ["kiro", "grok", "opencode", "pi"]
+    for h in ["kiro", "grok", "opencode", "pi", "cursor"]
         .into_iter()
         .filter(|h| named(h))
     {
@@ -681,8 +691,11 @@ async fn permissions_gate_the_write_and_deny_holds() {
         // gates only its file tools. After denied write attempts the agent
         // can route around its own gate with a terminal `printf`, which
         // never asks. The denies themselves are delivered and honoured.
-        if h == "hermes" && dir.path().join("note.txt").exists() {
-            println!("KNOWN hermes: denies honoured; terminal tool bypassed its approval flow");
+        // KNOWN (cursor, wire-captured 2026-09-07): the mirror image — its
+        // edit tool never asks over ACP; only shell commands outside its
+        // allowlist do, so the deny lands on a verification command.
+        if matches!(h, "hermes" | "cursor") && dir.path().join("note.txt").exists() {
+            println!("KNOWN {h}: denies honoured; the write went through an ungated tool");
         } else {
             assert!(
                 !dir.path().join("note.txt").exists(),
@@ -772,13 +785,15 @@ async fn a_question_round_trips() {
         // codex runs as a probe: `item/tool/requestUserInput` is
         // schema-confirmed but has never fired live (ticket 10) — the
         // translation is exercised if it ever does, without failing the run.
-        if h != "claude" && h != "codex" && h != "opencode" {
-            println!("SKIP {h}: questions (claude, codex, opencode)");
+        // cursor's Auto model has not fired `cursor/ask_question` in any
+        // probe (2026-09-07); same best-effort arm as codex.
+        if !matches!(h, "claude" | "codex" | "opencode" | "cursor") {
+            println!("SKIP {h}: questions (claude, codex, opencode, cursor)");
             continue;
         }
         let (session, mut events, _dir) = open(h).await;
         session
-            .prompt("Ask me whether I prefer red or blue using your question tool (claude: AskUserQuestion; codex: request_user_input; opencode: question), then answer with just my choice.")
+            .prompt("Ask me whether I prefer red or blue using your question tool (claude: AskUserQuestion; codex: request_user_input; opencode: question; cursor: ask_question), then answer with just my choice.")
             .await
             .unwrap();
         let mut text = String::new();
@@ -823,8 +838,11 @@ async fn a_question_round_trips() {
             }
         }
         if !asked {
-            assert_eq!(h, "codex", "{h}: no question request opened");
-            println!("SKIP codex: requestUserInput did not fire (unverified live, ticket 10)");
+            assert!(
+                matches!(h, "codex" | "cursor"),
+                "{h}: no question request opened"
+            );
+            println!("SKIP {h}: the question request did not fire (unverified live)");
             session.close().await.unwrap();
             continue;
         }
@@ -1716,6 +1734,9 @@ fn kill_child(harness: &str, session: &Session) {
         // the turn complete. Anchored so the user's Kiro apps' own
         // `kiro-cli acp --agent <name>` processes never match.
         "kiro" => (&["-f"], "kiro-cli(-chat)? acp$".to_owned()),
+        // The launcher script execs node under its own name; the user's
+        // own TUI never ends in `acp`.
+        "cursor" => (&["-n", "-f"], "cursor-agent .*index.js acp$".to_owned()),
         "codex" => (&["-n", "-f"], "codex app-server".to_owned()),
         // pi overwrites its argv with its own process title, so there is no
         // command line to match: the exact name plus newest-first is ours.
@@ -1857,6 +1878,88 @@ async fn config_home_isolates_login() {
         }
         pass(h, "config home isolates login (empty home is logged out)");
     }
+}
+
+/// Cursor: a model switch adopts that model's own options from the config
+/// response (Composer: `fast`), and they leave with the model. No prompt, so
+/// no quota spent.
+#[tokio::test]
+#[ignore = "live: talks to real agents"]
+async fn cursor_model_switch_reveals_the_models_own_options() {
+    if !enabled().await.contains(&"cursor") {
+        println!("SKIP: cursor not enabled");
+        return;
+    }
+    let (session, mut events, _dir) = open("cursor").await;
+    let option = |session: &Session, id: &str| {
+        session
+            .info()
+            .details
+            .config_options
+            .into_iter()
+            .find(|o| o.id.as_str() == id)
+    };
+    assert!(
+        option(&session, "fast").is_none(),
+        "Auto has no fast option"
+    );
+    session.configure("model", "composer-2.5").await.unwrap();
+    while option(&session, "fast").is_none() {
+        next(&mut events, "cursor: fast option after model switch").await;
+    }
+    assert_eq!(
+        option(&session, "model").and_then(|o| o.current),
+        Some(ConfigValue::Text("composer-2.5".into()))
+    );
+    session.configure("model", "default").await.unwrap();
+    while option(&session, "fast").is_some() {
+        next(&mut events, "cursor: fast option gone").await;
+    }
+    session.close().await.unwrap();
+    pass("cursor", "per-model options follow the model");
+}
+
+/// Cursor: every turn ends with an estimated ContextUsage labelled
+/// `anyagent/estimated` (its wire carries no usage).
+#[tokio::test]
+#[ignore = "live: talks to real agents"]
+async fn cursor_context_usage_is_estimated() {
+    if !enabled().await.contains(&"cursor") {
+        println!("SKIP: cursor not enabled");
+        return;
+    }
+    let (session, mut events, _dir) = open("cursor").await;
+    session.prompt("Say only OK. No tools.").await.unwrap();
+    let mut usage = None;
+    loop {
+        let event = next(&mut events, "cursor: usage turn").await;
+        match event.kind {
+            EventKind::ContextUsage { used_tokens, .. } => {
+                assert_eq!(
+                    event.extensions.get("anyagent/estimated"),
+                    Some(&serde_json::Value::Bool(true)),
+                    "usage not labelled as an estimate"
+                );
+                usage = Some(used_tokens);
+            }
+            EventKind::RequestOpened(request) => {
+                session.answer(request.id(), allow()).await.unwrap();
+            }
+            EventKind::TurnEnded { .. } => break,
+            _ => {}
+        }
+    }
+    let used = usage.expect("an estimated usage event before turn end");
+    assert!(used > 0, "estimate is empty");
+    assert!(
+        session
+            .info()
+            .details
+            .capabilities
+            .supports(Capability::ContextUsage)
+    );
+    session.close().await.unwrap();
+    pass("cursor", &format!("estimated usage {used} tokens"));
 }
 
 #[tokio::test]

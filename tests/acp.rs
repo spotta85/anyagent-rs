@@ -1287,3 +1287,501 @@ async fn kiro_spurious_cancel_is_retried_once_inside_the_adapter() {
     assert!(text.contains("Hello"), "{text:?}");
     session.close().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// CURSOR: the cursor-agent shape (fixture `--cursor`, recorded 2026-09-07)
+// ---------------------------------------------------------------------------
+
+/// A cursor catalog agent driven by the fixture's `--cursor` scenario.
+fn cursor(name: &str, flags: &str) -> AgentInstallation {
+    catalog_wrapper("cursor", name, &format!("--cursor {flags}"))
+}
+
+/// The advertised option with this id, if any.
+fn option(session: &Session, id: &str) -> Option<anyagent::ConfigOption> {
+    session
+        .info()
+        .details
+        .config_options
+        .into_iter()
+        .find(|o| o.id.as_str() == id)
+}
+
+/// Waits for events until the session's options satisfy `done`.
+async fn wait_options(session: &Session, events: &mut Events, done: impl Fn(&Session) -> bool) {
+    while !done(session) {
+        let event = next(events).await;
+        assert!(
+            !matches!(
+                event.kind,
+                EventKind::Diagnostic(anyagent::Diagnostic {
+                    level: anyagent::DiagnosticLevel::Warning,
+                    ..
+                })
+            ),
+            "warning while waiting: {:?}",
+            event.kind
+        );
+    }
+}
+
+/// Open runs `about` then `authenticate`: version and account come from `about`, options from session/new with `mode` listed once.
+#[tokio::test]
+async fn cursor_open_authenticates_and_reports_version_account_and_options() {
+    let runtime = Runtime::new();
+    let (session, _events) = runtime
+        .open(
+            &cursor("open", ""),
+            SessionOptions::in_dir(std::env::temp_dir()),
+        )
+        .await
+        .unwrap();
+    let info = session.info();
+    assert_eq!(info.details.version.as_deref(), Some("0.0.1"));
+    assert_eq!(
+        info.details.auth,
+        AuthStatus::Authenticated {
+            kind: AuthKind::Subscription,
+            account: Some(anyagent::AccountInfo {
+                email: Some("dev@example.com".into()),
+                plan: Some("Free".into()),
+            }),
+        }
+    );
+    let caps = &info.details.capabilities;
+    for cap in [
+        Capability::Permissions,
+        Capability::Images,
+        Capability::Resume,
+    ] {
+        assert!(caps.supports(cap.clone()), "missing {cap:?}");
+    }
+    assert!(
+        !caps.supports(Capability::Steer),
+        "cursor advertises no steering"
+    );
+    let ids: Vec<_> = info
+        .details
+        .config_options
+        .iter()
+        .map(|o| o.id.as_str().to_owned())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["mode", "model"],
+        "mode listed once, no per-model options on Auto"
+    );
+    assert_eq!(
+        option(&session, "mode").unwrap().current,
+        Some(ConfigValue::Text("agent".into()))
+    );
+    assert_eq!(info.resume_token.unwrap().as_str(), "sess-1");
+    session.close().await.unwrap();
+}
+
+/// Logged out, `about` reports no email: probe answers Unauthenticated with the catalog login before `authenticate` could start a browser login (the fixture hangs there).
+#[tokio::test]
+async fn cursor_logged_out_is_reported_before_the_browser_login() {
+    let agent = cursor("out", "--logged-out");
+    let details = tokio::time::timeout(Duration::from_secs(5), Runtime::new().probe(&agent))
+        .await
+        .expect("probe must not wait on the browser login")
+        .unwrap();
+    let AuthStatus::Unauthenticated { login } = details.auth else {
+        panic!("expected Unauthenticated, got {:?}", details.auth);
+    };
+    let LoginMethod::Terminal { command, .. } = &login[0] else {
+        panic!("expected a terminal login method");
+    };
+    assert_eq!(command[1..], ["login"]);
+    assert!(
+        login
+            .iter()
+            .any(|m| matches!(m, LoginMethod::EnvVar { name } if name == "CURSOR_API_KEY"))
+    );
+}
+
+/// A model switch adopts the model's own options from the config response (fast for composer, thinking/context/effort for opus), and they leave with the model; creation-time config does the same.
+#[tokio::test]
+async fn cursor_model_switch_reveals_the_models_own_options() {
+    let runtime = Runtime::new();
+    let (session, mut events) = runtime
+        .open(
+            &cursor("models", ""),
+            SessionOptions::in_dir(std::env::temp_dir()),
+        )
+        .await
+        .unwrap();
+    session.configure("model", "composer-2.5").await.unwrap();
+    wait_options(&session, &mut events, |s| option(s, "fast").is_some()).await;
+    let fast = option(&session, "fast").unwrap();
+    assert!(fast.live);
+    assert_eq!(fast.current, Some(ConfigValue::Text("true".into())));
+    assert_eq!(
+        option(&session, "model").unwrap().current,
+        Some(ConfigValue::Text("composer-2.5".into()))
+    );
+
+    session.configure("fast", "false").await.unwrap();
+    wait_options(&session, &mut events, |s| {
+        option(s, "fast").and_then(|o| o.current) == Some(ConfigValue::Text("false".into()))
+    })
+    .await;
+
+    session.configure("model", "default").await.unwrap();
+    wait_options(&session, &mut events, |s| option(s, "fast").is_none()).await;
+    assert_eq!(
+        option(&session, "mode").unwrap().current,
+        Some(ConfigValue::Text("agent".into()))
+    );
+    session.close().await.unwrap();
+
+    // Creation-time: the requested model's options are there at open.
+    let (session, _events) = runtime
+        .open(
+            &cursor("models-open", ""),
+            SessionOptions::in_dir(std::env::temp_dir()).configure("model", "claude-opus-5"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        option(&session, "context").unwrap().current,
+        Some(ConfigValue::Text("300k".into()))
+    );
+    assert_eq!(
+        option(&session, "effort").unwrap().current,
+        Some(ConfigValue::Text("high".into()))
+    );
+    assert_eq!(
+        option(&session, "thinking").unwrap().current,
+        Some(ConfigValue::Text("true".into()))
+    );
+    session.close().await.unwrap();
+}
+
+/// `cursor/ask_question` surfaces typed (prompt/allowMultiple read), and the answer goes back as `answered` with the option ids.
+#[tokio::test]
+async fn cursor_questions_round_trip_in_cursors_shape() {
+    let runtime = Runtime::new();
+    let (session, mut events) = runtime
+        .open(
+            &cursor("question", ""),
+            SessionOptions::in_dir(std::env::temp_dir()),
+        )
+        .await
+        .unwrap();
+    session.prompt("cursor-question").await.unwrap();
+    let mut text = String::new();
+    loop {
+        let event = next(&mut events).await;
+        match event.kind {
+            EventKind::RequestOpened(Request::Question(request)) => {
+                let q = &request.questions[0];
+                assert_eq!(q.id.as_str(), "color");
+                assert_eq!(q.text, "Red or blue?");
+                assert!(!q.multi_select);
+                assert_eq!(
+                    q.choices.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+                    ["r", "b"]
+                );
+                assert_eq!(q.choices[1].label, "Blue");
+                session
+                    .answer(
+                        request.id,
+                        Answer::Question(vec![QuestionAnswer::Choices(vec![ChoiceId::new("b")])]),
+                    )
+                    .await
+                    .unwrap();
+            }
+            EventKind::TextDelta { text: t, .. } => text.push_str(&t),
+            EventKind::TurnEnded { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        text,
+        r#"q={"outcome":"answered","answers":[{"questionId":"color","selectedOptionIds":["b"]}]} "#
+    );
+    assert!(
+        session
+            .info()
+            .details
+            .capabilities
+            .supports(Capability::Questions)
+    );
+    session.close().await.unwrap();
+}
+
+/// `cursor/update_todos` becomes the plan (merge honoured), `cursor/task` is acknowledged (a named tool, not a nested subagent), image generation is declined; none is answered "method not found".
+#[tokio::test]
+async fn cursor_todos_task_and_image_requests_are_answered() {
+    let runtime = Runtime::new();
+    let (session, mut events) = runtime
+        .open(
+            &cursor("todos", ""),
+            SessionOptions::in_dir(std::env::temp_dir()),
+        )
+        .await
+        .unwrap();
+    session.prompt("cursor-todos").await.unwrap();
+    let mut plans = Vec::new();
+    let mut surfaced = Vec::new();
+    let mut task_kind = None;
+    let mut text = String::new();
+    loop {
+        let event = next(&mut events).await;
+        match event.kind {
+            EventKind::PlanUpdated { entries } => plans.push(
+                entries
+                    .into_iter()
+                    .map(|e| (e.text, e.status))
+                    .collect::<Vec<_>>(),
+            ),
+            EventKind::ToolUpdated(tool) if tool.title == "Task: List files" => {
+                task_kind = Some((tool.kind, tool.raw.unwrap().name));
+            }
+            EventKind::Diagnostic(d) => {
+                assert_ne!(d.level, anyagent::DiagnosticLevel::Warning, "{}", d.message);
+                surfaced.extend(event.extensions.keys().cloned());
+            }
+            EventKind::TextDelta { text: t, .. } => text.push_str(&t),
+            EventKind::TurnEnded { .. } => break,
+            _ => {}
+        }
+    }
+    use anyagent::PlanStatus as P;
+    assert_eq!(
+        plans,
+        vec![
+            vec![
+                ("first".to_string(), P::Completed),
+                ("second".to_string(), P::Pending)
+            ],
+            vec![
+                ("first".to_string(), P::Completed),
+                ("second".to_string(), P::InProgress)
+            ],
+        ]
+    );
+    assert_eq!(
+        task_kind,
+        Some((anyagent::ToolKind::Other, "task".to_string()))
+    );
+    assert!(
+        surfaced.contains(&"cursor/task".to_string()),
+        "{surfaced:?}"
+    );
+    assert!(
+        surfaced.contains(&"cursor/generate_image".to_string()),
+        "{surfaced:?}"
+    );
+    assert_eq!(text, "todos=2 task=completed image=rejected ");
+    session.close().await.unwrap();
+}
+
+/// `cursor/create_plan` is accepted and surfaced raw with its markdown; the plan itself arrives as the standard plan update.
+#[tokio::test]
+async fn cursor_plan_proposals_are_accepted_and_surfaced() {
+    let runtime = Runtime::new();
+    let (session, mut events) = runtime
+        .open(
+            &cursor("plan", ""),
+            SessionOptions::in_dir(std::env::temp_dir()),
+        )
+        .await
+        .unwrap();
+    session.prompt("cursor-plan").await.unwrap();
+    let mut steps = Vec::new();
+    let mut markdown = None;
+    let mut text = String::new();
+    loop {
+        let event = next(&mut events).await;
+        match event.kind {
+            EventKind::PlanUpdated { entries } => {
+                steps = entries.into_iter().map(|e| e.text).collect()
+            }
+            EventKind::Diagnostic(_) => {
+                if let Some(plan) = event.extensions.get("cursor/create_plan") {
+                    markdown = plan["plan"].as_str().map(str::to_owned);
+                }
+            }
+            EventKind::TextDelta { text: t, .. } => text.push_str(&t),
+            EventKind::TurnEnded { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(steps, vec!["write README"]);
+    assert_eq!(markdown.as_deref(), Some("# Plan\n1. write"));
+    assert_eq!(text, "plan=accepted ");
+    session.close().await.unwrap();
+}
+
+/// Every turn ends with an estimated ContextUsage labelled `anyagent/estimated`; the window follows the model's `context` option (none on Auto).
+#[tokio::test]
+async fn cursor_context_usage_is_estimated_and_labelled() {
+    async fn usage_after_turn(session: &Session, events: &mut Events) -> (u64, Option<u64>, bool) {
+        session.prompt("hi").await.unwrap();
+        let mut usage = None;
+        loop {
+            let event = next(events).await;
+            match event.kind {
+                EventKind::RequestOpened(Request::Permission(request)) => {
+                    session.answer(request.id, allow()).await.unwrap();
+                }
+                EventKind::ContextUsage {
+                    used_tokens,
+                    window_tokens,
+                    ..
+                } => {
+                    let estimated = event.extensions.get("anyagent/estimated")
+                        == Some(&serde_json::Value::Bool(true));
+                    usage = Some((used_tokens, window_tokens, estimated));
+                }
+                EventKind::TurnEnded { .. } => break,
+                _ => {}
+            }
+        }
+        usage.expect("a usage event before the turn ended")
+    }
+    let runtime = Runtime::new();
+    let (session, mut events) = runtime
+        .open(
+            &cursor("usage", ""),
+            SessionOptions::in_dir(std::env::temp_dir()),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !session
+            .info()
+            .details
+            .capabilities
+            .supports(Capability::ContextUsage)
+    );
+    let (used, window, estimated) = usage_after_turn(&session, &mut events).await;
+    assert!(estimated);
+    assert!(used > 0, "counted the prompt and reply");
+    assert_eq!(window, None, "Auto has no context option");
+    assert!(
+        session
+            .info()
+            .details
+            .capabilities
+            .supports(Capability::ContextUsage)
+    );
+    // The count accumulates over the session.
+    let (used_again, _, _) = usage_after_turn(&session, &mut events).await;
+    assert!(used_again > used);
+    session.close().await.unwrap();
+
+    let (session, mut events) = runtime
+        .open(
+            &cursor("usage-opus", ""),
+            SessionOptions::in_dir(std::env::temp_dir()).configure("model", "claude-opus-5"),
+        )
+        .await
+        .unwrap();
+    let (_, window, _) = usage_after_turn(&session, &mut events).await;
+    assert_eq!(window, Some(300_000));
+    session.close().await.unwrap();
+
+    // An inlined image counts a flat allowance; a resumed session has no
+    // baseline for what came before, so it estimates nothing.
+    let dir = std::env::temp_dir().join(format!("anyagent-cursor-att-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("shot.png"), b"\x89PNG\r\n\x1a\ndata").unwrap();
+    let (session, mut events) = runtime
+        .open(
+            &cursor("usage-image", ""),
+            SessionOptions::in_dir(std::env::temp_dir()),
+        )
+        .await
+        .unwrap();
+    session
+        .prompt(Input::text("hi").attach(dir.join("shot.png")))
+        .await
+        .unwrap();
+    let mut used = 0;
+    loop {
+        let event = next(&mut events).await;
+        match event.kind {
+            EventKind::RequestOpened(request) => {
+                session.answer(request.id(), allow()).await.unwrap()
+            }
+            EventKind::ContextUsage { used_tokens, .. } => used = used_tokens,
+            EventKind::TurnEnded { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(used >= 1_500, "image allowance missing: {used}");
+    let token = session.info().resume_token.unwrap();
+    session.close().await.unwrap();
+
+    let (session, mut events) = runtime
+        .open(
+            &cursor("usage-resume", ""),
+            SessionOptions::in_dir(std::env::temp_dir()).resume(token),
+        )
+        .await
+        .unwrap();
+    session.prompt("hi").await.unwrap();
+    loop {
+        let event = next(&mut events).await;
+        match event.kind {
+            EventKind::RequestOpened(request) => {
+                session.answer(request.id(), allow()).await.unwrap()
+            }
+            EventKind::ContextUsage { .. } => panic!("a resumed session must not estimate"),
+            EventKind::TurnEnded { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(
+        !session
+            .info()
+            .details
+            .capabilities
+            .supports(Capability::ContextUsage)
+    );
+    session.close().await.unwrap();
+}
+
+/// A cursor question without options takes free text, which rides back as the option id.
+#[tokio::test]
+async fn cursor_optionless_questions_take_free_text() {
+    let runtime = Runtime::new();
+    let (session, mut events) = runtime
+        .open(
+            &cursor("question-free", ""),
+            SessionOptions::in_dir(std::env::temp_dir()),
+        )
+        .await
+        .unwrap();
+    session.prompt("cursor-question-free").await.unwrap();
+    let mut text = String::new();
+    loop {
+        let event = next(&mut events).await;
+        match event.kind {
+            EventKind::RequestOpened(Request::Question(request)) => {
+                let q = &request.questions[0];
+                assert!(q.choices.is_empty());
+                assert!(q.allows_free_text);
+                session
+                    .answer(
+                        request.id,
+                        Answer::Question(vec![QuestionAnswer::Text("purple".into())]),
+                    )
+                    .await
+                    .unwrap();
+            }
+            EventKind::TextDelta { text: t, .. } => text.push_str(&t),
+            EventKind::TurnEnded { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        text,
+        r#"q={"outcome":"answered","answers":[{"questionId":"color","selectedOptionIds":["purple"]}]} "#
+    );
+    session.close().await.unwrap();
+}

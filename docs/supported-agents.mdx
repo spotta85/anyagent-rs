@@ -15,6 +15,7 @@ real install.
 | Claude Code | `claude` | `claude` | native (stream-json) | `npm install -g @anthropic-ai/claude-code` |
 | Codex | `codex` | `codex` | native (app-server) | `npm install -g @openai/codex` |
 | Antigravity | `antigravity` | `agy`, or its ACP server when installed | native (stream-json), ACP with the server | [antigravity.google](https://antigravity.google), then `agy install`; optional ACP server below |
+| Cursor CLI | `cursor` | `cursor-agent` | ACP | `curl https://cursor.com/install -fsS \| bash` |
 | Grok | `grok` | `grok` | ACP | `npm install -g @xai-official/grok` |
 | Hermes Agent | `hermes` | `hermes` | ACP | [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) |
 | opencode | `opencode` | `opencode` | native (HTTP + SSE) | `brew install sst/tap/opencode` |
@@ -99,6 +100,27 @@ adapter reads the current level from
 kiro's metadata frames and switches it by running `/effort <level>` as a
 prompt between turns. A switch made mid-turn waits for that turn to end, and
 a prompt sent while the switch runs waits behind it.
+</Note>
+
+<Note>
+Cursor runs over `cursor-agent acp`. Its permission requests gate shell
+commands outside its allowlist; file edits never ask (wire-captured
+2026-09-07), so sandbox accordingly. Before the handshake anyagent runs
+`cursor-agent about` (0.5s) for the version and the logged-in account, and
+fails typed with `cursor-agent login` when there is none, because Cursor's
+own ACP `authenticate` would start a browser login instead. Modes
+(agent / plan / ask), permissions, images, resume, slash commands, and
+plans are plain ACP. A model switch adopts that model's own options
+(`effort`, `fast`, `thinking`, `context`) from the config response; Auto has
+none. Cursor's extension requests are answered: `ask_question` is a
+`Question` request, `create_plan` is accepted and surfaced raw with its
+markdown, `update_todos` drives the plan, `task` (a subagent run) is
+acknowledged and surfaced raw as a header only, with no transcript and no
+nested events. Cursor reports no context usage, so every turn
+ends with an estimate from what crossed the wire (4 chars ≈ 1 token),
+labelled `anyagent/estimated` in the event's extensions; the window is the
+model's `context` option when it has one. A resumed session gets no estimate,
+since Cursor replays none of its history.
 </Note>
 
 <Note>

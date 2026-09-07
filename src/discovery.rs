@@ -52,7 +52,13 @@ async fn scan(
 ) -> (Result<AgentInstallation, MissingAgent>, Vec<Diagnostic>) {
     let mut diagnostics = Vec::new();
     if let Some(exe) = env_override(profile, &mut diagnostics) {
-        let agent = installation(profile, exe, InstallationSource::EnvOverride, home).await;
+        let mut agent = installation(profile, exe, InstallationSource::EnvOverride, home).await;
+        // The override pins the base CLI, but a missing upgrade still rides
+        // along as installation guidance.
+        let dirs = search_dirs(profile, home, path, login);
+        if let Some(upgrade) = &profile.upgrade {
+            agent.upgrade = resolve_upgrade(profile, upgrade, &dirs, home).err();
+        }
         return (Ok(agent), diagnostics);
     }
     let dirs = search_dirs(profile, home, path, login);

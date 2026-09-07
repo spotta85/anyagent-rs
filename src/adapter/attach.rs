@@ -107,8 +107,9 @@ fn sniff(bytes: &[u8]) -> Option<(Media, &'static str)> {
         [b'G', b'I', b'F', b'8', ..] => (Image, "image/gif"),
         _ if riff(b"WEBP") => (Image, "image/webp"),
         _ if riff(b"WAVE") => (Audio, "audio/wav"),
-        // ID3 tag, or a bare frame: 11 sync bits, any MPEG version, layer
-        // III, with or without CRC (FB, FA, F3, F2, E3, E2).
+        // ID3 tag, or a bare frame: 11 sync bits, a valid MPEG version
+        // (the 01 pattern is reserved), layer III, with or without CRC
+        // (FB, FA, F3, F2, E3, E2).
         [b'I', b'D', b'3', ..] => (Audio, "audio/mpeg"),
         [0xFF, b, ..] if b & 0xE6 == 0xE2 && b & 0x18 != 0x08 => (Audio, "audio/mpeg"),
         [b'O', b'g', b'g', b'S', ..] => (Audio, "audio/ogg"),
@@ -204,6 +205,16 @@ mod tests {
         assert_eq!(
             sniff(&[0xFF, 0xFA, 0x90, 0x00]),
             Some((Media::Audio, "audio/mpeg"))
+        );
+        assert_eq!(
+            sniff(&[0xFF, 0xFB, 0x90, 0x00]),
+            Some((Media::Audio, "audio/mpeg")),
+            "CRC-protected frames are mp3"
+        );
+        assert_eq!(
+            sniff(&[0xFF, 0xEA, 0x90, 0x00]),
+            None,
+            "reserved MPEG version is not mp3"
         );
         assert_eq!(
             sniff(&[0xFF, 0xFD, 0x90, 0x00]),

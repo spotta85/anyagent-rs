@@ -164,6 +164,30 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         }),
     },
     AgentProfile {
+        id: "cursor",
+        name: "Cursor CLI",
+        cli: "cursor-agent",
+        executable_env: "ANYAGENT_CURSOR_BIN",
+        config_dir: ".cursor",
+        config_home_env: None,
+        connection: Connection::Acp { args: &["acp"] },
+        // `cursor-agent login` stores the token in the macOS keychain
+        // (probed 2026-09-07); the env key is Cursor's documented headless
+        // alternative.
+        auth_markers: &[
+            AuthMarker::Keychain("cursor-access-token", AuthKind::Subscription),
+            AuthMarker::ApiKeyEnv("CURSOR_API_KEY"),
+        ],
+        open_auth_kind: Some(AuthKind::Subscription),
+        // Every session call logged out fails with the auth code and this
+        // text (read from the 2026.09.02 bundle).
+        auth_error_hints: &["Authentication required"],
+        login_args: &["login"],
+        install_hint: "curl https://cursor.com/install -fsS | bash",
+        extra_paths: &[".local/bin"],
+        upgrade: None,
+    },
+    AgentProfile {
         id: "grok",
         name: "Grok",
         cli: "grok",

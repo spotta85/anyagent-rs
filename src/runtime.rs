@@ -693,6 +693,48 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    // The lock deliberately spans the awaits: it serializes tests that
+    // mutate process-wide HOME/PATH.
+    #[allow(clippy::await_holding_lock)]
+    async fn env_override_to_the_cli_still_names_a_missing_upgrade() {
+        let _guard = env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join(".local/bin");
+        let agy = make_exe(&bin, "agy");
+        // The fixture wrappers exec `node`, so the real PATH stays behind
+        // the fake bin.
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![bin.clone()];
+        paths.extend(std::env::split_paths(&path));
+        let _env = EnvGuard::set(&[
+            ("HOME", home.path().as_os_str().to_owned()),
+            ("PATH", std::env::join_paths(paths).unwrap()),
+            ("ANYAGENT_ANTIGRAVITY_BIN", agy.as_os_str().to_owned()),
+        ]);
+
+        // The override pins the CLI, but the missing server still rides
+        // along as installation guidance.
+        let report = Runtime::new().discover().await;
+        let agent = report.require("antigravity").unwrap();
+        assert_eq!(agent.executable_path, agy);
+        assert!(agent.acp_args.is_none());
+        let upgrade = agent.upgrade.as_ref().expect("upgrade named");
+        assert_eq!(upgrade.name, "Antigravity ACP server");
+
+        // The server installed: the override still forces headless, and
+        // there is nothing missing left to name.
+        make_exe(
+            &home.path().join(".local/agy-acp-server"),
+            "agy_acp_server.par",
+        );
+        let report = Runtime::new().discover().await;
+        let agent = report.require("antigravity").unwrap();
+        assert_eq!(agent.executable_path, agy);
+        assert!(agent.acp_args.is_none());
+        assert!(agent.upgrade.is_none());
+    }
+
     /// Process-wide env vars set for one test and restored on drop, so a
     /// failed assertion cannot leak them into the next test.
     struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);

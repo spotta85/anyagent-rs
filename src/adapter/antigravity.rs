@@ -537,7 +537,11 @@ impl Drive {
 
     /// Exactly one `result` per turn: usage, then the turn's end.
     async fn on_result(&mut self, result: &Value) -> Result<(), Gone> {
-        self.message = None;
+        if let Some(message_id) = self.message.take() {
+            self.events
+                .event(EventKind::MessageEnded { message_id })
+                .await?;
+        }
         self.settle_tools().await?;
         if let Some(used) = self.last_usage.take() {
             self.events
