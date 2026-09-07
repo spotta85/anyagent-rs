@@ -604,12 +604,15 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let bin = home.path().join(".local/bin");
         make_exe(&bin, "agy");
-        let orig_home = std::env::var_os("HOME");
-        let orig_path = std::env::var_os("PATH");
-        unsafe {
-            std::env::set_var("HOME", home.path());
-            std::env::set_var("PATH", bin.to_string_lossy().to_string());
-        }
+        // The fixture wrappers exec `node`, so the real PATH stays behind
+        // the fake bin.
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![bin.clone()];
+        paths.extend(std::env::split_paths(&path));
+        let _env = EnvGuard::set(&[
+            ("HOME", home.path().as_os_str().to_owned()),
+            ("PATH", std::env::join_paths(paths).unwrap()),
+        ]);
 
         // Only the CLI: it is the installation, and the ACP server is the
         // named upgrade with its own install hint.
@@ -645,7 +648,7 @@ mod tests {
         std::fs::write(
             &server,
             format!(
-                "#!/bin/sh\nexec node {} --auth-adopt \"$@\"\n",
+                "#!/bin/sh\nexec node '{}' --auth-adopt \"$@\"\n",
                 fixture.display()
             ),
         )
@@ -671,7 +674,7 @@ mod tests {
         std::fs::write(
             &server,
             format!(
-                "#!/bin/sh\nexec node {} --auth-required --capitalized-auth --no-auth-methods \"$@\"\n",
+                "#!/bin/sh\nexec node '{}' --auth-required --capitalized-auth --no-auth-methods \"$@\"\n",
                 fixture.display()
             ),
         )
@@ -688,17 +691,35 @@ mod tests {
             matches!(&login[0], crate::agent::LoginMethod::Terminal { command, .. } if command == &["agy"]),
             "{login:?}"
         );
+    }
 
-        unsafe {
-            if let Some(v) = orig_home {
-                std::env::set_var("HOME", v);
-            } else {
-                std::env::remove_var("HOME");
-            }
-            if let Some(v) = orig_path {
-                std::env::set_var("PATH", v);
-            } else {
-                std::env::remove_var("PATH");
+    /// Process-wide env vars set for one test and restored on drop, so a
+    /// failed assertion cannot leak them into the next test.
+    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvGuard {
+        fn set(vars: &[(&'static str, std::ffi::OsString)]) -> Self {
+            let saved = vars
+                .iter()
+                .map(|(name, value)| {
+                    let orig = std::env::var_os(name);
+                    unsafe { std::env::set_var(name, value) };
+                    (*name, orig)
+                })
+                .collect();
+            Self(saved)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, orig) in self.0.drain(..) {
+                unsafe {
+                    match orig {
+                        Some(v) => std::env::set_var(name, v),
+                        None => std::env::remove_var(name),
+                    }
+                }
             }
         }
     }

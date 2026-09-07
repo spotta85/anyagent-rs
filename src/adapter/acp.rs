@@ -1471,7 +1471,7 @@ impl Drive {
                 attach::Media::Pdf if self.prompt_media.embedded_context => json!({
                     "type": "resource",
                     "resource": {
-                        "uri": format!("file://{}", l.path),
+                        "uri": attach::file_uri(&l.path),
                         "mimeType": inline.mime,
                         "blob": inline.base64(),
                     },

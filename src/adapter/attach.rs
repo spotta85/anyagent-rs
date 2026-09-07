@@ -118,6 +118,21 @@ fn sniff(bytes: &[u8]) -> Option<(Media, &'static str)> {
     })
 }
 
+/// The absolute path as a `file:` URI: everything outside the unreserved
+/// set and `/` is percent-encoded, so a space or `#` in a name survives.
+pub(crate) fn file_uri(path: &str) -> String {
+    let mut uri = String::from("file://");
+    for b in path.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                uri.push(b as char)
+            }
+            _ => uri.push_str(&format!("%{b:02X}")),
+        }
+    }
+    uri
+}
+
 /// Standard base64 with padding. Encoding only, so a dependency is not worth it.
 pub(crate) fn base64(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -154,6 +169,14 @@ mod tests {
         assert_eq!(base64(b"foo"), "Zm9v");
         assert_eq!(base64(b"foobar"), "Zm9vYmFy");
         assert_eq!(base64(&[0xFF, 0x00, 0xFF]), "/wD/");
+    }
+
+    /// file_uri keeps unreserved characters and encodes the rest.
+    #[test]
+    fn file_uri_encodes_reserved_characters() {
+        assert_eq!(file_uri("/tmp/a-b_c.pdf"), "file:///tmp/a-b_c.pdf");
+        assert_eq!(file_uri("/tmp/a #1.pdf"), "file:///tmp/a%20%231.pdf");
+        assert_eq!(file_uri("/tmp/é.pdf"), "file:///tmp/%C3%A9.pdf");
     }
 
     /// sniff detects image, audio, and PDF magic bytes; anything else is None.

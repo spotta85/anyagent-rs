@@ -110,8 +110,12 @@ async fn launch(
     recorder: Option<WireRecorder>,
 ) -> Result<(process::Child, LineWire, DriverInfo), AgentError> {
     let exe = &request.installation.executable_path;
-    let (started, models, version) =
-        tokio::join!(start(request, recorder), models(exe), version(exe));
+    let env = crate::adapter::config_home_env(&request.installation, &request.options)?;
+    let (started, models, version) = tokio::join!(
+        start(request, recorder),
+        models(exe, &env),
+        version(exe, &env)
+    );
     let (child, wire, init) = started?;
     Ok((
         child,
@@ -237,8 +241,8 @@ async fn wait_init(wire: &mut LineWire) -> Result<Value, AgentError> {
 
 /// `agy --output-format=json models` (the flag is global, before the
 /// subcommand). Empty when the fetch fails; the option is then omitted.
-async fn models(exe: &Path) -> Vec<ConfigChoice> {
-    let Some(out) = output(exe, &["--output-format=json", "models"]).await else {
+async fn models(exe: &Path, env: &[(String, String)]) -> Vec<ConfigChoice> {
+    let Some(out) = output(exe, env, &["--output-format=json", "models"]).await else {
         return Vec::new();
     };
     let Ok(report) = serde_json::from_str::<Value>(&out) else {
@@ -260,17 +264,19 @@ async fn models(exe: &Path) -> Vec<ConfigChoice> {
 }
 
 /// `agy --version`; the wire never reports it.
-async fn version(exe: &Path) -> Option<String> {
-    let version = output(exe, &["--version"]).await?;
+async fn version(exe: &Path, env: &[(String, String)]) -> Option<String> {
+    let version = output(exe, env, &["--version"]).await?;
     let version = version.trim().to_owned();
     (!version.is_empty()).then_some(version)
 }
 
-/// Captured stdout of a short side process; `None` if it fails or hangs.
-async fn output(exe: &Path, args: &[&str]) -> Option<String> {
+/// Captured stdout of a short side process in the session's config home;
+/// `None` if it fails or hangs.
+async fn output(exe: &Path, env: &[(String, String)], args: &[&str]) -> Option<String> {
     let mut command = tokio::process::Command::new(exe);
     command
         .args(args)
+        .envs(env.iter().cloned())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -476,21 +482,22 @@ impl Drive {
     async fn on_step(&mut self, step: &Value) -> Result<(), Gone> {
         let done = step["state"].as_str() != Some("ACTIVE");
         match step["step_type"].as_str().unwrap_or_default() {
+            // A message exists once text arrives: a step with no text (a
+            // tool-only response) opens nothing to end.
             "agent_response" => {
-                let message_id = self.message();
                 if let Some(used) = step["usage"]["total_tokens"].as_u64().filter(|t| *t > 0) {
                     self.last_usage = Some(used);
                 }
                 if let Some(text) = step["text_delta"].as_str().filter(|t| !t.is_empty()) {
+                    let message_id = self.message();
                     self.events
                         .event(EventKind::TextDelta {
-                            message_id: message_id.clone(),
+                            message_id,
                             text: text.to_owned(),
                         })
                         .await?;
                 }
-                if done {
-                    self.message = None;
+                if let Some(message_id) = self.message.take_if(|_| done) {
                     self.events
                         .event(EventKind::MessageEnded { message_id })
                         .await?;

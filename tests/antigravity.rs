@@ -28,7 +28,7 @@ fn wrapper(name: &str, flags: &str) -> PathBuf {
     std::fs::write(
         &path,
         format!(
-            "#!/bin/sh\nexec node {} {flags} \"$@\"\n",
+            "#!/bin/sh\nexec node '{}' {flags} \"$@\"\n",
             fixture.display()
         ),
     )

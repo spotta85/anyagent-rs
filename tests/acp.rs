@@ -55,7 +55,7 @@ fn catalog_wrapper(agent: &str, name: &str, flags: &str) -> AgentInstallation {
     std::fs::write(
         &path,
         format!(
-            "#!/bin/sh\nexec node {} {flags} \"$@\"\n",
+            "#!/bin/sh\nexec node '{}' {flags} \"$@\"\n",
             fixture.display()
         ),
     )
