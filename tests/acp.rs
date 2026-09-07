@@ -1462,10 +1462,30 @@ async fn cursor_model_switch_reveals_the_models_own_options() {
 /// `cursor/ask_question` surfaces typed (prompt/allowMultiple read), and the answer goes back as `answered` with the option ids.
 /// Antigravity's ACP server asks through an `interaction_*` permission
 /// whose options are the choices: it surfaces as a question, never as a
-/// tool or a permission, and the answer is the chosen option id.
+/// tool or a permission, and the answer is the chosen option id. Another
+/// agent's `interaction_*` tool is an ordinary tool and permission.
 #[tokio::test]
 async fn interaction_permissions_are_questions() {
     let (session, mut events) = open(&[]).await;
+    session.prompt("interaction-question").await.unwrap();
+    let mut saw = (false, false);
+    loop {
+        let event = next(&mut events).await;
+        match event.kind {
+            EventKind::RequestOpened(Request::Permission(request)) => {
+                saw.0 = true;
+                session.answer(request.id, allow()).await.unwrap();
+            }
+            EventKind::RequestOpened(other) => panic!("a question on a plain agent: {other:?}"),
+            EventKind::ToolUpdated(tool) if tool.id.as_str() == "interaction_1" => saw.1 = true,
+            EventKind::TurnEnded { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(saw, (true, true), "(permission, tool) on a plain agent");
+    session.close().await.unwrap();
+
+    let (session, mut events) = open(&["--antigravity"]).await;
     session.prompt("interaction-question").await.unwrap();
     let mut text = String::new();
     loop {

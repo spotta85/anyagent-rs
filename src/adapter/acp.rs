@@ -109,6 +109,7 @@ impl Adapter for AcpAdapter {
             login,
             first_class_model,
             kiro,
+            antigravity,
             prompt_media,
             estimate,
         } = match handshake.await {
@@ -159,6 +160,7 @@ impl Adapter for AcpAdapter {
                 configs: Vec::new(),
                 first_class_model,
                 kiro,
+                antigravity,
                 prompt_media,
                 estimate,
                 usage_chars: 0,
@@ -191,6 +193,7 @@ struct Handshake {
     login: Vec<LoginMethod>,
     first_class_model: bool,
     kiro: bool,
+    antigravity: bool,
     prompt_media: PromptMedia,
     /// A new cursor session: context usage is estimated (it sends none).
     estimate: bool,
@@ -300,6 +303,7 @@ async fn handshake(
     let first_class_model =
         first_class_models.is_some_and(|models| apply_first_class_models(&mut info, &models));
     let kiro = is_kiro(&init);
+    let antigravity = is_antigravity(&init);
     let prompt_media = PromptMedia {
         audio: init.agent_capabilities.prompt_capabilities.audio,
         embedded_context: init.agent_capabilities.prompt_capabilities.embedded_context,
@@ -353,9 +357,17 @@ async fn handshake(
         login,
         first_class_model,
         kiro,
+        antigravity,
         prompt_media,
         estimate,
     })
+}
+
+/// Google's Antigravity server asks questions as `interaction_*` permissions.
+fn is_antigravity(init: &acp::InitializeResponse) -> bool {
+    init.agent_info
+        .as_ref()
+        .is_some_and(|i| i.name == "antigravity-acp")
 }
 
 /// Kiro is the one ACP agent with a prompt-driven effort switch.
@@ -899,6 +911,9 @@ struct Drive {
     first_class_model: bool,
     /// The agent is kiro: `effort` selections ride a `/effort` prompt.
     kiro: bool,
+    /// The agent is Antigravity's server: its `interaction_*` permission
+    /// requests are questions (see `QuestionWire::Interaction`).
+    antigravity: bool,
     /// Which inlined media the agent takes in prompts, from `initialize`.
     prompt_media: PromptMedia,
     /// A new cursor session: context usage is estimated (it sends none).
@@ -1192,8 +1207,8 @@ impl Drive {
             }),
             // An interaction is a question, surfaced by its permission
             // request alone; the tool call around it is wire noise.
-            U::ToolCall(call) if is_interaction(&call.tool_call_id.0) => None,
-            U::ToolCallUpdate(update) if is_interaction(&update.tool_call_id.0) => None,
+            U::ToolCall(call) if self.is_interaction(&call.tool_call_id.0) => None,
+            U::ToolCallUpdate(update) if self.is_interaction(&update.tool_call_id.0) => None,
             U::ToolCall(call) => {
                 let tool = fresh_tool(call);
                 self.tools.insert(tool.id.as_str().to_owned(), tool.clone());
@@ -1316,7 +1331,7 @@ impl Drive {
                         .await;
                 }
             };
-        if is_interaction(&request.tool_call.tool_call_id.0)
+        if self.is_interaction(&request.tool_call.tool_call_id.0)
             && !request.options.is_empty()
             && request
                 .options
@@ -1350,6 +1365,12 @@ impl Drive {
                 }),
             )))
             .await
+    }
+
+    /// Antigravity's `interaction_*` tool calls are its questions; any
+    /// other agent's ids are opaque.
+    fn is_interaction(&self, tool_call_id: &str) -> bool {
+        self.antigravity && tool_call_id.starts_with("interaction_")
     }
 
     /// Antigravity's question (see `QuestionWire::Interaction`): the title
@@ -2085,11 +2106,6 @@ fn cancelled_question(wire: QuestionWire) -> Value {
         QuestionWire::Grok => json!({ "outcome": "cancelled" }),
         _ => json!({ "outcome": { "outcome": "cancelled" } }),
     }
-}
-
-/// Antigravity's `interaction_*` tool-call ids mark its questions.
-fn is_interaction(tool_call_id: &str) -> bool {
-    tool_call_id.starts_with("interaction_")
 }
 
 /// Antigravity's accepted answer: the one chosen option, as the permission

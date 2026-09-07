@@ -27,6 +27,8 @@ const grokModels = () => ({ currentModelId: grokModel, availableModels: [
   { modelId: 'grok-basic', name: 'Grok Basic' },
 ] });
 const kiroMetadata = (sessionId) => send({ jsonrpc: '2.0', method: '_kiro.dev/metadata', params: { sessionId, contextUsagePercentage: 0.5, effort } });
+// --antigravity: the Antigravity server's agentInfo name, which turns its
+// `interaction_*` permissions into questions.
 // --cursor state: the selected model and its own options (shapes recorded
 // from cursor-agent 2026.09.02 with parameterizedModelPicker).
 let authed = false, cursorModel = 'default', cursorOpts = { fast: 'true', thinking: 'true', context: '300k', effort: 'high' };
@@ -74,7 +76,7 @@ async function onRequest(m) {
         : [{ id: 'fixture-login', name: 'Log in', type: 'terminal', args: ['auth', 'login'] }];
       // The cursor shape: no agentInfo, no steering, an agent-driven method.
       if (flag('--cursor')) return reply({ protocolVersion: 1, agentCapabilities: { loadSession: true, promptCapabilities: { image: true }, mcpCapabilities: { http: true, sse: true } }, authMethods: [{ id: 'cursor_login', name: 'Cursor Login', description: "Run 'agent login' first if not logged in." }] });
-      return reply({ protocolVersion: 1, agentCapabilities: { loadSession: !flag('--no-load'), promptCapabilities: { image: true, audio: flag('--media'), embeddedContext: flag('--media') }, mcpCapabilities: { http: true, sse: false }, _meta: { steering: { supported: true } } }, authMethods, agentInfo: { name: flag('--kiro') ? 'Kiro CLI Agent' : 'fixture', version: '0.0.1' }, _meta: { vendor: 'spike' } });
+      return reply({ protocolVersion: 1, agentCapabilities: { loadSession: !flag('--no-load'), promptCapabilities: { image: true, audio: flag('--media'), embeddedContext: flag('--media') }, mcpCapabilities: { http: true, sse: false }, _meta: { steering: { supported: true } } }, authMethods, agentInfo: { name: flag('--kiro') ? 'Kiro CLI Agent' : flag('--antigravity') ? 'antigravity-acp' : 'fixture', version: '0.0.1' }, _meta: { vendor: 'spike' } });
     }
     // --auth-adopt: the antigravity ACP server shape — no auth choice of its
     // own until `authenticate` picks one, which adopts an existing login.

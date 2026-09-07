@@ -240,13 +240,25 @@ async fn mode_switches_live() {
             .find(|v| Some(ConfigValue::Text(v.clone())) != mode.current)
             .expect("a mode other than the current one");
         session.configure("mode", target.as_str()).await.unwrap();
-        while option(&session).and_then(|o| o.current) != Some(ConfigValue::Text(target.clone())) {
+        let switched = |info: &anyagent::SessionInfo| {
+            info.configuration
+                .options
+                .get(&anyagent::ConfigId::new("mode"))
+                == Some(&ConfigValue::Text(target.clone()))
+        };
+        // The switch must arrive as an event, not only in the snapshot.
+        let mut announced = false;
+        while !announced {
             let event = next(&mut events, "mode switch").await;
             assert!(
                 !matches!(event.kind, EventKind::TextDelta { .. }),
                 "{h}: a switch leaked text"
             );
+            if let EventKind::SessionUpdated(info) = &event.kind {
+                announced = switched(info);
+            }
         }
+        assert!(switched(&session.info()), "{h}: snapshot lags the event");
         session
             .prompt("Reply with just the word ok.")
             .await
@@ -285,7 +297,7 @@ async fn attachments_reach_the_model() {
         session
             .prompt(
                 Input::text("What colour is the attached image? Reply with one word.")
-                    .attach(fixtures.join("red.png")),
+                    .attach(fixtures.join("image.png")),
             )
             .await
             .unwrap();
