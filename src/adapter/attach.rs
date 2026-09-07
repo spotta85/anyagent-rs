@@ -110,7 +110,7 @@ fn sniff(bytes: &[u8]) -> Option<(Media, &'static str)> {
         // ID3 tag, or a bare frame: 11 sync bits, any MPEG version, layer
         // III, with or without CRC (FB, FA, F3, F2, E3, E2).
         [b'I', b'D', b'3', ..] => (Audio, "audio/mpeg"),
-        [0xFF, b, ..] if b & 0xE6 == 0xE2 => (Audio, "audio/mpeg"),
+        [0xFF, b, ..] if b & 0xE6 == 0xE2 && b & 0x18 != 0x08 => (Audio, "audio/mpeg"),
         [b'O', b'g', b'g', b'S', ..] => (Audio, "audio/ogg"),
         [b'f', b'L', b'a', b'C', ..] => (Audio, "audio/flac"),
         [_, _, _, _, b'f', b't', b'y', b'p', b'M', b'4', b'A', ..] => (Audio, "audio/mp4"),
