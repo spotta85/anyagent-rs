@@ -110,10 +110,13 @@ async fn build_roster() -> Roster {
         .collect();
 
     let report = Runtime::new().discover().await;
+    // The CLI is always `agy`; the upgrade is the server binary. Checking
+    // the name also covers ANYAGENT_ANTIGRAVITY_BIN pinning the CLI while
+    // the server is installed.
     let _ = HEADLESS_AGY.set(
         report
             .require("antigravity")
-            .map(|a| a.upgrade.is_some())
+            .map(|a| a.executable_path.file_name().is_some_and(|n| n == "agy"))
             .unwrap_or(false),
     );
     let mut installed = Vec::new();
