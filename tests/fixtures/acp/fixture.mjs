@@ -175,7 +175,9 @@ async function runTurn(m) {
   // Cursor extensions (shapes from docs.cursor.com/cli/acp; every one
   // arrives as a request with an id on 2026.09.02).
   if (ptext.includes('cursor-question')) {
-    const q = await request('cursor/ask_question', { toolCallId: 'call_q', title: 'Need input', questions: [{ id: 'color', prompt: 'Red or blue?', options: [{ id: 'r', label: 'Red' }, { id: 'b', label: 'Blue' }], allowMultiple: false }] });
+    // `cursor-question-free`: no options, so the answer is free text.
+    const options = ptext.includes('free') ? [] : [{ id: 'r', label: 'Red' }, { id: 'b', label: 'Blue' }];
+    const q = await request('cursor/ask_question', { toolCallId: 'call_q', title: 'Need input', questions: [{ id: 'color', prompt: 'Red or blue?', options, allowMultiple: false }] });
     notify(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `q=${JSON.stringify(q.result?.outcome ?? 'error')} ` } });
     done('end_turn');
     return;

@@ -94,7 +94,8 @@ impl Adapter for AcpAdapter {
             HANDSHAKE_TIMEOUT,
             handshake(&mut wire, &request, open_auth_kind),
         );
-        let (mut info, session_id, login, first_class_model, kiro, cursor) = match handshake.await {
+        let (mut info, session_id, login, first_class_model, kiro, estimate) = match handshake.await
+        {
             Ok(Ok(ok)) => ok,
             Ok(Err(e)) => {
                 // Shutdown first: it joins the stderr reader, so the tail is
@@ -141,7 +142,7 @@ impl Adapter for AcpAdapter {
                 configs: Vec::new(),
                 first_class_model,
                 kiro,
-                estimate: cursor,
+                estimate,
                 usage_chars: 0,
                 todos: Vec::new(),
                 effort_id: None,
@@ -168,7 +169,7 @@ impl Adapter for AcpAdapter {
 /// with the auth code becomes `AuthRequired` with runnable login methods;
 /// the same methods ride along for auth failures later in the session.
 /// Returns the info, session id, login methods, and the first-class-model,
-/// kiro, and cursor flags.
+/// kiro, and usage-estimate flags.
 async fn handshake(
     wire: &mut Wire,
     request: &ConnectRequest,
@@ -190,6 +191,9 @@ async fn handshake(
         .map_err(|e| e.into_error(&[], &request.installation.executable_path))?;
     let init: acp::InitializeResponse = parse(init, "initialize response")?;
     let cursor = is_cursor(&init);
+    // A resumed cursor session carries history the wire never replays, so
+    // there is no baseline to estimate usage from: no estimate at all.
+    let estimate = cursor && matches!(request.options.start, SessionStart::New);
     // Cursor refuses every session call until `authenticate` has read its
     // keychain login (0.8–7s, probed 2026-09-07).
     if cursor {
@@ -294,7 +298,7 @@ async fn handshake(
         .iter()
         .filter_map(|m| login_method(m, &request.installation.executable_path))
         .collect();
-    Ok((info, session_id, login, first_class_model, kiro, cursor))
+    Ok((info, session_id, login, first_class_model, kiro, estimate))
 }
 
 /// Kiro is the one ACP agent with a prompt-driven effort switch.
@@ -385,6 +389,21 @@ fn replace_config_options(
     if kiro {
         sync_effort(info);
     }
+}
+
+/// Characters a prompt costs for the usage estimate: its text (attachment
+/// refs included) plus a flat allowance per inlined image (~1.5k tokens).
+fn prompt_chars(blocks: &Value) -> usize {
+    const IMAGE_CHARS: usize = 6_000;
+    blocks
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|b| match b["type"].as_str() {
+            Some("image") => IMAGE_CHARS,
+            _ => b["text"].as_str().map_or(0, str::len),
+        })
+        .sum()
 }
 
 /// Cursor's `context` option value ("300k", "1m") as a token count.
@@ -801,7 +820,7 @@ struct Drive {
     first_class_model: bool,
     /// The agent is kiro: `effort` selections ride a `/effort` prompt.
     kiro: bool,
-    /// The agent is cursor: context usage is estimated (it sends none).
+    /// A new cursor session: context usage is estimated (it sends none).
     estimate: bool,
     /// Characters that crossed the wire this session, for the estimate.
     usage_chars: usize,
@@ -855,14 +874,15 @@ impl Drive {
         match cmd {
             DriverCommand::StartTurn { input } => {
                 self.events.send(DriverEvent::TurnAck).await?;
-                self.usage_chars += input.as_text().len();
                 // `_meta.promptId` lets grok's prompt-complete extension name
                 // this exact prompt; spec-conformant agents ignore `_meta`.
                 self.prompt_seq += 1;
                 let pid = format!("p{}", self.prompt_seq);
+                let blocks = self.prompt_blocks(&input).await?;
+                self.usage_chars += prompt_chars(&blocks);
                 let params = json!({
                     "sessionId": self.session_id,
-                    "prompt": self.prompt_blocks(&input).await?,
+                    "prompt": blocks,
                     "_meta": { "promptId": pid, "requestId": pid },
                 });
                 // One prompt on the wire at a time: a turn that lands while
@@ -1255,7 +1275,7 @@ impl Drive {
                 .await;
         };
         self.advertise(Capability::Questions).await?;
-        let questions = list.iter().map(typed_question).collect();
+        let questions = list.iter().map(|q| typed_question(q, cursor)).collect();
         let id = RequestId::new(format!("r{wire_id}"));
         self.questions.insert(
             id.clone(),
@@ -1842,8 +1862,9 @@ fn option_for(choice: PermissionChoice, options: &[(PermissionChoice, String)]) 
 
 /// One raw question object as the typed [`Question`]: grok's
 /// `question`/`multiSelect` or cursor's `prompt`/`allowMultiple`. Ids fall
-/// back to the question/label text (grok marks them optional).
-fn typed_question(q: &Value) -> Question {
+/// back to the question/label text (grok marks them optional). A cursor
+/// question without options takes free text (it rides as the option id).
+fn typed_question(q: &Value, cursor: bool) -> Question {
     let text = q["question"]
         .as_str()
         .or(q["prompt"].as_str())
@@ -1872,7 +1893,7 @@ fn typed_question(q: &Value) -> Question {
             .as_bool()
             .or(q["allowMultiple"].as_bool())
             .unwrap_or(false),
-        allows_free_text: false,
+        allows_free_text: cursor && q["options"].as_array().is_none_or(Vec::is_empty),
     }
 }
 

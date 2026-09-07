@@ -1642,4 +1642,104 @@ async fn cursor_context_usage_is_estimated_and_labelled() {
     let (_, window, _) = usage_after_turn(&session, &mut events).await;
     assert_eq!(window, Some(300_000));
     session.close().await.unwrap();
+
+    // An inlined image counts a flat allowance; a resumed session has no
+    // baseline for what came before, so it estimates nothing.
+    let dir = std::env::temp_dir().join(format!("anyagent-cursor-att-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("shot.png"), b"\x89PNG\r\n\x1a\ndata").unwrap();
+    let (session, mut events) = runtime
+        .open(
+            &cursor("usage-image", ""),
+            SessionOptions::in_dir(std::env::temp_dir()),
+        )
+        .await
+        .unwrap();
+    session
+        .prompt(Input::text("hi").attach(dir.join("shot.png")))
+        .await
+        .unwrap();
+    let mut used = 0;
+    loop {
+        let event = next(&mut events).await;
+        match event.kind {
+            EventKind::RequestOpened(request) => {
+                session.answer(request.id(), allow()).await.unwrap()
+            }
+            EventKind::ContextUsage { used_tokens, .. } => used = used_tokens,
+            EventKind::TurnEnded { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(used >= 1_500, "image allowance missing: {used}");
+    let token = session.info().resume_token.unwrap();
+    session.close().await.unwrap();
+
+    let (session, mut events) = runtime
+        .open(
+            &cursor("usage-resume", ""),
+            SessionOptions::in_dir(std::env::temp_dir()).resume(token),
+        )
+        .await
+        .unwrap();
+    session.prompt("hi").await.unwrap();
+    loop {
+        let event = next(&mut events).await;
+        match event.kind {
+            EventKind::RequestOpened(request) => {
+                session.answer(request.id(), allow()).await.unwrap()
+            }
+            EventKind::ContextUsage { .. } => panic!("a resumed session must not estimate"),
+            EventKind::TurnEnded { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(
+        !session
+            .info()
+            .details
+            .capabilities
+            .supports(Capability::ContextUsage)
+    );
+    session.close().await.unwrap();
+}
+
+/// A cursor question without options takes free text, which rides back as the option id.
+#[tokio::test]
+async fn cursor_optionless_questions_take_free_text() {
+    let runtime = Runtime::new();
+    let (session, mut events) = runtime
+        .open(
+            &cursor("question-free", ""),
+            SessionOptions::in_dir(std::env::temp_dir()),
+        )
+        .await
+        .unwrap();
+    session.prompt("cursor-question-free").await.unwrap();
+    let mut text = String::new();
+    loop {
+        let event = next(&mut events).await;
+        match event.kind {
+            EventKind::RequestOpened(Request::Question(request)) => {
+                let q = &request.questions[0];
+                assert!(q.choices.is_empty());
+                assert!(q.allows_free_text);
+                session
+                    .answer(
+                        request.id,
+                        Answer::Question(vec![QuestionAnswer::Text("purple".into())]),
+                    )
+                    .await
+                    .unwrap();
+            }
+            EventKind::TextDelta { text: t, .. } => text.push_str(&t),
+            EventKind::TurnEnded { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        text,
+        r#"q={"outcome":"answered","answers":[{"questionId":"color","selectedOptionIds":["purple"]}]} "#
+    );
+    session.close().await.unwrap();
 }

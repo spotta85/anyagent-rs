@@ -66,7 +66,8 @@ markdown, `update_todos` drives the plan, `task` marks a subagent tool
 (header only, no transcript). Cursor reports no context usage, so every turn
 ends with an estimate from what crossed the wire (4 chars ≈ 1 token),
 labelled `anyagent/estimated` in the event's extensions; the window is the
-model's `context` option when it has one.
+model's `context` option when it has one. A resumed session gets no estimate,
+since Cursor replays none of its history.
 </Note>
 
 <Note>
