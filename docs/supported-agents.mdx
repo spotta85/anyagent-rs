@@ -62,8 +62,9 @@ plans are plain ACP. A model switch adopts that model's own options
 (`effort`, `fast`, `thinking`, `context`) from the config response; Auto has
 none. Cursor's extension requests are answered: `ask_question` is a
 `Question` request, `create_plan` is accepted and surfaced raw with its
-markdown, `update_todos` drives the plan, `task` marks a subagent tool
-(header only, no transcript). Cursor reports no context usage, so every turn
+markdown, `update_todos` drives the plan, `task` (a subagent run) is
+acknowledged and surfaced raw as a header only, with no transcript and no
+nested events. Cursor reports no context usage, so every turn
 ends with an estimate from what crossed the wire (4 chars ≈ 1 token),
 labelled `anyagent/estimated` in the event's extensions; the window is the
 model's `context` option when it has one. A resumed session gets no estimate,

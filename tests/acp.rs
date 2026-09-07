@@ -1470,7 +1470,7 @@ async fn cursor_questions_round_trip_in_cursors_shape() {
     session.close().await.unwrap();
 }
 
-/// `cursor/update_todos` becomes the plan (merge honoured), `cursor/task` is a subagent tool and is acknowledged, image generation is declined; none is answered "method not found".
+/// `cursor/update_todos` becomes the plan (merge honoured), `cursor/task` is acknowledged (a named tool, not a nested subagent), image generation is declined; none is answered "method not found".
 #[tokio::test]
 async fn cursor_todos_task_and_image_requests_are_answered() {
     let runtime = Runtime::new();
@@ -1523,7 +1523,7 @@ async fn cursor_todos_task_and_image_requests_are_answered() {
     );
     assert_eq!(
         task_kind,
-        Some((anyagent::ToolKind::Subagent, "task".to_string()))
+        Some((anyagent::ToolKind::Other, "task".to_string()))
     );
     assert!(
         surfaced.contains(&"cursor/task".to_string()),
