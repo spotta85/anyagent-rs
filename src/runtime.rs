@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::adapter::{Adapter, ConnectRequest};
 use crate::agent::{
     AgentDetails, AgentId, AgentInstallation, AuthStatus, Capabilities, Capability, Input,
-    PermissionMode, SessionOptions, SessionStart,
+    InstallationSource, PermissionMode, SessionOptions, SessionStart,
 };
 use crate::error::AgentError;
 use crate::event::{
@@ -67,8 +67,9 @@ impl Runtime {
                 Connection::Native(NativeKind::Opencode) => {
                     Arc::new(crate::adapter::opencode::OpencodeAdapter::new())
                 }
-                // Antigravity's wire is unvalidated (ticket 05); no driver yet.
-                Connection::Native(NativeKind::Antigravity) => continue,
+                Connection::Native(NativeKind::Antigravity) => Arc::new(
+                    crate::adapter::antigravity::AntigravityAdapter::new(profile),
+                ),
             };
             adapters.insert(AgentId::new(profile.id), adapter);
         }
@@ -92,7 +93,6 @@ impl Runtime {
     /// The real catalog is not scanned.
     #[cfg(any(test, feature = "mock"))]
     pub(crate) fn with_test_adapter(adapter: impl Adapter + 'static) -> Self {
-        use crate::agent::InstallationSource;
         let id = AgentId::new("mock");
         let mut runtime = Self::new();
         runtime.profiles = &[];
@@ -103,6 +103,7 @@ impl Runtime {
             executable_path: PathBuf::from("mock"),
             source: InstallationSource::Pinned,
             auth: None,
+            upgrade: None,
             acp_args: None,
         });
         runtime
@@ -132,10 +133,19 @@ impl Runtime {
         agent: &AgentInstallation,
         options: SessionOptions,
     ) -> Result<(Session, Events), AgentError> {
-        // An explicit `AgentInstallation::acp` drives ACP even for a catalog
-        // agent with a native adapter; otherwise the catalog adapter.
+        // ACP args drive ACP even for a catalog agent with a native adapter:
+        // an explicit `AgentInstallation::acp`, or discovery having found the
+        // agent's ACP upgrade. Only the discovered one keeps the catalog's
+        // auth facts; a pinned ad-hoc install named like a catalog agent is
+        // still ad-hoc.
+        let profile = (agent.source != InstallationSource::Pinned)
+            .then(|| self.profiles.iter().find(|p| p.id == agent.id.as_str()))
+            .flatten();
         let adapter: Arc<dyn Adapter> = match (self.adapters.get(&agent.id), &agent.acp_args) {
-            (_, Some(args)) => Arc::new(crate::adapter::acp::AcpAdapter::new(args.clone())),
+            (_, Some(args)) => Arc::new(crate::adapter::acp::AcpAdapter::with_args(
+                profile,
+                args.clone(),
+            )),
             (Some(adapter), None) => Arc::clone(adapter),
             (None, None) => {
                 return Err(AgentError::ProtocolFailed(format!(
@@ -589,59 +599,169 @@ mod tests {
     // The lock deliberately spans the awaits: it serializes tests that
     // mutate process-wide HOME/PATH.
     #[allow(clippy::await_holding_lock)]
-    async fn discover_hides_agents_without_adapter() {
+    async fn discover_prefers_the_upgrade_and_names_it_when_missing() {
         let _guard = env_lock().lock().unwrap();
-        // `antigravity` has no adapter; even if its `agy` binary is on disk
-        // it must not appear as usable.
         let home = tempfile::tempdir().unwrap();
         let bin = home.path().join(".local/bin");
         make_exe(&bin, "agy");
-        // Also create a supported agent so the scan has something to find.
-        make_exe(&bin, "claude");
+        // The fixture wrappers exec `node`, so the real PATH stays behind
+        // the fake bin.
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![bin.clone()];
+        paths.extend(std::env::split_paths(&path));
+        let _env = EnvGuard::set(&[
+            ("HOME", home.path().as_os_str().to_owned()),
+            ("PATH", std::env::join_paths(paths).unwrap()),
+        ]);
 
-        let orig_home = std::env::var_os("HOME");
-        let orig_path = std::env::var_os("PATH");
-        unsafe {
-            std::env::set_var("HOME", home.path());
-            std::env::set_var("PATH", bin.to_string_lossy().to_string());
-        }
-
-        // Raw discovery (no filtering) would find `agy`.
-        let raw = crate::discovery::discover(crate::catalog::PROFILES).await;
+        // Only the CLI: it is the installation, and the ACP server is the
+        // named upgrade with its own install hint.
+        let report = Runtime::new().discover().await;
+        let agent = report.require("antigravity").unwrap();
+        assert_eq!(agent.executable_path, bin.join("agy"));
+        assert!(agent.acp_args.is_none());
+        let upgrade = agent.upgrade.as_ref().expect("upgrade named");
+        assert_eq!(upgrade.name, "Antigravity ACP server");
+        assert!(upgrade.install_hint.contains("antigravity-acp"));
         assert!(
-            raw.agents.iter().any(|a| a.id.as_str() == "antigravity"),
-            "raw discover should find agy when present"
+            upgrade
+                .searched
+                .contains(&home.path().join(".local/agy-acp-server"))
         );
 
-        // Runtime::discover hides it.
-        let runtime = Runtime::new();
-        let report = runtime.discover().await;
-        assert!(
-            !report.agents.iter().any(|a| a.id.as_str() == "antigravity"),
-            "antigravity must not appear as usable"
+        // The server installed: it wins, over ACP, with nothing left to add.
+        let server = make_exe(
+            &home.path().join(".local/agy-acp-server"),
+            "agy_acp_server.par",
         );
-        assert!(
-            !report
-                .missing
-                .iter()
-                .any(|m| m.id.as_str() == "antigravity"),
-            "antigravity must not appear as missing either"
-        );
-        assert!(
-            report.agents.iter().any(|a| a.id.as_str() == "claude"),
-            "supported agents still appear"
-        );
+        let report = Runtime::new().discover().await;
+        let agent = report.require("antigravity").unwrap();
+        assert_eq!(agent.executable_path, server);
+        assert_eq!(agent.acp_args.as_deref(), Some(&[][..]));
+        assert!(agent.upgrade.is_none());
 
-        unsafe {
-            if let Some(v) = orig_home {
-                std::env::set_var("HOME", v);
-            } else {
-                std::env::remove_var("HOME");
+        // Opening it goes through the ACP adapter with the catalog's facts:
+        // the server refuses `session/new` until `authenticate` adopts the
+        // CLI's login, and the handshake does that itself.
+        let fixture =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/acp/fixture.mjs");
+        std::fs::write(
+            &server,
+            format!(
+                "#!/bin/sh\nexec node '{}' --auth-adopt \"$@\"\n",
+                fixture.display()
+            ),
+        )
+        .unwrap();
+        let (session, _events) = Runtime::new()
+            .open(agent, SessionOptions::in_dir(home.path()))
+            .await
+            .expect("open adopts the login");
+        let info = session.info();
+        assert!(matches!(
+            info.details.auth,
+            AuthStatus::Authenticated {
+                kind: crate::agent::AuthKind::Subscription,
+                ..
             }
-            if let Some(v) = orig_path {
-                std::env::set_var("PATH", v);
-            } else {
-                std::env::remove_var("PATH");
+        ));
+        assert!(info.details.capabilities.supports(Capability::Permissions));
+        session.close().await.unwrap();
+
+        // Refused for good (the server's capitalised "Authentication
+        // required", no runnable method of its own): typed, and the login
+        // it names is the CLI's TUI, not the server.
+        std::fs::write(
+            &server,
+            format!(
+                "#!/bin/sh\nexec node '{}' --auth-required --capitalized-auth --no-auth-methods \"$@\"\n",
+                fixture.display()
+            ),
+        )
+        .unwrap();
+        let err = Runtime::new()
+            .open(agent, SessionOptions::in_dir(home.path()))
+            .await
+            .err()
+            .expect("refused");
+        let AgentError::AuthRequired { login } = err else {
+            panic!("expected AuthRequired, got {err:?}");
+        };
+        assert!(
+            matches!(&login[0], crate::agent::LoginMethod::Terminal { command, .. } if command == &["agy"]),
+            "{login:?}"
+        );
+    }
+
+    #[tokio::test]
+    // The lock deliberately spans the awaits: it serializes tests that
+    // mutate process-wide HOME/PATH.
+    #[allow(clippy::await_holding_lock)]
+    async fn env_override_to_the_cli_still_names_a_missing_upgrade() {
+        let _guard = env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join(".local/bin");
+        let agy = make_exe(&bin, "agy");
+        // The fixture wrappers exec `node`, so the real PATH stays behind
+        // the fake bin.
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![bin.clone()];
+        paths.extend(std::env::split_paths(&path));
+        let _env = EnvGuard::set(&[
+            ("HOME", home.path().as_os_str().to_owned()),
+            ("PATH", std::env::join_paths(paths).unwrap()),
+            ("ANYAGENT_ANTIGRAVITY_BIN", agy.as_os_str().to_owned()),
+        ]);
+
+        // The override pins the CLI, but the missing server still rides
+        // along as installation guidance.
+        let report = Runtime::new().discover().await;
+        let agent = report.require("antigravity").unwrap();
+        assert_eq!(agent.executable_path, agy);
+        assert!(agent.acp_args.is_none());
+        let upgrade = agent.upgrade.as_ref().expect("upgrade named");
+        assert_eq!(upgrade.name, "Antigravity ACP server");
+
+        // The server installed: the override still forces headless, and
+        // there is nothing missing left to name.
+        make_exe(
+            &home.path().join(".local/agy-acp-server"),
+            "agy_acp_server.par",
+        );
+        let report = Runtime::new().discover().await;
+        let agent = report.require("antigravity").unwrap();
+        assert_eq!(agent.executable_path, agy);
+        assert!(agent.acp_args.is_none());
+        assert!(agent.upgrade.is_none());
+    }
+
+    /// Process-wide env vars set for one test and restored on drop, so a
+    /// failed assertion cannot leak them into the next test.
+    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvGuard {
+        fn set(vars: &[(&'static str, std::ffi::OsString)]) -> Self {
+            let saved = vars
+                .iter()
+                .map(|(name, value)| {
+                    let orig = std::env::var_os(name);
+                    unsafe { std::env::set_var(name, value) };
+                    (*name, orig)
+                })
+                .collect();
+            Self(saved)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, orig) in self.0.drain(..) {
+                unsafe {
+                    match orig {
+                        Some(v) => std::env::set_var(name, v),
+                        None => std::env::remove_var(name),
+                    }
+                }
             }
         }
     }

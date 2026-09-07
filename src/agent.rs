@@ -63,6 +63,11 @@ pub struct AgentInstallation {
     pub executable_path: PathBuf,
     pub source: InstallationSource,
     pub auth: Option<AuthStatus>,
+    /// A richer runtime for this agent that is not installed (Antigravity's
+    /// ACP server). `open` works without it with fewer capabilities; the
+    /// record says what to install to get the rest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade: Option<crate::runtime::MissingAgent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) acp_args: Option<Vec<String>>,
 }
@@ -77,6 +82,7 @@ impl AgentInstallation {
             executable_path: executable.into(),
             source: InstallationSource::Pinned,
             auth: None,
+            upgrade: None,
             acp_args: None,
         }
     }
@@ -90,6 +96,7 @@ impl AgentInstallation {
             executable_path: executable.into(),
             source: InstallationSource::Pinned,
             auth: None,
+            upgrade: None,
             acp_args: Some(args),
         }
     }

@@ -15,6 +15,7 @@ const num = (name, dflt) => +(process.argv.find(a => a.startsWith(name + '='))?.
 const send = (m) => process.stdout.write(JSON.stringify(m) + '\n');
 const notify = (sessionId, update) => send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId, update } });
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+let adopted = null;
 let nextId = 100, pending = {}, turn = null, mcpDecl = [], effort = 'high', spurious = false;
 // --grok-models: per-model reasoning efforts in `_meta`. As on grok 1.0.4,
 // `reasoningEffort` there is a static default; the effort in force is only
@@ -73,20 +74,28 @@ async function onRequest(m) {
         : [{ id: 'fixture-login', name: 'Log in', type: 'terminal', args: ['auth', 'login'] }];
       // The cursor shape: no agentInfo, no steering, an agent-driven method.
       if (flag('--cursor')) return reply({ protocolVersion: 1, agentCapabilities: { loadSession: true, promptCapabilities: { image: true }, mcpCapabilities: { http: true, sse: true } }, authMethods: [{ id: 'cursor_login', name: 'Cursor Login', description: "Run 'agent login' first if not logged in." }] });
-      return reply({ protocolVersion: 1, agentCapabilities: { loadSession: !flag('--no-load'), promptCapabilities: { image: true }, mcpCapabilities: { http: true, sse: false }, _meta: { steering: { supported: true } } }, authMethods, agentInfo: { name: flag('--kiro') ? 'Kiro CLI Agent' : 'fixture', version: '0.0.1' }, _meta: { vendor: 'spike' } });
+      return reply({ protocolVersion: 1, agentCapabilities: { loadSession: !flag('--no-load'), promptCapabilities: { image: true, audio: flag('--media'), embeddedContext: flag('--media') }, mcpCapabilities: { http: true, sse: false }, _meta: { steering: { supported: true } } }, authMethods, agentInfo: { name: flag('--kiro') ? 'Kiro CLI Agent' : 'fixture', version: '0.0.1' }, _meta: { vendor: 'spike' } });
     }
+    // --auth-adopt: the antigravity ACP server shape — no auth choice of its
+    // own until `authenticate` picks one, which adopts an existing login.
+    // --cursor uses `authenticate` with `cursor_login` after the `about`
+    // preflight instead.
     case 'authenticate': {
-      if (!flag('--cursor')) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32601, message: 'method not found' } });
-      if (m.params.methodId !== 'cursor_login') return send({ jsonrpc: '2.0', id: m.id, error: { code: -32602, message: `Unknown authentication method: ${m.params.methodId}` } });
-      // Logged out, cursor starts a browser login and waits for it.
-      if (flag('--logged-out')) return;
-      authed = true;
+      if (flag('--cursor')) {
+        if (m.params.methodId !== 'cursor_login') return send({ jsonrpc: '2.0', id: m.id, error: { code: -32602, message: `Unknown authentication method: ${m.params.methodId}` } });
+        // Logged out, cursor starts a browser login and waits for it.
+        if (flag('--logged-out')) return;
+        authed = true;
+        return reply({});
+      }
+      if (!flag('--auth-adopt')) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32601, message: 'method not found' } });
+      adopted = m.params.methodId;
       return reply({});
     }
     case 'session/new': {
       if (flag('--cursor') && !authed) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32000, message: "Authentication required. Please run 'agent login' first, then call authenticate() with methodId 'cursor_login'." } });
       if (flag('--cursor')) return reply(cursorSession());
-      if (flag('--auth-required')) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32000, message: flag('--capitalized-auth') ? 'Authentication required' : 'authentication required' } });
+      if (flag('--auth-required') || (flag('--auth-adopt') && !adopted)) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32000, message: flag('--capitalized-auth') ? 'Authentication required' : 'authentication required' } });
       // The hermes shape: a plain internal error whose data carries the words.
       if (flag('--auth-hint-error')) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32603, message: 'Internal error', data: { details: 'No LLM provider configured. Run `fixture login` first.' } } });
       mcpDecl = m.params.mcpServers ?? [];
@@ -212,9 +221,10 @@ async function runTurn(m) {
   notify(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Hello ' } });
   if (mcpDecl.length) notify(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `mcp=${mcpDecl.map(s => `${s.type ?? 'stdio'}:${s.name}`).join(',')} ` } });
   // Echo attachments so tests can assert the wire shape.
-  const imgs = m.params.prompt.filter(b => b.type === 'image' && b.data).length;
+  const count = (type, key) => m.params.prompt.filter(b => b.type === type && b[key]).length;
+  const imgs = count('image', 'data');
   if (imgs || ptext.includes('Attached files:')) {
-    notify(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `att=${imgs} ref=1 ` } });
+    notify(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `att=${imgs} aud=${count('audio', 'data')} res=${count('resource', 'resource')} ref=1 ` } });
   }
   notify(sid, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'thinking…' } });
   notify(sid, { sessionUpdate: 'tool_call', toolCallId: 'call_1', title: 'Edit main.rs', kind: 'edit', status: 'pending', rawInput: { path: 'main.rs' }, locations: [{ path: 'main.rs', line: 3 }], content: [{ type: 'diff', path: 'main.rs', oldText: 'a', newText: 'b' }], extraVendorField: 42, _meta: { claude: { toolUseId: 'toolu_1' } } });

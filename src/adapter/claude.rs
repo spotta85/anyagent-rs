@@ -399,7 +399,7 @@ fn account_status(account: &Value, request: &ConnectRequest) -> AuthStatus {
             };
         }
         return AuthStatus::Unauthenticated {
-            login: login_methods(&request.installation),
+            login: login_methods(&request.installation, Some(&request.options)),
         };
     }
     request
@@ -760,7 +760,7 @@ impl Drive {
         // A synthetic API-error message with the typed auth marker means the
         // credentials died; the engine fails the turn and closes the session.
         if frame["error"].as_str() == Some("authentication_failed")
-            && let login = login_methods(&self.request.installation)
+            && let login = login_methods(&self.request.installation, Some(&self.request.options))
             && !login.is_empty()
         {
             return self.events.send(DriverEvent::AuthLost { login }).await;
@@ -1303,14 +1303,14 @@ impl Drive {
         } else {
             let mut blocks: Vec<Value> = loaded
                 .iter()
-                .filter_map(|l| l.image.as_ref())
+                .filter_map(|l| l.image())
                 .map(|image| {
                     json!({
                         "type": "image",
                         "source": {
                             "type": "base64",
                             "media_type": image.mime,
-                            "data": image.base64,
+                            "data": image.base64(),
                         },
                     })
                 })

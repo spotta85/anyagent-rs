@@ -55,7 +55,7 @@ fn catalog_wrapper(agent: &str, name: &str, flags: &str) -> AgentInstallation {
     std::fs::write(
         &path,
         format!(
-            "#!/bin/sh\nexec node {} {flags} \"$@\"\n",
+            "#!/bin/sh\nexec node '{}' {flags} \"$@\"\n",
             fixture.display()
         ),
     )
@@ -289,9 +289,51 @@ async fn attachments_inline_images_and_reference_paths() {
             _ => {}
         }
     }
-    // One inlined image; pdf and the unreadable file ride as path refs.
-    assert!(text.contains("att=1 ref=1"), "wire shape wrong: {text:?}");
+    // One inlined image; the pdf (not advertised) and the unreadable file
+    // ride as path refs only.
+    assert!(
+        text.contains("att=1 aud=0 res=0 ref=1"),
+        "wire shape wrong: {text:?}"
+    );
     assert_eq!(unreadable, 1);
+    session.close().await.unwrap();
+}
+
+/// Audio and PDF attachments ride as `audio` and embedded `resource` blocks
+/// once the agent advertises those prompt capabilities.
+#[tokio::test]
+async fn attachments_inline_audio_and_pdf_when_advertised() {
+    let dir = std::env::temp_dir().join(format!("anyagent-att-media-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("shot.png"), b"\x89PNG\r\n\x1a\ndata").unwrap();
+    std::fs::write(dir.join("voice.wav"), b"RIFF\x00\x00\x00\x00WAVEfmt data").unwrap();
+    std::fs::write(dir.join("report.pdf"), b"%PDF-1.7 data").unwrap();
+    let (session, mut events) = open(&["--media"]).await;
+    session
+        .prompt(
+            Input::text("listen")
+                .attach(dir.join("shot.png"))
+                .attach(dir.join("voice.wav"))
+                .attach(dir.join("report.pdf")),
+        )
+        .await
+        .unwrap();
+    let mut text = String::new();
+    loop {
+        let event = next(&mut events).await;
+        match event.kind {
+            EventKind::TextDelta { text: t, .. } => text.push_str(&t),
+            EventKind::RequestOpened(request) => {
+                session.answer(request.id(), allow()).await.unwrap()
+            }
+            EventKind::TurnEnded { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(
+        text.contains("att=1 aud=1 res=1 ref=1"),
+        "wire shape wrong: {text:?}"
+    );
     session.close().await.unwrap();
 }
 

@@ -121,7 +121,7 @@ impl Adapter for CodexAdapter {
             // Logged out: "codex account authentication required to read rate limits".
             Ok(Err(WireError::Rpc(m))) if m.contains("authentication required") => {
                 Err(AgentError::AuthRequired {
-                    login: login_methods(installation),
+                    login: login_methods(installation, None),
                 })
             }
             Ok(Err(e)) => Err(with_stderr(e.into_error(), &child)),
@@ -447,7 +447,7 @@ fn account_status(account: &Value, request: &ConnectRequest) -> AuthStatus {
             account: None,
         },
         None => AuthStatus::Unauthenticated {
-            login: login_methods(&request.installation),
+            login: login_methods(&request.installation, Some(&request.options)),
         },
     }
 }
@@ -1217,7 +1217,7 @@ impl Drive {
             return self
                 .events
                 .send(DriverEvent::AuthLost {
-                    login: login_methods(&self.request.installation),
+                    login: login_methods(&self.request.installation, Some(&self.request.options)),
                 })
                 .await;
         }
@@ -1393,7 +1393,7 @@ impl Drive {
         }
         let mut items =
             vec![json!({ "type": "text", "text": attach::with_refs(input.as_text(), &loaded) })];
-        for image in loaded.iter().filter(|l| l.image.is_some()) {
+        for image in loaded.iter().filter(|l| l.image().is_some()) {
             items.push(json!({ "type": "localImage", "path": image.path }));
         }
         Ok(items)

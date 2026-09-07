@@ -79,7 +79,7 @@ impl Adapter for OpencodeAdapter {
                 session_id: launched.session_id,
                 windows: launched.windows,
                 variants: launched.variants,
-                login: login_methods(&request.installation),
+                login: login_methods(&request.installation, Some(&request.options)),
                 scratch: TurnScratch::default(),
                 tide: String::new(),
                 cost: 0.0,
@@ -315,7 +315,7 @@ fn auth_status(request: &ConnectRequest, connected: &Value) -> AuthStatus {
     let any = connected.as_array().is_some_and(|c| !c.is_empty());
     if !any {
         return AuthStatus::Unauthenticated {
-            login: login_methods(&request.installation),
+            login: login_methods(&request.installation, Some(&request.options)),
         };
     }
     match &request.installation.auth {
@@ -750,7 +750,7 @@ impl Drive {
         if let Some((command, arguments)) =
             slash_command(&text).filter(|(name, _)| self.has_command(name))
         {
-            if loaded.iter().any(|l| l.image.is_some()) {
+            if loaded.iter().any(|l| l.image().is_some()) {
                 self.events
                     .diagnostic(
                         DiagnosticLevel::Warning,
@@ -761,11 +761,11 @@ impl Drive {
             return self.start_command(command, arguments);
         }
         let mut parts = vec![json!({ "type": "text", "text": text })];
-        for image in loaded.iter().filter_map(|l| l.image.as_ref()) {
+        for image in loaded.iter().filter_map(|l| l.image()) {
             parts.push(json!({
                 "type": "file",
                 "mime": image.mime,
-                "url": format!("data:{};base64,{}", image.mime, image.base64),
+                "url": format!("data:{};base64,{}", image.mime, image.base64()),
             }));
         }
         let mut body = json!({ "parts": parts });

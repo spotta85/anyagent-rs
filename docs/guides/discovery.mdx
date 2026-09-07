@@ -26,6 +26,19 @@ for missing in &report.missing {
 `MissingAgent` carries the install hint, so "Codex isn't installed" and "here's
 how to install it" are the same lookup.
 
+### Optional upgrades
+
+Some agents have a richer, separately installed runtime (Antigravity's ACP
+server). Discovery prefers it when found. When only the base CLI is there,
+the installation still opens, and `agent.upgrade` is the same `MissingAgent`
+shape naming what to install for the extra capabilities:
+
+```rust
+if let Some(upgrade) = &agent.upgrade {
+    println!("{}: install {} for more — {}", agent.name, upgrade.name, upgrade.install_hint);
+}
+```
+
 ### Insisting on one
 
 ```rust

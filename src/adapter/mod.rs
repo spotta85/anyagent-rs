@@ -10,6 +10,7 @@
 //! and error mapping.
 
 use std::num::NonZeroU32;
+use std::path::Path;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -18,7 +19,7 @@ use tokio::sync::mpsc;
 
 use crate::agent::{
     AgentDetails, AgentInstallation, ConfigChoice, ConfigId, ConfigKind, ConfigOption, ConfigValue,
-    Input, ResumeToken, RollbackScope, SessionConfiguration, SessionOptions,
+    Input, LoginMethod, ResumeToken, RollbackScope, SessionConfiguration, SessionOptions,
 };
 use crate::error::AgentError;
 use crate::event::{
@@ -26,6 +27,7 @@ use crate::event::{
 };
 
 pub(crate) mod acp;
+pub(crate) mod antigravity;
 pub(crate) mod attach;
 pub(crate) mod claude;
 pub(crate) mod codex;
@@ -409,13 +411,31 @@ pub(crate) fn config_home_env(
 }
 
 /// Runnable login methods from the catalog, for a logged-out handshake and
-/// for mid-session auth loss.
-pub(crate) fn login_methods(installation: &AgentInstallation) -> Vec<crate::agent::LoginMethod> {
-    crate::catalog::PROFILES
+/// for mid-session auth loss. Given the session's options they carry its
+/// config-home variable, so the login lands where the session looks.
+pub(crate) fn login_methods(
+    installation: &AgentInstallation,
+    options: Option<&SessionOptions>,
+) -> Vec<LoginMethod> {
+    let login = crate::catalog::PROFILES
         .iter()
         .find(|p| p.id == installation.id.as_str())
         .map(|p| crate::discovery::login_methods(p, &installation.executable_path))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let env = options
+        .and_then(|o| config_home_env(installation, o).ok())
+        .unwrap_or_default();
+    login_in(login, &env)
+}
+
+/// Terminal login methods with the session's config-home variable attached.
+pub(crate) fn login_in(mut login: Vec<LoginMethod>, env: &[(String, String)]) -> Vec<LoginMethod> {
+    for method in &mut login {
+        if let LoginMethod::Terminal { env: vars, .. } = method {
+            vars.extend(env.iter().cloned());
+        }
+    }
+    login
 }
 
 /// Adds the child's stderr to a handshake failure (a logged-out CLI prints
@@ -427,6 +447,65 @@ pub(crate) fn with_stderr(error: AgentError, child: &crate::process::Child) -> A
             AgentError::ProtocolFailed(format!("{message}: {stderr}"))
         }
         (error, _) => error,
+    }
+}
+
+/// Types a logged-out open as `AuthRequired` with login methods that carry
+/// the session's config-home variable. An error already typed is stamped;
+/// a failure is matched against the profile's probed fingerprints (kiro
+/// exits before speaking ACP, hermes fails session/new with a plain
+/// internal error, agy exits before `init`); anything else passes.
+pub(crate) fn auth_hinted(
+    error: AgentError,
+    profile: Option<&crate::catalog::AgentProfile>,
+    exe: &Path,
+    env: &[(String, String)],
+) -> AgentError {
+    if let AgentError::AuthRequired { login } = error {
+        return AgentError::AuthRequired {
+            login: login_in(login, env),
+        };
+    }
+    let Some(profile) = profile else { return error };
+    // Only failure shapes carry the agent's own words; other typed errors
+    // (UnsupportedFeature, …) must pass through untouched.
+    if !matches!(
+        error,
+        AgentError::ProtocolFailed(_) | AgentError::ProcessExited { .. }
+    ) {
+        return error;
+    }
+    let text = error.to_string().to_lowercase();
+    if !profile
+        .auth_error_hints
+        .iter()
+        .any(|h| text.contains(&h.to_lowercase()))
+    {
+        return error;
+    }
+    // An ACP upgrade has no login of its own: the base CLI's is the flow.
+    let exe = match &profile.upgrade {
+        Some(u) if exe.file_name().is_some_and(|n| n == u.cli) => Path::new(profile.cli),
+        _ => exe,
+    };
+    let mut login = crate::discovery::login_methods(profile, exe);
+    // No login command in the catalog (grok, agy): the agent's own TUI is
+    // the flow.
+    if !login
+        .iter()
+        .any(|m| matches!(m, LoginMethod::Terminal { .. }))
+    {
+        login.insert(
+            0,
+            LoginMethod::Terminal {
+                description: format!("{} logs in on launch; run it in a terminal", profile.name),
+                command: vec![exe.to_string_lossy().into_owned()],
+                env: std::collections::BTreeMap::new(),
+            },
+        );
+    }
+    AgentError::AuthRequired {
+        login: login_in(login, env),
     }
 }
 

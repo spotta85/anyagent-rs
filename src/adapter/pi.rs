@@ -211,7 +211,7 @@ async fn auth_status(
     env: &[(String, String)],
 ) -> AuthStatus {
     let unauthenticated = || AuthStatus::Unauthenticated {
-        login: login_methods(&request.installation),
+        login: login_methods(&request.installation, Some(&request.options)),
     };
     // No credentials anywhere means no model resolves, and pi says so.
     if provider.is_empty() || provider == "unknown" {
@@ -252,7 +252,8 @@ async fn output(exe: &Path, args: &[&str], env: &[(String, String)]) -> Option<S
         .envs(env.iter().cloned())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
     let out = tokio::time::timeout(SIDE_PROCESS_TIMEOUT, command.output())
         .await
         .ok()?
@@ -858,8 +859,8 @@ impl Drive {
         }
         let images: Vec<Value> = loaded
             .iter()
-            .filter_map(|l| l.image.as_ref())
-            .map(|image| json!({ "type": "image", "data": image.base64, "mimeType": image.mime }))
+            .filter_map(|l| l.image())
+            .map(|image| json!({ "type": "image", "data": image.base64(), "mimeType": image.mime }))
             .collect();
         let mut body = json!({ "message": attach::with_refs(input.as_text(), &loaded) });
         if !images.is_empty() {

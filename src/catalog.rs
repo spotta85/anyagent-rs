@@ -35,6 +35,23 @@ pub(crate) struct AgentProfile {
     pub install_hint: &'static str,
     /// Extra install locations searched last. `~`-relative unless absolute.
     pub extra_paths: &'static [&'static str],
+    /// A richer, separately installed runtime for the same agent, preferred
+    /// when found. Without it the base CLI is opened and the installation
+    /// names the upgrade as missing.
+    pub upgrade: Option<Upgrade>,
+}
+
+/// A second executable that drives the same agent over ACP with more
+/// capabilities than its CLI (Antigravity's ACP server).
+pub(crate) struct Upgrade {
+    pub name: &'static str,
+    pub cli: &'static str,
+    pub acp_args: &'static [&'static str],
+    pub extra_paths: &'static [&'static str],
+    pub install_hint: &'static str,
+    /// ACP auth method to call when `session/new` says the server has no
+    /// login selected; it adopts the base CLI's login without a browser.
+    pub acp_auth_method: Option<&'static str>,
 }
 
 pub(crate) enum Connection {
@@ -47,7 +64,7 @@ pub(crate) enum NativeKind {
     Claude,
     Codex,
     /// Antigravity's `agy` CLI: its own stream-json event dialect
-    /// (`--input-format=stream-json`, validated 2026-08-23). Adapter pending.
+    /// (`--input-format=stream-json`, probed 1.1.24 on 2026-09-02).
     Antigravity,
     /// The pi RPC wire (`--mode rpc`).
     Pi,
@@ -86,6 +103,7 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         login_args: &["auth", "login"],
         install_hint: "npm install -g @anthropic-ai/claude-code",
         extra_paths: &[".claude/local", ".local/bin"],
+        upgrade: None,
     },
     AgentProfile {
         id: "codex",
@@ -103,6 +121,7 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         login_args: &["login"],
         install_hint: "npm install -g @openai/codex",
         extra_paths: &[],
+        upgrade: None,
     },
     // Gemini CLI is deprecated upstream (personal OAuth sunset, users moved
     // to Antigravity); its profile was replaced 2026-08-23.
@@ -114,15 +133,35 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         config_dir: ".gemini",
         config_home_env: None,
         connection: Connection::Native(NativeKind::Antigravity),
+        // Both sit directly under ~/.gemini (verified on disk 2026-08-24).
         auth_markers: &[
             AuthMarker::ConfigFile("jetski-standalone-oauth-token", AuthKind::Subscription),
             AuthMarker::ConfigFile("oauth_creds.json", AuthKind::Subscription),
         ],
-        open_auth_kind: None,
-        auth_error_hints: &[],
+        // Logged out, `agy` exits before its `init` frame (probed 1.1.24).
+        open_auth_kind: Some(AuthKind::Subscription),
+        auth_error_hints: &["authentication required", "authentication failed"],
+        // Login is the TUI itself: the bare executable is the command.
         login_args: &[],
         install_hint: "install Antigravity from https://antigravity.google, then run `agy install`",
         extra_paths: &[".local/bin"],
+        // Google's ACP server (registry id `antigravity-acp`): permissions,
+        // questions, steer, and in-process cancel that the CLI's headless
+        // wire lacks. Gemini models only.
+        upgrade: Some(Upgrade {
+            name: "Antigravity ACP server",
+            cli: "agy_acp_server.par",
+            acp_args: &[],
+            extra_paths: &[".local/agy-acp-server", ".local/bin"],
+            install_hint: "download the `antigravity-acp` archive for your platform from \
+                 https://github.com/agentclientprotocol/registry/blob/main/antigravity-acp/agent.json \
+                 and unpack it into ~/.local/agy-acp-server",
+            // The server keeps its own auth choice (`auth.type` in
+            // ~/.gemini/antigravity-acp/settings.json). Without one, a
+            // single in-protocol `authenticate` adopts the `agy` login in
+            // ~2 s with no browser (probed 2026-09-07).
+            acp_auth_method: Some("oauth-personal"),
+        }),
     },
     AgentProfile {
         id: "cursor",
@@ -146,6 +185,7 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         login_args: &["login"],
         install_hint: "curl https://cursor.com/install -fsS | bash",
         extra_paths: &[".local/bin"],
+        upgrade: None,
     },
     AgentProfile {
         id: "grok",
@@ -175,6 +215,7 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         install_hint: "npm install -g @xai-official/grok \
              (or `curl -fsSL https://x.ai/cli/install.sh | bash`)",
         extra_paths: &[".local/bin", ".grok/bin", ".npm-global/bin"],
+        upgrade: None,
     },
     AgentProfile {
         id: "hermes",
@@ -190,6 +231,7 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         login_args: &["login"],
         install_hint: "see https://github.com/NousResearch/hermes-agent",
         extra_paths: &[".local/bin"],
+        upgrade: None,
     },
     AgentProfile {
         id: "opencode",
@@ -209,6 +251,7 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         login_args: &["auth", "login"],
         install_hint: "brew install sst/tap/opencode",
         extra_paths: &[],
+        upgrade: None,
     },
     AgentProfile {
         id: "kiro",
@@ -227,6 +270,7 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         login_args: &["login"],
         install_hint: "install Kiro CLI from https://kiro.dev",
         extra_paths: &[".local/bin"],
+        upgrade: None,
     },
     AgentProfile {
         id: "pi",
@@ -255,6 +299,7 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         login_args: &[],
         install_hint: "npm install -g @earendil-works/pi-coding-agent",
         extra_paths: &[".bun/bin", ".local/bin"],
+        upgrade: None,
     },
     // oh-my-pi (`omp`) speaks the same pi RPC wire and would be one more
     // profile on `NativeKind::Pi`; deferred to its own ticket.
@@ -278,6 +323,7 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         login_args: &[],
         install_hint: "npm install -g @qwen-code/qwen-code",
         extra_paths: &[],
+        upgrade: None,
     },
 ];
 

@@ -14,7 +14,7 @@ check:
 features:
     @grep -A2 '#\[ignore' tests/live.rs | grep -oE 'async fn [a-z_]+' | cut -d' ' -f3
 
-# harness: claude|codex|opencode|hermes|kiro|pi|all — feature: substring from `just features`, empty = all
+# harness: claude|codex|opencode|hermes|kiro|pi|antigravity|all — feature: substring from `just features`, empty = all
 live harness feature='':
     ANYAGENT_LIVE={{harness}} cargo test --test live {{feature}} -- --ignored --nocapture --test-threads=1
 

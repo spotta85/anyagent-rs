@@ -35,6 +35,8 @@ use crate::event::{
 use crate::process::{self, Spawn};
 
 const AUTH_REQUIRED_CODE: i64 = -32000;
+/// Adopting an existing login is ~2 s; a browser flow would never return.
+const ADOPT_LOGIN_WAIT: Duration = Duration::from_secs(10);
 
 /// One instance per ACP agent; `args` put the CLI in protocol mode.
 pub(crate) struct AcpAdapter {
@@ -45,12 +47,13 @@ pub(crate) struct AcpAdapter {
 }
 
 impl AcpAdapter {
-    /// An ad-hoc ACP agent: protocol args only, no catalog facts.
-    pub(crate) fn new(args: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        Self {
-            args: args.into_iter().map(Into::into).collect(),
-            profile: None,
-        }
+    /// Explicit protocol args, with the catalog's auth facts when the agent
+    /// has an entry (an ACP upgrade) and none for an ad-hoc install.
+    pub(crate) fn with_args(
+        profile: Option<&'static crate::catalog::AgentProfile>,
+        args: Vec<String>,
+    ) -> Self {
+        Self { args, profile }
     }
 
     /// A catalog agent: protocol args and auth facts from its profile.
@@ -77,35 +80,49 @@ impl Adapter for AcpAdapter {
         // Cursor's version and login come from `about` (0.5s): its ACP
         // `authenticate` opens a browser login when logged out.
         let about = match self.profile {
-            Some(p) if p.id == "cursor" => cursor_about(&request.installation).await?,
+            Some(p) if p.id == "cursor" => {
+                cursor_about(&request.installation, &request.options).await?
+            }
             _ => CursorAbout::default(),
         };
         let mut child = process::spawn(Spawn {
             exec_path: request.installation.executable_path.clone(),
             args: self.args.clone(),
             cwd: request.options.cwd().clone(),
-            env,
+            env: env.clone(),
         })
         .await?;
         let mut wire = Wire::over(&mut child, recorder);
 
         let open_auth_kind = self.profile.and_then(|p| p.open_auth_kind.clone());
+        let adopt_login = self
+            .profile
+            .and_then(|p| p.upgrade.as_ref())
+            .and_then(|u| u.acp_auth_method);
         let handshake = tokio::time::timeout(
             HANDSHAKE_TIMEOUT,
-            handshake(&mut wire, &request, open_auth_kind),
+            handshake(&mut wire, &request, open_auth_kind, adopt_login),
         );
-        let (mut info, session_id, login, first_class_model, kiro, estimate) = match handshake.await
-        {
+        let Handshake {
+            mut info,
+            session_id,
+            login,
+            first_class_model,
+            kiro,
+            prompt_media,
+            estimate,
+        } = match handshake.await {
             Ok(Ok(ok)) => ok,
             Ok(Err(e)) => {
                 // Shutdown first: it joins the stderr reader, so the tail is
                 // complete before the error is rendered and hint-matched.
                 child.shutdown(CLOSE_GRACE).await;
                 let e = crate::adapter::with_stderr(e, &child);
-                return Err(auth_hinted(
+                return Err(crate::adapter::auth_hinted(
                     e,
                     self.profile,
                     &request.installation.executable_path,
+                    &env,
                 ));
             }
             Err(_) => {
@@ -142,6 +159,7 @@ impl Adapter for AcpAdapter {
                 configs: Vec::new(),
                 first_class_model,
                 kiro,
+                prompt_media,
                 estimate,
                 usage_chars: 0,
                 todos: Vec::new(),
@@ -149,7 +167,7 @@ impl Adapter for AcpAdapter {
                 pending_effort: None,
                 held_prompt: None,
                 retry: None,
-                login,
+                login: crate::adapter::login_in(login, &env),
             }
             .run(cmd_rx),
         );
@@ -165,16 +183,28 @@ impl Adapter for AcpAdapter {
 // LAUNCH AND HANDSHAKE
 // ---------------------------------------------------------------------------
 
+/// What the handshake settled, for the drive task.
+struct Handshake {
+    info: DriverInfo,
+    session_id: String,
+    /// Runnable login methods, for auth failures later in the session.
+    login: Vec<LoginMethod>,
+    first_class_model: bool,
+    kiro: bool,
+    prompt_media: PromptMedia,
+    /// A new cursor session: context usage is estimated (it sends none).
+    estimate: bool,
+}
+
 /// `initialize`, then `session/new` or `session/load`. A `session/new` error
 /// with the auth code becomes `AuthRequired` with runnable login methods;
 /// the same methods ride along for auth failures later in the session.
-/// Returns the info, session id, login methods, and the first-class-model,
-/// kiro, and usage-estimate flags.
 async fn handshake(
     wire: &mut Wire,
     request: &ConnectRequest,
     open_auth_kind: Option<AuthKind>,
-) -> Result<(DriverInfo, String, Vec<LoginMethod>, bool, bool, bool), AgentError> {
+    adopt_login: Option<&'static str>,
+) -> Result<Handshake, AgentError> {
     // `parameterizedModelPicker` makes Cursor list the selected model's own
     // options (effort, fast, thinking, context) in every config response;
     // spec-conformant agents ignore `_meta` (probed 2026-09-07).
@@ -229,9 +259,24 @@ async fn handshake(
             String::new(),
         ),
     };
-    let response = wire
-        .roundtrip(method, params)
-        .await
+    let mut response = wire.roundtrip(method, params.clone()).await;
+    // An ACP upgrade with its own auth choice (antigravity's server) adopts
+    // the CLI's login in-protocol: one `authenticate`, then the same call
+    // again. Logged out of the CLI too, the server starts Google's browser
+    // login instead (probed 2026-09-07), so the wait is short and the
+    // original refusal stands on any other outcome.
+    if let (Err(WireError::Rpc { code, .. }), Some(method_id)) = (&response, adopt_login)
+        && *code == AUTH_REQUIRED_CODE
+    {
+        let authenticate = wire.roundtrip("authenticate", json!({ "methodId": method_id }));
+        if matches!(
+            tokio::time::timeout(ADOPT_LOGIN_WAIT, authenticate).await,
+            Ok(Ok(_))
+        ) {
+            response = wire.roundtrip(method, params).await;
+        }
+    }
+    let response = response
         .map_err(|e| e.into_error(&init.auth_methods, &request.installation.executable_path))?;
 
     let mut info = driver_info(&init, &request.installation.auth, open_auth_kind);
@@ -255,6 +300,10 @@ async fn handshake(
     let first_class_model =
         first_class_models.is_some_and(|models| apply_first_class_models(&mut info, &models));
     let kiro = is_kiro(&init);
+    let prompt_media = PromptMedia {
+        audio: init.agent_capabilities.prompt_capabilities.audio,
+        embedded_context: init.agent_capabilities.prompt_capabilities.embedded_context,
+    };
     info.resume_token = Some(ResumeToken::new(&session_id));
     // Creation-time config: apply each requested option before the first
     // turn; a refusal fails the open instead of silently running misconfigured.
@@ -298,7 +347,15 @@ async fn handshake(
         .iter()
         .filter_map(|m| login_method(m, &request.installation.executable_path))
         .collect();
-    Ok((info, session_id, login, first_class_model, kiro, estimate))
+    Ok(Handshake {
+        info,
+        session_id,
+        login,
+        first_class_model,
+        kiro,
+        prompt_media,
+        estimate,
+    })
 }
 
 /// Kiro is the one ACP agent with a prompt-driven effort switch.
@@ -327,7 +384,10 @@ struct CursorAbout {
 /// out and fails typed with the catalog login command, since Cursor's own
 /// `authenticate` would start a browser login instead (read from the
 /// 2026.09.02 bundle). A failed or unparseable `about` reports nothing.
-async fn cursor_about(installation: &AgentInstallation) -> Result<CursorAbout, AgentError> {
+async fn cursor_about(
+    installation: &AgentInstallation,
+    options: &crate::agent::SessionOptions,
+) -> Result<CursorAbout, AgentError> {
     let output = tokio::process::Command::new(&installation.executable_path)
         .args(["about", "--format", "json"])
         .stdin(std::process::Stdio::null())
@@ -341,7 +401,7 @@ async fn cursor_about(installation: &AgentInstallation) -> Result<CursorAbout, A
     };
     if json.get("userEmail").is_some_and(Value::is_null) {
         return Err(AgentError::AuthRequired {
-            login: crate::adapter::login_methods(installation),
+            login: crate::adapter::login_methods(installation, Some(options)),
         });
     }
     Ok(CursorAbout {
@@ -795,6 +855,13 @@ struct PendingQuestion {
     cursor: bool,
 }
 
+/// Prompt content the agent advertised beyond text and images.
+#[derive(Clone, Copy)]
+struct PromptMedia {
+    audio: bool,
+    embedded_context: bool,
+}
+
 struct Drive {
     wire: Wire,
     child: process::Child,
@@ -820,6 +887,8 @@ struct Drive {
     first_class_model: bool,
     /// The agent is kiro: `effort` selections ride a `/effort` prompt.
     kiro: bool,
+    /// Which inlined media the agent takes in prompts, from `initialize`.
+    prompt_media: PromptMedia,
     /// A new cursor session: context usage is estimated (it sends none).
     estimate: bool,
     /// Characters that crossed the wire this session, for the estimate.
@@ -1659,8 +1728,9 @@ impl Drive {
         (tool.clone(), appended)
     }
 
-    /// Content blocks for one prompt: inlined images first (when the agent
-    /// takes them), then the text carrying every attachment's path ref.
+    /// Content blocks for one prompt: inlined media first, each kind only
+    /// when the agent advertised it (images, audio, PDFs as embedded
+    /// resources), then the text carrying every attachment's path ref.
     async fn prompt_blocks(&mut self, input: &Input) -> Result<Value, Gone> {
         let loaded = attach::load(&input.attachments).await;
         for problem in loaded.iter().filter_map(|l| l.problem.as_deref()) {
@@ -1668,15 +1738,28 @@ impl Drive {
                 .diagnostic(DiagnosticLevel::Warning, problem.to_owned())
                 .await?;
         }
+        let images = self.info.details.capabilities.supports(Capability::Images);
         let mut blocks = Vec::new();
-        if self.info.details.capabilities.supports(Capability::Images) {
-            for image in loaded.iter().filter_map(|l| l.image.as_ref()) {
-                blocks.push(json!({
-                    "type": "image",
-                    "data": image.base64,
-                    "mimeType": image.mime,
-                }));
-            }
+        for l in &loaded {
+            let Some(inline) = &l.inline else { continue };
+            let block = match inline.media {
+                attach::Media::Image if images => {
+                    json!({ "type": "image", "data": inline.base64(), "mimeType": inline.mime })
+                }
+                attach::Media::Audio if self.prompt_media.audio => {
+                    json!({ "type": "audio", "data": inline.base64(), "mimeType": inline.mime })
+                }
+                attach::Media::Pdf if self.prompt_media.embedded_context => json!({
+                    "type": "resource",
+                    "resource": {
+                        "uri": attach::file_uri(&l.path),
+                        "mimeType": inline.mime,
+                        "blob": inline.base64(),
+                    },
+                }),
+                _ => continue,
+            };
+            blocks.push(block);
         }
         blocks.push(json!({
             "type": "text",
@@ -2098,45 +2181,6 @@ impl WireError {
             }
         }
     }
-}
-
-/// Maps an agent's own logged-out error to `AuthRequired` using the
-/// profile's probed fingerprints (kiro exits before speaking ACP, hermes
-/// fails session/new with a plain internal error); other failures pass.
-fn auth_hinted(
-    error: AgentError,
-    profile: Option<&crate::catalog::AgentProfile>,
-    exe: &std::path::Path,
-) -> AgentError {
-    let Some(profile) = profile else { return error };
-    // Only failure shapes carry the agent's own words; typed errors
-    // (AuthRequired, UnsupportedFeature, …) must pass through untouched.
-    if !matches!(
-        error,
-        AgentError::ProtocolFailed(_) | AgentError::ProcessExited { .. }
-    ) {
-        return error;
-    }
-    let text = error.to_string();
-    if !profile.auth_error_hints.iter().any(|h| text.contains(h)) {
-        return error;
-    }
-    let mut login = crate::discovery::login_methods(profile, exe);
-    // No login command in the catalog (grok): the agent's own TUI is the flow.
-    if !login
-        .iter()
-        .any(|m| matches!(m, LoginMethod::Terminal { .. }))
-    {
-        login.insert(
-            0,
-            LoginMethod::Terminal {
-                description: format!("{} logs in on launch; run it in a terminal", profile.name),
-                command: vec![exe.to_string_lossy().into_owned()],
-                env: std::collections::BTreeMap::new(),
-            },
-        );
-    }
-    AgentError::AuthRequired { login }
 }
 
 /// A terminal auth method becomes a runnable command; agent-driven auth is

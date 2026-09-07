@@ -11,9 +11,9 @@ use futures::StreamExt;
 
 use anyagent::{
     AgentError, AgentInstallation, Answer, AuthKind, AuthStatus, Capability, ConfigId, ConfigKind,
-    ConfigValue, DeliveryKind, Event, EventKind, Events, Input, McpServer, PermissionChoice,
-    PlanStatus, QuestionAnswer, Request, Runtime, Session, SessionOptions, StopReason, ToolInput,
-    ToolKind, ToolStatus,
+    ConfigValue, DeliveryKind, Event, EventKind, Events, Input, LoginMethod, McpServer,
+    PermissionChoice, PlanStatus, QuestionAnswer, Request, Runtime, Session, SessionOptions,
+    StopReason, ToolInput, ToolKind, ToolStatus,
 };
 
 /// A `codex` stand-in: a script that execs the fixture with scenario flags,
@@ -665,6 +665,32 @@ async fn cancel_interrupts_and_cancels_inflight_tools() {
     assert!(cancelled_tool);
     // Idle cancel is a no-op, not an error.
     session.cancel(false).await.unwrap();
+    session.close().await.unwrap();
+}
+
+/// An isolated config home rides the login command's env, so the login
+/// lands where the session looks.
+#[tokio::test]
+async fn login_methods_carry_the_config_home() {
+    let home =
+        std::env::temp_dir().join(format!("anyagent-codex-login-home-{}", std::process::id()));
+    let (session, _events) = open_with(
+        "logged-out-home",
+        "--logged-out",
+        SessionOptions::in_dir(std::env::temp_dir()).config_home(&home),
+    )
+    .await
+    .unwrap();
+    let AuthStatus::Unauthenticated { login } = session.info().details.auth else {
+        panic!("expected Unauthenticated");
+    };
+    let LoginMethod::Terminal { env, .. } = &login[0] else {
+        panic!("expected a terminal login method");
+    };
+    assert_eq!(
+        env.get("CODEX_HOME").map(String::as_str),
+        Some(home.to_string_lossy().as_ref())
+    );
     session.close().await.unwrap();
 }
 

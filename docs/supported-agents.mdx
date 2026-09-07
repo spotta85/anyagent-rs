@@ -14,7 +14,7 @@ real install.
 |---|---|---|---|---|
 | Claude Code | `claude` | `claude` | native (stream-json) | `npm install -g @anthropic-ai/claude-code` |
 | Codex | `codex` | `codex` | native (app-server) | `npm install -g @openai/codex` |
-| Antigravity | `antigravity` | `agy` | native (adapter in progress — not yet openable) | [antigravity.google](https://antigravity.google), then `agy install` |
+| Antigravity | `antigravity` | `agy`, or its ACP server when installed | native (stream-json), ACP with the server | [antigravity.google](https://antigravity.google), then `agy install`; optional ACP server below |
 | Cursor CLI | `cursor` | `cursor-agent` | ACP | `curl https://cursor.com/install -fsS \| bash` |
 | Grok | `grok` | `grok` | ACP | `npm install -g @xai-official/grok` |
 | Hermes Agent | `hermes` | `hermes` | ACP | [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) |
@@ -27,6 +27,58 @@ real install.
 Gemini CLI was removed in favour of Antigravity after Google sunset personal
 OAuth for it.
 </Note>
+
+## Antigravity: two ways in
+
+Antigravity has two wires, and discovery picks the richer one that is
+installed:
+
+```text
+discover("antigravity")
+  ├─ ACP server found  ──►  open over ACP: permissions, questions, steer,
+  │                         in-process cancel, images, slash commands
+  │                         (Gemini models only)
+  └─ only `agy` found  ──►  open over agy's headless stream-json wire:
+                            text, tools, resume, context usage, cancel by
+                            respawn; every model `agy models` lists
+                            → installation.upgrade names the server
+```
+
+The `agy` CLI ships with the Antigravity IDE, so most machines have it. Its
+headless wire cannot prompt: in `Ask` mode every permission-gated tool is
+denied by the agent itself (the tool shows as failed with its message),
+`AutoApprove` launches with `--dangerously-skip-permissions`, questions are
+skipped and reported as a diagnostic, and a mid-turn prompt queues. `model`
+and `mode` (`accept-edits`, `plan`) are creation-time options; reopen with
+the resume token to change them. Cancel kills the process and resumes the
+conversation in a fresh one, about two seconds.
+
+The ACP server is Google's own, listed in the
+[ACP registry](https://github.com/agentclientprotocol/registry/blob/main/antigravity-acp/agent.json)
+as `antigravity-acp`: a 314 MB download, 854 MB unpacked, searched in
+`~/.local/agy-acp-server` and on `PATH`. It reuses the `agy` login: anyagent
+calls its `authenticate` once per open when the server has no auth choice of
+its own (about 2 seconds, no browser), or set `auth.type` in
+`~/.gemini/antigravity-acp/settings.json` to skip that. With no `agy` login
+either, the server opens Google's browser login and the open fails
+`AuthRequired` naming `agy`, like the CLI does. When `agy` is found
+but the server is not, the installation carries
+`upgrade: Some(MissingAgent)` with the download hint, so an app can offer the
+richer path without hard-coding anything:
+
+```rust
+let agent = report.require("antigravity")?;
+if let Some(upgrade) = &agent.upgrade {
+    ui.offer_install(&upgrade.name, &upgrade.install_hint);
+}
+```
+
+To force the headless CLI while the server is installed, point the catalog at
+it: `ANYAGENT_ANTIGRAVITY_BIN=~/.local/bin/agy`.
+
+Google's Antigravity terms restrict third-party tools driving a personal
+Antigravity login; the ACP server is Google's sanctioned client path. Apps
+should surface that choice to their users.
 
 <Note>
 `pi` is provider-key based: log in with `/login <provider>` inside the CLI,
