@@ -1294,7 +1294,7 @@ impl Drive {
 
     /// Cursor's other extension methods. They arrive as requests with an id
     /// (the docs call them notifications), so each is answered: todos become
-    /// the plan, a plan proposal is accepted, a subagent header is
+    /// the plan, a plan proposal is accepted, a subagent task header is
     /// acknowledged, image generation is declined. Everything but todos is
     /// also surfaced raw under its method name for apps that want the
     /// plan markdown or the subagent header.
@@ -1778,15 +1778,13 @@ fn apply_content(tool: &mut ToolUpdate, content: Vec<acp::ToolCallContent>) -> S
     appended
 }
 
-/// Keeps the agent's own input when the wire carries it. Cursor names the
-/// tool inside it (`_toolName`); its `task` is a subagent run (probed
-/// 2026-09-07).
+/// Keeps the agent's own input when the wire carries it, named when the
+/// agent names the tool inside it (cursor's `_toolName`). Cursor's `task`
+/// stays `Other`: it runs a subagent but reports only a header, never the
+/// nested events `ToolKind::Subagent` promises (probed 2026-09-07).
 fn apply_raw_input(tool: &mut ToolUpdate, raw_input: Option<Value>) {
     if let Some(input) = raw_input {
         let name = input["_toolName"].as_str().unwrap_or_default().to_owned();
-        if name == "task" {
-            tool.kind = ToolKind::Subagent;
-        }
         tool.raw = Some(RawTool { name, input });
     }
 }
