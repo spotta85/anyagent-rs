@@ -252,7 +252,8 @@ async fn output(exe: &Path, args: &[&str], env: &[(String, String)]) -> Option<S
         .envs(env.iter().cloned())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
     let out = tokio::time::timeout(SIDE_PROCESS_TIMEOUT, command.output())
         .await
         .ok()?

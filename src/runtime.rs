@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::adapter::{Adapter, ConnectRequest};
 use crate::agent::{
     AgentDetails, AgentId, AgentInstallation, AuthStatus, Capabilities, Capability, Input,
-    PermissionMode, SessionOptions, SessionStart,
+    InstallationSource, PermissionMode, SessionOptions, SessionStart,
 };
 use crate::error::AgentError;
 use crate::event::{
@@ -93,7 +93,6 @@ impl Runtime {
     /// The real catalog is not scanned.
     #[cfg(any(test, feature = "mock"))]
     pub(crate) fn with_test_adapter(adapter: impl Adapter + 'static) -> Self {
-        use crate::agent::InstallationSource;
         let id = AgentId::new("mock");
         let mut runtime = Self::new();
         runtime.profiles = &[];
@@ -136,8 +135,12 @@ impl Runtime {
     ) -> Result<(Session, Events), AgentError> {
         // ACP args drive ACP even for a catalog agent with a native adapter:
         // an explicit `AgentInstallation::acp`, or discovery having found the
-        // agent's ACP upgrade (which keeps the catalog's auth facts).
-        let profile = self.profiles.iter().find(|p| p.id == agent.id.as_str());
+        // agent's ACP upgrade. Only the discovered one keeps the catalog's
+        // auth facts; a pinned ad-hoc install named like a catalog agent is
+        // still ad-hoc.
+        let profile = (agent.source != InstallationSource::Pinned)
+            .then(|| self.profiles.iter().find(|p| p.id == agent.id.as_str()))
+            .flatten();
         let adapter: Arc<dyn Adapter> = match (self.adapters.get(&agent.id), &agent.acp_args) {
             (_, Some(args)) => Arc::new(crate::adapter::acp::AcpAdapter::with_args(
                 profile,

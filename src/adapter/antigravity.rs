@@ -76,6 +76,7 @@ impl Adapter for AntigravityAdapter {
                 token: info.resume_token.clone(),
                 message: None,
                 next_message: 0,
+                last_usage: None,
             }
             .run(cmd_rx),
         );
@@ -274,7 +275,8 @@ async fn output(exe: &Path, args: &[&str]) -> Option<String> {
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
     let out = tokio::time::timeout(SIDE_PROCESS_TIMEOUT, command.output())
         .await
         .ok()?
@@ -368,6 +370,9 @@ struct Drive {
     /// The assistant message being streamed.
     message: Option<MessageId>,
     next_message: u64,
+    /// Context occupancy from the turn's last model call: `result.usage`
+    /// sums every step's snapshot instead (recorded), so it is not the size.
+    last_usage: Option<u64>,
 }
 
 impl Drive {
@@ -475,6 +480,9 @@ impl Drive {
         match step["step_type"].as_str().unwrap_or_default() {
             "agent_response" => {
                 let message_id = self.message();
+                if let Some(used) = step["usage"]["total_tokens"].as_u64().filter(|t| *t > 0) {
+                    self.last_usage = Some(used);
+                }
                 if let Some(text) = step["text_delta"].as_str().filter(|t| !t.is_empty()) {
                     self.events
                         .event(EventKind::TextDelta {
@@ -510,7 +518,7 @@ impl Drive {
     /// Exactly one `result` per turn: usage, then the turn's end.
     async fn on_result(&mut self, result: &Value) -> Result<(), Gone> {
         self.message = None;
-        if let Some(used) = result["usage"]["total_tokens"].as_u64().filter(|t| *t > 0) {
+        if let Some(used) = self.last_usage.take() {
             self.events
                 .event(EventKind::ContextUsage {
                     used_tokens: used,

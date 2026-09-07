@@ -50,7 +50,10 @@ answers the two side processes the adapter shells out to (`--version` and
 
 - `usage` is `{input_tokens, output_tokens, thinking_tokens,
   cache_read_tokens, total_tokens}` on every DONE `agent_response` and every
-  `result`. Nothing names the context window size.
+  `result`. The `result` one is the **sum** of the turn's step snapshots (and
+  keeps summing across resumed processes: `08-resume-b` reports 27723 after
+  two 13.9k calls), so the last `agent_response` snapshot is the context
+  size. Nothing names the window.
 - `step_type` values seen: `user_input`, `agent_response`, `tool`,
   `subagent`, `unknown` (a skipped question), `system_message`.
 - `--output-format=json models` works; `models --output-format=json` does

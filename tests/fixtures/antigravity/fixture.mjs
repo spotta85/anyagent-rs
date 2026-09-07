@@ -65,9 +65,10 @@ rl.on('close', () => process.exit(0));
 
 const update = (fields) => send({ event: 'step_update', step_update: { conversation_id: conversation, step_index: step, ...fields } });
 const text = (delta, state = 'DONE') => update({ state, step_type: 'agent_response', text_delta: delta, ...(state === 'DONE' && { duration_seconds: 1, usage: usage(13762) }) });
+// `result.usage` sums every step snapshot (recorded): twice a single step.
 const result = (response, status = 'SUCCESS', error) => {
   turns += 1;
-  send({ event: 'result', result: { conversation_id: conversation, status, response, ...(error && { error }), duration_seconds: 1, num_turns: turns, usage: usage(13762) } });
+  send({ event: 'result', result: { conversation_id: conversation, status, response, ...(error && { error }), duration_seconds: 1, num_turns: turns, usage: usage(2 * 13762 + 1) } });
 };
 
 async function onUser(frame) {
