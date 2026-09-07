@@ -9,7 +9,7 @@
 
 ### One Up-to-date, feature-rich Rust interface to the agents already on a users machine.
 
-Users have Claude Code, Codex, Cursor, Grok, OpenCode, Kiro, and friends on their
+Users have Claude Code, Codex, Cursor, Grok, OpenCode, Kiro, Antigravity, and friends on their
 machines — each with its own CLI, protocol, and quirks. If you're building an
 app on top of them, you end up writing and maintaining a driver per agent.
 anyagent is that layer, **once: it finds the agents, speaks each one's protocol
@@ -17,8 +17,7 @@ anyagent is that layer, **once: it finds the agents, speaks each one's protocol
 API — `Runtime`, `Session`, and a stream of `Events`**.
 
 #### Your app keeps its own transcript, UI, and policy. anyagent owns the processes, the wires, and the turn rules — every agent behaves the same way through it.
-<img width="583" height="346" alt="image" src="https://github.com/user-attachments/assets/6133087d-e12a-4b66-9990-b7c5e8e81011" />
-
+<img width="630" height="346" alt="image" src="https://github.com/user-attachments/assets/45924ad0-2954-4b9f-8a80-11882ed07d7a" />
 
 
 ## Use
