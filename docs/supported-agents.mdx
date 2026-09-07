@@ -35,8 +35,9 @@ installed:
 
 ```text
 discover("antigravity")
-  ├─ ACP server found  ──►  open over ACP: permissions, questions, steer,
-  │                         in-process cancel, images, slash commands
+  ├─ ACP server found  ──►  open over ACP: permissions, questions,
+  │                         in-process cancel, live mode and model switch,
+  │                         images, PDFs, diffs, slash commands
   │                         (Gemini models only)
   └─ only `agy` found  ──►  open over agy's headless stream-json wire:
                             text, tools, resume, context usage, cancel by
@@ -56,7 +57,9 @@ conversation in a fresh one, about two seconds.
 The ACP server is Google's own, listed in the
 [ACP registry](https://github.com/agentclientprotocol/registry/blob/main/antigravity-acp/agent.json)
 as `antigravity-acp`: a 314 MB download, 854 MB unpacked, searched in
-`~/.local/agy-acp-server` and on `PATH`. It reuses the `agy` login: anyagent
+`~/.local/agy-acp-server` and on `PATH`. Its questions arrive as permission
+requests whose options are the choices; anyagent surfaces them as `Question`
+requests, so an app answers them like claude's. It reuses the `agy` login: anyagent
 calls its `authenticate` once per open when the server has no auth choice of
 its own (about 2 seconds, no browser), or set `auth.type` in
 `~/.gemini/antigravity-acp/settings.json` to skip that. With no `agy` login

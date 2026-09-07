@@ -109,6 +109,7 @@ impl Adapter for AcpAdapter {
             login,
             first_class_model,
             kiro,
+            antigravity,
             prompt_media,
             estimate,
         } = match handshake.await {
@@ -159,6 +160,7 @@ impl Adapter for AcpAdapter {
                 configs: Vec::new(),
                 first_class_model,
                 kiro,
+                antigravity,
                 prompt_media,
                 estimate,
                 usage_chars: 0,
@@ -191,6 +193,7 @@ struct Handshake {
     login: Vec<LoginMethod>,
     first_class_model: bool,
     kiro: bool,
+    antigravity: bool,
     prompt_media: PromptMedia,
     /// A new cursor session: context usage is estimated (it sends none).
     estimate: bool,
@@ -300,6 +303,7 @@ async fn handshake(
     let first_class_model =
         first_class_models.is_some_and(|models| apply_first_class_models(&mut info, &models));
     let kiro = is_kiro(&init);
+    let antigravity = is_antigravity(&init);
     let prompt_media = PromptMedia {
         audio: init.agent_capabilities.prompt_capabilities.audio,
         embedded_context: init.agent_capabilities.prompt_capabilities.embedded_context,
@@ -353,9 +357,17 @@ async fn handshake(
         login,
         first_class_model,
         kiro,
+        antigravity,
         prompt_media,
         estimate,
     })
+}
+
+/// Google's Antigravity server asks questions as `interaction_*` permissions.
+fn is_antigravity(init: &acp::InitializeResponse) -> bool {
+    init.agent_info
+        .as_ref()
+        .is_some_and(|i| i.name == "antigravity-acp")
 }
 
 /// Kiro is the one ACP agent with a prompt-driven effort switch.
@@ -848,11 +860,23 @@ struct PendingPermission {
 
 /// A question request waiting for `answer`: its wire id and the raw
 /// question objects, so choice ids map back to what the agent expects
-/// (grok: option labels; cursor: option ids).
+/// (grok: option labels; cursor: option ids; antigravity: the permission
+/// option id).
 struct PendingQuestion {
     wire_id: Value,
     questions: Vec<Value>,
-    cursor: bool,
+    wire: QuestionWire,
+}
+
+/// Which agent's question shape a pending question answers in.
+#[derive(Clone, Copy, PartialEq)]
+enum QuestionWire {
+    Grok,
+    Cursor,
+    /// Antigravity's ACP server: a permission request on an `interaction_*`
+    /// tool call, every option `allow_once` with the choice as its name
+    /// (recorded 2026-09-07).
+    Interaction,
 }
 
 /// Prompt content the agent advertised beyond text and images.
@@ -887,6 +911,9 @@ struct Drive {
     first_class_model: bool,
     /// The agent is kiro: `effort` selections ride a `/effort` prompt.
     kiro: bool,
+    /// The agent is Antigravity's server: its `interaction_*` permission
+    /// requests are questions (see `QuestionWire::Interaction`).
+    antigravity: bool,
     /// Which inlined media the agent takes in prompts, from `initialize`.
     prompt_media: PromptMedia,
     /// A new cursor session: context usage is estimated (it sends none).
@@ -996,7 +1023,7 @@ impl Drive {
                 }
                 for (_, pending) in std::mem::take(&mut self.questions) {
                     self.wire
-                        .respond(pending.wire_id, cancelled_question(pending.cursor))
+                        .respond(pending.wire_id, cancelled_question(pending.wire))
                         .await?;
                 }
             }
@@ -1178,6 +1205,10 @@ impl Drive {
             U::UserMessageChunk(chunk) => text_kind(chunk, |message_id, text| {
                 EventKind::UserMessage { message_id, text }
             }),
+            // An interaction is a question, surfaced by its permission
+            // request alone; the tool call around it is wire noise.
+            U::ToolCall(call) if self.is_interaction(&call.tool_call_id.0) => None,
+            U::ToolCallUpdate(update) if self.is_interaction(&update.tool_call_id.0) => None,
             U::ToolCall(call) => {
                 let tool = fresh_tool(call);
                 self.tools.insert(tool.id.as_str().to_owned(), tool.clone());
@@ -1300,6 +1331,15 @@ impl Drive {
                         .await;
                 }
             };
+        if self.is_interaction(&request.tool_call.tool_call_id.0)
+            && !request.options.is_empty()
+            && request
+                .options
+                .iter()
+                .all(|o| matches!(o.kind, acp::PermissionOptionKind::AllowOnce))
+        {
+            return self.on_interaction(wire_id, request).await;
+        }
         // The raw JSON-RPC id (number or string) keeps distinct requests distinct.
         let id = RequestId::new(format!("r{wire_id}"));
         let options: Vec<(PermissionChoice, String)> = request
@@ -1322,6 +1362,60 @@ impl Drive {
                     tool,
                     options: options.into_iter().map(|(choice, _)| choice).collect(),
                     detail: None,
+                }),
+            )))
+            .await
+    }
+
+    /// Antigravity's `interaction_*` tool calls are its questions; any
+    /// other agent's ids are opaque.
+    fn is_interaction(&self, tool_call_id: &str) -> bool {
+        self.antigravity && tool_call_id.starts_with("interaction_")
+    }
+
+    /// Antigravity's question (see `QuestionWire::Interaction`): the title
+    /// is the question, one choice per option, the answer its `optionId`.
+    async fn on_interaction(
+        &mut self,
+        wire_id: Value,
+        request: acp::RequestPermissionRequest,
+    ) -> Result<(), Gone> {
+        self.advertise(Capability::Questions).await?;
+        let call = &request.tool_call;
+        let question = Question {
+            id: QuestionId::new(call.tool_call_id.0.to_string()),
+            text: call.fields.title.clone().unwrap_or_default(),
+            header: None,
+            choices: request
+                .options
+                .iter()
+                .map(|o| Choice {
+                    id: ChoiceId::new(o.option_id.0.to_string()),
+                    label: o.name.clone(),
+                    description: None,
+                })
+                .collect(),
+            multi_select: false,
+            allows_free_text: false,
+        };
+        let id = RequestId::new(format!("r{wire_id}"));
+        self.questions.insert(
+            id.clone(),
+            PendingQuestion {
+                wire_id,
+                questions: request
+                    .options
+                    .iter()
+                    .map(|o| Value::String(o.option_id.0.to_string()))
+                    .collect(),
+                wire: QuestionWire::Interaction,
+            },
+        );
+        self.events
+            .send(DriverEvent::event(EventKind::RequestOpened(
+                Request::Question(QuestionRequest {
+                    id,
+                    questions: vec![question],
                 }),
             )))
             .await
@@ -1351,7 +1445,10 @@ impl Drive {
             PendingQuestion {
                 wire_id,
                 questions: list,
-                cursor,
+                wire: match cursor {
+                    true => QuestionWire::Cursor,
+                    false => QuestionWire::Grok,
+                },
             },
         );
         self.events
@@ -1703,16 +1800,19 @@ impl Drive {
         let Some(pending) = self.questions.remove(&request) else {
             return Ok(());
         };
-        let response = match (answer, pending.cursor) {
-            (crate::event::Answer::Question(answers), false) => {
+        let response = match (answer, pending.wire) {
+            (crate::event::Answer::Question(answers), QuestionWire::Grok) => {
                 question_response(&pending.questions, &answers)
             }
-            (crate::event::Answer::Question(answers), true) => {
+            (crate::event::Answer::Question(answers), QuestionWire::Cursor) => {
                 cursor_question_response(&pending.questions, &answers)
+            }
+            (crate::event::Answer::Question(answers), QuestionWire::Interaction) => {
+                interaction_response(&pending.questions, &answers)
             }
             (crate::event::Answer::Permission(_), _) => None,
         };
-        let response = response.unwrap_or_else(|| cancelled_question(pending.cursor));
+        let response = response.unwrap_or_else(|| cancelled_question(pending.wire));
         self.wire.respond(pending.wire_id, response).await?;
         Ok(())
     }
@@ -2001,12 +2101,24 @@ fn cursor_question_response(questions: &[Value], answers: &[QuestionAnswer]) -> 
 }
 
 /// The cancelled answer in the agent's own shape.
-fn cancelled_question(cursor: bool) -> Value {
-    if cursor {
-        json!({ "outcome": { "outcome": "cancelled" } })
-    } else {
-        json!({ "outcome": "cancelled" })
+fn cancelled_question(wire: QuestionWire) -> Value {
+    match wire {
+        QuestionWire::Grok => json!({ "outcome": "cancelled" }),
+        _ => json!({ "outcome": { "outcome": "cancelled" } }),
     }
+}
+
+/// Antigravity's accepted answer: the one chosen option, as the permission
+/// outcome. `None` (no single known choice) degrades to `cancelled`.
+fn interaction_response(options: &[Value], answers: &[QuestionAnswer]) -> Option<Value> {
+    let [QuestionAnswer::Choices(ids)] = answers else {
+        return None;
+    };
+    let [id] = ids.as_slice() else { return None };
+    options
+        .iter()
+        .any(|o| o.as_str() == Some(id.as_str()))
+        .then(|| json!({ "outcome": { "outcome": "selected", "optionId": id.as_str() } }))
 }
 
 /// Grok's accepted answer: `answers` keyed by question text, values the

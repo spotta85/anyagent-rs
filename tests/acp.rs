@@ -1460,6 +1460,74 @@ async fn cursor_model_switch_reveals_the_models_own_options() {
 }
 
 /// `cursor/ask_question` surfaces typed (prompt/allowMultiple read), and the answer goes back as `answered` with the option ids.
+/// Antigravity's ACP server asks through an `interaction_*` permission
+/// whose options are the choices: it surfaces as a question, never as a
+/// tool or a permission, and the answer is the chosen option id. Another
+/// agent's `interaction_*` tool is an ordinary tool and permission.
+#[tokio::test]
+async fn interaction_permissions_are_questions() {
+    let (session, mut events) = open(&[]).await;
+    session.prompt("interaction-question").await.unwrap();
+    let mut saw = (false, false);
+    loop {
+        let event = next(&mut events).await;
+        match event.kind {
+            EventKind::RequestOpened(Request::Permission(request)) => {
+                saw.0 = true;
+                session.answer(request.id, allow()).await.unwrap();
+            }
+            EventKind::RequestOpened(other) => panic!("a question on a plain agent: {other:?}"),
+            EventKind::ToolUpdated(tool) if tool.id.as_str() == "interaction_1" => saw.1 = true,
+            EventKind::TurnEnded { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(saw, (true, true), "(permission, tool) on a plain agent");
+    session.close().await.unwrap();
+
+    let (session, mut events) = open(&["--antigravity"]).await;
+    session.prompt("interaction-question").await.unwrap();
+    let mut text = String::new();
+    loop {
+        let event = next(&mut events).await;
+        match event.kind {
+            EventKind::RequestOpened(Request::Question(request)) => {
+                let q = &request.questions[0];
+                assert_eq!(q.text, "Red or blue?");
+                assert_eq!(
+                    q.choices
+                        .iter()
+                        .map(|c| c.label.as_str())
+                        .collect::<Vec<_>>(),
+                    ["Red", "Blue"]
+                );
+                assert_eq!(q.choices[1].id.as_str(), "2");
+                session
+                    .answer(
+                        request.id,
+                        Answer::Question(vec![QuestionAnswer::Choices(vec![ChoiceId::new("2")])]),
+                    )
+                    .await
+                    .unwrap();
+            }
+            EventKind::RequestOpened(other) => panic!("not a question: {other:?}"),
+            EventKind::ToolUpdated(tool) => panic!("question surfaced as a tool: {}", tool.title),
+            EventKind::TextDelta { text: t, .. } => text.push_str(&t),
+            EventKind::TurnEnded { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(text, r#"q={"outcome":"selected","optionId":"2"} "#);
+    assert!(
+        session
+            .info()
+            .details
+            .capabilities
+            .supports(Capability::Questions)
+    );
+    session.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn cursor_questions_round_trip_in_cursors_shape() {
     let runtime = Runtime::new();

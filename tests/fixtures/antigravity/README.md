@@ -41,12 +41,18 @@ stdio, driven by anyagent's existing ACP adapter.
 | acp-01-handshake | `initialize`: images, audio, embedded context, http and sse MCP, `loadSession`, four agent-driven `authMethods`; then `session/new` refused `-32000` because the server has no auth choice of its own yet |
 | acp-02-pong | with `auth.type: oauth-personal` in `~/.gemini/antigravity-acp/settings.json`: `session/new` (15 s the first time) returns modes `default` / `auto_edit` / `yolo`, 11 Gemini models, and the `model` config option; one prompt streams `pong` and ends `end_turn`; `available_commands_update` lists `plan` and `logout`. A raw OAuth URL line was printed on stdout after the turn |
 | acp-03-authenticate | no settings file: `authenticate {methodId: oauth-personal}` returns `{}` in 2.3 s with no browser, adopting the `agy` login; the adapter does this on the `-32000` |
+| acp-04-question | `ask_question`: a `tool_call` with id `interaction_*` titled by the question, then `session/request_permission` whose options are the choices, every one `allow_once`; the answer is `selected` with the `optionId`, and the model echoes the choice. The adapter surfaces it as a `Question` |
 
 `fixture.mjs` is the hand-written stand-in these recordings describe; it also
 answers the two side processes the adapter shells out to (`--version` and
 `--output-format=json models`).
 
 ## Wire notes
+
+- The ACP server has no steer: a second `session/prompt` while one runs is
+  held, and once the first ends the server reports "Concurrent
+  receive_steps() calls are not supported" and drops its agent connection
+  (probed 2026-09-07). anyagent queues mid-turn prompts instead.
 
 - `usage` is `{input_tokens, output_tokens, thinking_tokens,
   cache_read_tokens, total_tokens}` on every DONE `agent_response` and every
