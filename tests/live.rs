@@ -745,8 +745,13 @@ async fn tools_run_to_completion_and_the_file_lands() {
 #[ignore = "live: talks to real agents"]
 async fn permissions_gate_the_write_and_deny_holds() {
     for h in enabled().await {
-        let write =
-            "Create a file named note.txt containing exactly the word HELLO. Use your file tools.";
+        // Cursor gates shell commands, never its edit tool (wire-captured
+        // 2026-09-07): its write goes through the shell so the gate is hit.
+        let write = if h == "cursor" {
+            "Run the shell command `printf HELLO > note.txt` to create note.txt. Use the shell, not your file-edit tool. Do not verify afterwards."
+        } else {
+            "Create a file named note.txt containing exactly the word HELLO. Use your file tools."
+        };
         // Session A: allow — the request closes and the file lands.
         let (session, mut events, dir) = open(h).await;
         if !session
@@ -807,9 +812,8 @@ async fn permissions_gate_the_write_and_deny_holds() {
         // gates only its file tools. After denied write attempts the agent
         // can route around its own gate with a terminal `printf`, which
         // never asks. The denies themselves are delivered and honoured.
-        // KNOWN (cursor, wire-captured 2026-09-07): the mirror image — its
-        // edit tool never asks over ACP; only shell commands outside its
-        // allowlist do, so the deny lands on a verification command.
+        // KNOWN (cursor): after a denied shell write the model may still
+        // reach for its ungated edit tool.
         if matches!(h, "hermes" | "cursor") && dir.path().join("note.txt").exists() {
             println!("KNOWN {h}: denies honoured; the write went through an ungated tool");
         } else {
