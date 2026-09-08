@@ -97,14 +97,21 @@ Any other ACP agent works without a catalog entry via
 
 ## Docs
 
-Guides, concepts, and the full event reference live at
-**[anyagent.mintlify.site](https://anyagent.mintlify.site)**.
+**[anyagent.mintlify.site](https://anyagent.mintlify.site)**
 
-The generated API reference — every type and signature — is on
-[docs.rs/anyagent](https://docs.rs/anyagent).
+| Page | What it covers |
+|---|---|
+| [Quickstart](https://anyagent.mintlify.site/quickstart) | Install, discover, open, prompt, stream |
+| [Core API](https://anyagent.mintlify.site/core-api) | Runtime, Session, SessionOptions, every EventKind, requests, errors |
+| [Features](https://anyagent.mintlify.site/features) | Each feature: what, how, what confirms it, what gates it |
+| [Agents](https://anyagent.mintlify.site/agents) | Catalog, capability matrix, per-agent quirks, custom ACP agents |
+| [Building an app](https://anyagent.mintlify.site/building-an-app) | Step-by-step chat app: threads, permissions, settings, persistence, usage |
+| [Architecture](https://anyagent.mintlify.site/architecture) | Layers, the engine/adapter seam, adding an agent |
+
+Generated API reference, every type and signature: [docs.rs/anyagent](https://docs.rs/anyagent).
 
 ## Contributions
-Contributions are welcome! Please be sure to open an issue first. Upon approval you may create a pr. Please avoid contributing AI-Slop :) ... unless fable wrote it. Read [contributions.md](contributions.md) for more specifics!
+Contributions are welcome! Please be sure to open an issue first. Upon approval you may create a pr. Please avoid contributing AI-Slop :) ... unless fable wrote it. Read the [contributing guide](https://anyagent.mintlify.site/contributing) for the test tiers and what a PR needs.
 
 ## License
 
