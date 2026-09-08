@@ -112,6 +112,8 @@
   line-height: 1.55;
   text-wrap: pretty;
 }
+.hero-lead p { margin: 0; }
+.hero-lead p + p { margin-top: 0.6em; }
 .hero-lead .wordmark { color: var(--accent); font-weight: 700; }
 .hero-cta { display: flex; flex-wrap: wrap; gap: 12px; margin: 28px 0 8px; }
 .btn {
