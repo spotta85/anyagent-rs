@@ -1,0 +1,140 @@
+/* anyagent docs theme — palette copied from anyagent-landing.html.
+   Dark only; docs.json sets appearance.strict so there is no light mode.
+
+   This Mintlify build themes through space-separated RGB triplets consumed as
+   rgb(var(--x)), so the palette is defined once as triplets and feeds both
+   Mintlify's own variables and our --bg/--accent shorthands. */
+:root {
+  --rgb-bg:      21 21 21;      /* #151515 */
+  --rgb-surface: 28 28 28;      /* #1c1c1c */
+  --rgb-fg:     242 242 242;    /* #f2f2f2 */
+  --rgb-muted:  134 134 134;    /* #868686 */
+  --rgb-border:  46 46 46;      /* #2e2e2e */
+  --rgb-accent: 232 118 58;     /* #e8763a */
+
+  /* hand the palette to Mintlify */
+  --background-dark: var(--rgb-bg);
+  --background-light: var(--rgb-bg);
+  --default-border-color: var(--rgb-border);
+  --primary: var(--rgb-accent);
+  --primary-light: var(--rgb-accent);
+  --primary-dark: var(--rgb-accent);
+
+  /* our own shorthands */
+  --bg:      rgb(var(--rgb-bg));
+  --surface: rgb(var(--rgb-surface));
+  --fg:      rgb(var(--rgb-fg));
+  --muted:   rgb(var(--rgb-muted));
+  --border:  rgb(var(--rgb-border));
+  --accent:  rgb(var(--rgb-accent));
+  --on-accent:    var(--bg);
+  --accent-hover: oklch(75% 0.155 50);
+
+  /* ascii ramp, density 1..6 — read by fields.js, never hard-coded in JS */
+  --ascii-1: color-mix(in oklch, var(--accent) 16%, var(--bg));
+  --ascii-2: color-mix(in oklch, var(--accent) 30%, var(--bg));
+  --ascii-3: color-mix(in oklch, var(--accent) 46%, var(--bg));
+  --ascii-4: color-mix(in oklch, var(--accent) 64%, var(--bg));
+  --ascii-5: color-mix(in oklch, var(--accent) 82%, var(--bg));
+  --ascii-6: var(--accent);
+  --ascii-dot: color-mix(in oklch, var(--fg) 10%, var(--bg));
+
+  --tl-red:   oklch(65.5% 0.185 25);
+  --tl-amber: oklch(80.0% 0.145 80);
+  --tl-green: oklch(76.0% 0.170 145);
+
+  --font-display: 'SF Pro Display', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Helvetica, sans-serif;
+  --font-mono:    'SF Mono', ui-monospace, 'JetBrains Mono', Menlo, monospace;
+  --radius-md: 14px;
+  --radius-pill: 999px;
+  --motion: 180ms;
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* ─── ambient canvas fields (see fields.js) ─────────────────────────
+   Mintlify paints #background-color as a fixed sheet at z-index -10. The
+   fields sit one layer above it at -9, still below all content, and are
+   position:fixed so they hold still while the docs scroll. */
+.field {
+  position: fixed;
+  left: 0; right: 0;
+  z-index: -9;
+  pointer-events: none;
+  overflow: hidden;
+}
+.field canvas { display: block; width: 100%; height: 100%; }
+.field-ripple {
+  top: 0;
+  height: clamp(240px, 28vw, 380px);
+  opacity: 0.5;
+  -webkit-mask-image: linear-gradient(to bottom, black 0%, black 25%, transparent 100%);
+  mask-image: linear-gradient(to bottom, black 0%, black 25%, transparent 100%);
+}
+.field-dither {
+  bottom: 0;
+  height: clamp(200px, 24vw, 340px);
+  opacity: 0.4;
+  -webkit-mask-image: linear-gradient(to top, black 0%, black 35%, transparent 100%);
+  mask-image: linear-gradient(to top, black 0%, black 35%, transparent 100%);
+}
+
+/* navbar goes translucent so the ripple reads through it */
+#navbar {
+  background: color-mix(in oklch, var(--bg) 70%, transparent);
+  -webkit-backdrop-filter: blur(20px) saturate(1.3);
+  backdrop-filter: blur(20px) saturate(1.3);
+}
+
+/* ─── type ──────────────────────────────────────────────────────────
+   Tight tracking on display sizes is what makes the landing read as itself. */
+#page-title, #content h1 { font-family: var(--font-display); letter-spacing: -0.032em; }
+#content h2, #content h3 { font-family: var(--font-display); letter-spacing: -0.015em; }
+
+/* ─── code ──────────────────────────────────────────────────────────
+   Only *titled* blocks get Ghostty-style traffic lights: the header element
+   exists solely on those, so untitled snippets stay plain. */
+[data-component-part="code-block-header"]::before {
+  content: '';
+  flex: 0 0 auto;
+  align-self: center;
+  width: 44px; height: 12px;
+  margin-right: 12px;
+  border-radius: var(--radius-pill);
+  background:
+    radial-gradient(circle 6px at 6px  50%, var(--tl-red)   98%, transparent),
+    radial-gradient(circle 6px at 22px 50%, var(--tl-amber) 98%, transparent),
+    radial-gradient(circle 6px at 38px 50%, var(--tl-green) 98%, transparent);
+}
+
+/* ─── hero (home page only) ─────────────────────────────────────────*/
+.hero-lead {
+  font-size: clamp(16px, 1.25vw, 19px);
+  line-height: 1.55;
+  text-wrap: pretty;
+}
+.hero-lead .wordmark { color: var(--accent); font-weight: 700; }
+.hero-cta { display: flex; flex-wrap: wrap; gap: 12px; margin: 28px 0 8px; }
+.btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-height: 44px;
+  padding: 0 22px;
+  border-radius: var(--radius-pill);
+  border: 1px solid transparent;
+  font-size: 15px; font-weight: 500; letter-spacing: -0.01em;
+  white-space: nowrap;
+  text-decoration: none;
+  transition: background var(--motion) var(--ease),
+              border-color var(--motion) var(--ease),
+              transform 60ms var(--ease);
+}
+.btn:active { transform: translateY(1px); }
+.btn-primary {
+  background: var(--accent);
+  color: var(--on-accent);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+/* contrast rises on hover — never the other way round */
+.btn-primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+.btn-secondary { background: var(--surface); color: var(--fg); border-color: var(--border); }
+.btn-secondary:hover { border-color: color-mix(in oklch, var(--fg) 45%, transparent); }
