@@ -7,10 +7,16 @@ icon: "rocket"
 ## Requirements
 
 - Rust 1.88 or newer (edition 2024)
-- A [supported agent](/supported-agents) installed and logged in
-- A Tokio runtime — anyagent is built on Tokio
+- A [supported agent](/agents) installed and logged in
+- A Tokio runtime
 
 ## Install
+
+```bash
+cargo add anyagent futures tokio --features tokio/rt-multi-thread,tokio/macros
+```
+
+That adds these to `Cargo.toml`:
 
 ```toml Cargo.toml
 [dependencies]
@@ -29,15 +35,15 @@ use futures::StreamExt;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = Runtime::new();
 
-    // Find what's on this machine, then insist on one of them.
+    // 1. Find what's on this machine, then insist on one of them.
     let report = runtime.discover().await;
     let agent = report.require("claude")?;
 
-    // Open a session; you get a command handle and an event stream.
+    // 2. Open a session: a command handle and an event stream.
     let (session, mut events) = runtime.open(agent, SessionOptions::in_dir(".")).await?;
 
+    // 3. Prompt, then drain events until the turn ends.
     session.prompt("explain this repo").await?;
-
     while let Some(event) = events.next().await {
         match event?.kind {
             EventKind::TextDelta { text, .. } => print!("{text}"),
@@ -51,38 +57,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+What just happened:
+
+```text
+discover()  →  report.agents (installed)  +  report.missing (with install hints)
+open()      →  spawns the agent, handshakes, returns (Session, Events)
+prompt()    →  starts a turn
+Events      →  TurnStarted, TextDelta…, TurnEnded
+close()     →  ends the process
+```
+
 <Note>
 `Session` is cheap to clone and every clone talks to the same engine task, so
 you can prompt from one task while another drains `Events`.
 </Note>
 
-## Handling a permission
-
-Most real turns hit a permission request. Answer it and the turn continues:
-
-```rust
-use anyagent::{Answer, EventKind, PermissionChoice, Request};
-
-EventKind::RequestOpened(Request::Permission(request)) => {
-    println!("allow {}?", request.tool.title);
-    session
-        .answer(request.id, Answer::Permission(PermissionChoice::AllowOnce))
-        .await?;
-}
-```
-
-If you don't want to make that call yourself, open the session with
-`SessionOptions::in_dir(".").permission_mode(PermissionMode::AutoApprove)` and
-anyagent approves each request without forwarding it.
-
 ## Run the examples
 
 The repo's [`examples/`](https://github.com/spotta85/anyagent-rs/tree/main/examples)
-folder is the tour — small, commented programs against the real agents on
-your machine:
+folder has three small programs that run against the agents on your machine:
 
 ```bash
-cargo run --example chat -- claude      # the core loop: prompt, stream, answer
+cargo run --example chat -- claude      # prompt, stream, answer, steer
 cargo run --example sessions -- claude  # several sessions at once, then resume
 cargo run --example probe               # what's installed, logged in, and capable
 ```
@@ -90,10 +86,10 @@ cargo run --example probe               # what's installed, logged in, and capab
 ## Next
 
 <CardGroup cols={2}>
-  <Card title="Concepts" icon="book" href="/concepts">
-    The vocabulary the API is built on.
+  <Card title="Core API" icon="code" href="/core-api">
+    The full public interface on one page.
   </Card>
-  <Card title="Sessions" icon="terminal" href="/guides/sessions">
-    Steering, queuing, cancelling, configuring.
+  <Card title="Building an app" icon="window" href="/building-an-app">
+    Threads, streaming, permissions, model picker, persistence.
   </Card>
 </CardGroup>

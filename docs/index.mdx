@@ -1,14 +1,14 @@
 ---
-title: "anyagent"
+title: "Overview"
 description: "One Rust interface to the coding agents installed on a machine."
 icon: "house"
 mode: "wide"
 ---
 
 <div className="hero-lead">
-Users have Claude Code, Codex, Grok, opencode, Kiro, and friends on their
-machines — each with its own CLI, protocol, and quirks. If you build an app on
-top of them, you end up writing a driver per agent.
+Users already have Claude Code, Codex, Cursor, opencode, Kiro, and friends
+installed and logged in. Each one has its own CLI, protocol, and quirks, so an
+app built on top of them ends up with a driver per agent.
 
 <b className="wordmark">anyagent</b> is that layer, written once. It finds the
 agents, speaks each one's protocol (native or
@@ -20,47 +20,66 @@ agents, speaks each one's protocol (native or
   <a className="btn btn-secondary" href="https://crates.io/crates/anyagent">crates.io</a>
 </div>
 
-## The whole flow
+## Three objects
 
 ```text
 Runtime::discover()  ->  Runtime::open()  ->  (Session, Events)
+
+  your app ── prompt / answer / configure ──►  Session
+                                                  │
+                                                  ▼
+                                            agent process
+                                                  │
+  your UI  ◄── text / tools / requests / usage ── Events
 ```
 
-- **`Runtime`** finds agents and opens sessions.
-- **`Session`** is the command handle: prompt, answer, configure, cancel.
-- **`Events`** is the stream coming back: text, tool calls, requests, turn ends.
+| Object | Role | You call it for |
+|---|---|---|
+| `Runtime` | Finds agents, opens sessions | `discover`, `probe`, `open`, `generate`, `plan_usage` |
+| `Session` | Command handle for one live conversation | `prompt`, `answer`, `configure`, `cancel`, `rollback`, `close` |
+| `Events` | The stream everything comes back on | one `match` on `EventKind` |
 
-Your app keeps its own transcript, UI, and policy. anyagent owns the processes,
-the wires, and the turn rules — so every agent behaves the same way through it.
+## Who owns what
 
-<CardGroup cols={2}>
-  <Card title="Quickstart" icon="play" href="/quickstart">
-    Install the crate and run your first turn.
-  </Card>
-  <Card title="Features" icon="sparkles" href="/features">
-    Everything anyagent does, and the API that drives each piece.
-  </Card>
-  <Card title="Concepts" icon="book" href="/concepts">
-    Session, turn, prompt, steer, request — the shared vocabulary.
-  </Card>
-  <Card title="Supported agents" icon="list" href="/supported-agents">
-    What ships in the catalog, and how to add your own ACP agent.
-  </Card>
-  <Card title="Events" icon="bolt" href="/guides/events">
-    Every `EventKind` and what it means.
-  </Card>
-</CardGroup>
+| anyagent owns | Your app owns |
+|---|---|
+| Finding and launching agent processes | The transcript store |
+| Speaking each wire | Titles, threads, worktrees |
+| Turn rules: one `TurnEnded` per turn, steer or queue, request lifetimes | The UI and the policy behind it |
+| Normalizing events and tool calls | What to do with a permission request |
 
 ## Design rules
 
-Three rules keep the interface honest:
-
-1. **Same types for every agent.** Anything provider-specific rides in
+1. **Same types for every agent.** Provider-specific data rides in
    `extensions` instead of leaking into the API.
 2. **Capabilities are reported, not assumed.** After `open`, the session tells
-   you what this agent can actually do on this connection.
+   you what this agent can do on this connection. Gate features on that, not
+   on the agent's name.
 3. **A turn ends exactly once.** Whether the wire said so or anyagent inferred
    it, you get one `TurnEnded`.
+
+## Where to go
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install, discover, open, prompt, stream, answer one permission.
+  </Card>
+  <Card title="Core API" icon="code" href="/core-api">
+    Runtime, Session, SessionOptions, every EventKind, requests, errors.
+  </Card>
+  <Card title="Features" icon="sparkles" href="/features">
+    Each thing anyagent does, in a few sentences and one snippet.
+  </Card>
+  <Card title="Agents" icon="plug" href="/agents">
+    The catalog, the capability matrix, per-agent quirks, custom ACP agents.
+  </Card>
+  <Card title="Building an app" icon="window" href="/building-an-app">
+    How the pieces fit in a real chat app: threads, streaming, permissions, persistence.
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/architecture">
+    The codebase map and how an event travels from wire to your UI.
+  </Card>
+</CardGroup>
 
 ## License
 

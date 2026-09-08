@@ -1,0 +1,221 @@
+---
+title: "Agents"
+description: "The catalog, what each agent can do, per-agent quirks, and how to connect one that isn't listed."
+icon: "plug"
+---
+
+anyagent ships a catalog of known agents. Each entry says how to find the
+CLI, how to launch it in protocol mode, and the quirks verified against a
+real install. Guessed flags never ship.
+
+## Catalog
+
+| Agent | id | CLI | Wire | Install |
+|---|---|---|---|---|
+| Claude Code | `claude` | `claude` | native (stream-json) | `npm install -g @anthropic-ai/claude-code` |
+| Codex | `codex` | `codex` | native (app-server) | `npm install -g @openai/codex` |
+| opencode | `opencode` | `opencode` | native (HTTP + SSE) | `brew install sst/tap/opencode` |
+| pi | `pi` | `pi` | native (pi RPC) | `npm install -g @earendil-works/pi-coding-agent` |
+| Antigravity | `antigravity` | `agy`, or its ACP server | native (stream-json), ACP with the server | [antigravity.google](https://antigravity.google), then `agy install` |
+| Cursor CLI | `cursor` | `cursor-agent` | ACP | `curl https://cursor.com/install -fsS \| bash` |
+| Grok | `grok` | `grok` | ACP | `npm install -g @xai-official/grok` |
+| Hermes Agent | `hermes` | `hermes` | ACP | [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) |
+| Kiro CLI | `kiro` | `kiro-cli` | ACP | [kiro.dev](https://kiro.dev) |
+| Qwen Code | `qwen` | `qwen` | ACP | `npm install -g @qwen-code/qwen-code` |
+
+Native wires are driven directly by an adapter written for that agent. ACP
+agents share one adapter that speaks the
+[Agent Client Protocol](https://agentclientprotocol.com).
+
+## Capability matrix
+
+What each adapter reports after `open`. Read it from
+`session.info().details.capabilities` at runtime; never hardcode this table.
+
+| Capability | claude | codex | opencode | pi | antigravity (agy) | ACP agents |
+|---|:-:|:-:|:-:|:-:|:-:|:-:|
+| `Images` | ✓ | ✓ | ✓ | ✓ | | handshake |
+| `Resume` | ✓ | ✓ | ✓ | ✓ | ✓ | handshake |
+| `Steer` | | ✓ | | ✓ | | handshake |
+| `Permissions` | ✓ | ✓ | ✓ | | | ✓ |
+| `Questions` | ✓ | | ✓ | ✓ | | on first sight |
+| `Rollback` | ✓ | ✓ | ✓ | | | |
+| `RollbackFiles` | ✓ | | | | | |
+| `Fork` | ✓ | ✓ | ✓ | | | |
+| `Compact` | ✓ | ✓ | ✓ | ✓ | | |
+| `SlashCommands` | ✓ | ✓ | ✓ | ✓ | | ✓ |
+| `Plan` | ✓ | ✓ | ✓ | | | ✓ |
+| `Subagents` | ✓ | ✓ | ✓ | | | |
+| `ContextUsage` | ✓ | ✓ | ✓ | ✓ | ✓ | on first sight |
+| `PlanUsage` | ✓ | ✓ | | | | |
+
+- **handshake**: the ACP `initialize` response says whether the agent takes
+  images, loads sessions, and accepts steering. Cursor, for example, reports
+  images and resume; Antigravity's server reports no steer.
+- **on first sight**: ACP has no handshake flag for these. The capability is
+  added, with a `SessionUpdated`, the first time the agent sends one.
+
+Every gate holds the same way: an unsupported call fails typed with
+`UnsupportedFeature` instead of misbehaving.
+
+## Config options by agent
+
+| Agent | `model` | `effort` | `fast` | `mode` | other |
+|---|:-:|:-:|:-:|:-:|---|
+| claude | live | live, from the model | live, when the model supports it | | |
+| codex | live | live, from its catalog | live | | `sandbox`, approval policy |
+| opencode | live (`provider/id`) | live, as the model's `variant` | | | |
+| pi | live | live, thinking levels | | | |
+| antigravity (agy) | at open only | | | at open only (`accept-edits`, `plan`) | reopen with the resume token to change |
+| antigravity (ACP) | live | | | live | Gemini models only |
+| cursor | live | per model | per model | live (`agent`, `plan`, `ask`) | `thinking`, `context` per model |
+| grok | live | live, with grok's labels | | | |
+| kiro | live | live (`low` … `max`), absent on models without it | | | |
+| hermes, qwen | live | none | | | |
+
+## Per-agent notes
+
+<AccordionGroup>
+<Accordion title="Claude Code">
+The fullest native adapter. `fast` appears when the selected model reports
+`supportsFastMode`; switching it resumes the process under the hood with the
+same `Session` handle and conversation. Rollback can restore files.
+</Accordion>
+
+<Accordion title="Codex">
+Opts into the app-server's experimental API. Approval policy and sandbox
+switch live. Images ride as `localImage` items. Client MCP servers ride as
+launch overrides (stdio and HTTP; no SSE). `rollback` maps to
+`thread/revert`; files are never restored. Questions are translated
+defensively but the capability stays off until observed live.
+</Accordion>
+
+<Accordion title="opencode">
+anyagent starts `opencode serve` on a private localhost port per session,
+gated by a per-session secret, and drives its HTTP + SSE wire. Task-tool
+child sessions nest as subagents. No steer (mid-turn prompts queue) and no
+plan quota. Pass a model as `configure("model", "provider/id")`; opencode's
+free `opencode/…` models need no key. To drive it over ACP instead:
+`AgentInstallation::acp("opencode", path, ["acp"])`.
+</Accordion>
+
+<Accordion title="pi">
+Provider-key based: log in with `/login <provider>` inside the CLI, or set the
+provider's API-key variable. `generate` launches with `--no-tools --no-session`,
+so it is text-only and nothing is saved.
+</Accordion>
+
+<Accordion title="Antigravity: two ways in">
+Discovery picks the richer wire that is installed:
+
+```text
+discover("antigravity")
+  ├─ ACP server found  ──►  open over ACP: permissions, questions,
+  │                         in-process cancel, live mode and model switch,
+  │                         images, PDFs, diffs, slash commands
+  │                         (Gemini models only)
+  └─ only `agy` found  ──►  open over agy's headless stream-json wire:
+                            text, tools, resume, context usage, cancel by
+                            respawn; every model `agy models` lists
+                            → installation.upgrade names the server
+```
+
+The headless `agy` wire cannot prompt: in `Ask` mode every permission-gated
+tool is denied by the agent itself (the tool shows as failed), `AutoApprove`
+launches with `--dangerously-skip-permissions`, questions are skipped with a
+diagnostic, and a mid-turn prompt queues. Cancel kills the process and resumes
+the conversation in a fresh one, about two seconds.
+
+The ACP server is Google's own (`antigravity-acp` in the
+[ACP registry](https://github.com/agentclientprotocol/registry/blob/main/antigravity-acp/agent.json),
+a 314 MB download). It reuses the `agy` login: anyagent calls its
+`authenticate` once per open (about 2 s, no browser), or set `auth.type` in
+`~/.gemini/antigravity-acp/settings.json` to skip that. When only `agy` is
+found, the installation carries `upgrade: Some(MissingAgent)` with the
+download hint:
+
+```rust
+if let Some(upgrade) = &agent.upgrade {
+    ui.offer_install(&upgrade.name, &upgrade.install_hint);
+}
+```
+
+Force the headless CLI with `ANYAGENT_ANTIGRAVITY_BIN=~/.local/bin/agy`.
+Google's terms restrict third-party tools driving a personal Antigravity
+login; the ACP server is the sanctioned path. Surface that choice to users.
+</Accordion>
+
+<Accordion title="Cursor CLI">
+Runs over `cursor-agent acp`. Permission requests gate shell commands outside
+its allowlist; file edits never ask, so sandbox accordingly. Before the
+handshake anyagent runs `cursor-agent about` for the version and account and
+fails typed with `cursor-agent login` when logged out. A model switch adopts
+that model's own options (`effort`, `fast`, `thinking`, `context`). Cursor's
+extension requests are answered: `ask_question` becomes a `Question`,
+`update_todos` drives the plan, `task` (a subagent run) is surfaced as a
+header only. Cursor reports no context usage, so each turn ends with an
+estimate (4 chars ≈ 1 token) labelled `anyagent/estimated` in extensions.
+</Accordion>
+
+<Accordion title="Kiro CLI">
+Its credential lives in a sqlite row that exists logged out too, so discovery
+reports `Unknown` and `probe` answers for real. `effort` is exposed as a live
+option even though ACP advertises none: the adapter reads the level from
+kiro's metadata and switches it by running `/effort <level>` as a hidden
+prompt between turns.
+</Accordion>
+
+<Accordion title="Hermes Agent">
+Only its file tools ask permission. Its terminal tool runs without asking, so
+a denied write does not stop it from writing via shell. Hermes never sends
+tool status updates. No `effort` option.
+</Accordion>
+
+<Accordion title="Grok and Qwen Code">
+Plain ACP. Grok exposes `effort` from the model's `reasoningEfforts`; qwen
+exposes none. Both log in through their own TUI.
+</Accordion>
+</AccordionGroup>
+
+<Note>
+Compaction is native-adapter only. ACP has no compaction in schema 1.7, so
+ACP agents refuse with `UnsupportedFeature`.
+</Note>
+
+## Any other ACP agent
+
+No catalog entry needed. Build the installation yourself:
+
+```rust
+use anyagent::{AgentInstallation, Runtime, SessionOptions};
+
+let agent = AgentInstallation::acp(
+    "my-agent",                    // display name
+    "/usr/local/bin/my-agent",     // executable
+    vec!["acp".into()],            // args that put it in ACP mode
+);
+let (session, events) = Runtime::new().open(&agent, SessionOptions::in_dir(".")).await?;
+```
+
+Events, requests, and capabilities are identical downstream. What you lose is
+the catalog's verified quirks: launch flags, login markers, auth error hints.
+
+## Pointing at a specific binary
+
+Every catalog entry reads `ANYAGENT_<AGENT>_BIN` first:
+
+```bash
+ANYAGENT_CLAUDE_BIN=/path/to/claude cargo run --example probe
+```
+
+Or skip discovery with `AgentInstallation::at(id, executable)`.
+
+## Several logins of the same agent
+
+```rust
+SessionOptions::in_dir(".").config_home("/path/to/work-account")
+```
+
+anyagent sets the agent's own config-home variable (`CLAUDE_CONFIG_DIR`,
+`CODEX_HOME`, …) for that process. An agent with no such variable fails with
+`InvalidConfiguration`; an isolation request is never silently dropped.

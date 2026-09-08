@@ -1,0 +1,94 @@
+---
+title: "Contributing"
+description: "Development setup, the test tiers, and what a PR needs."
+icon: "code-pull-request"
+---
+
+## Flow
+
+1. Open an issue first and get it approved.
+2. Fork, branch, make the change.
+3. Open a PR with the proof described below.
+
+## Setup
+
+```bash
+git clone https://github.com/spotta85/anyagent-rs && cd anyagent-rs
+cargo install just        # the dev front door; `just` lists every command
+just check                # fmt, clippy, offline tests
+```
+
+Rust 1.88 or newer. For live tests, the agent you are touching must be
+installed and logged in.
+
+## Code
+
+Write the smallest amount of code that does the job. No AI slop.
+
+Comments:
+
+- Every function gets a 1-2 line doc comment: what it does, what flows in and out.
+- Non-trivial chunks inside a function can get a short comment.
+- Nothing else.
+
+Main functions hold the high-level flow and read top to bottom; helpers sit
+below them. Adapters never decide turn rules; see
+[Architecture](/architecture#the-seam).
+
+## Test tiers
+
+| Tier | Command | What it proves | Needs |
+|---|---|---|---|
+| Offline | `just check` | Engine contract (`conformance.rs`), each adapter against recorded fixtures | nothing |
+| Live, one feature | `just live claude cancel` | The feature against the real agent | the agent installed and logged in |
+| Live, all | `just live all` | The full matrix in `tests/live.rs` | every agent |
+
+`just features` lists the live feature names. `just live` always runs with
+one test thread; parallel runs open many real sessions at once.
+
+Live rules:
+
+- Never touch real auth: no deleting or moving `~/.claude`, `~/.hermes`,
+  `~/.local/share/opencode`, no logouts.
+- `SKIP` lines are passes. Capability gates and missing keys skip with a
+  reason.
+- A failure on model output only (wrong word, empty text) with correct
+  structure: rerun once. Two identical failures are a finding. A structural
+  failure (missing event, wrong error type, hung) is a finding immediately.
+
+## What a PR needs
+
+| Change | Proof to include |
+|---|---|
+| Any | `just check` passes |
+| Touches a wire or adapter | `just live <harness> <feature>` output for every harness it touches |
+| Adds or changes a feature | Its test in `tests/live.rs` added or updated |
+| Changes the public interface | Say so in the description, with what and why. Docs updated in the same PR |
+| Fixes a wire bug | A `record_wire` capture or fixture showing the bug, and the test that now passes |
+
+A PR that changes the interface without updating the docs will not be merged.
+
+## Recording a wire
+
+When an agent misbehaves, capture exactly what crossed the wire:
+
+```rust
+SessionOptions::in_dir(".").record_wire("/tmp/claude.jsonl")
+```
+
+Recordings are unredacted. Strip anything sensitive before turning one into a
+fixture under `tests/fixtures/<agent>/`.
+
+## Docs
+
+The docs are Mintlify pages under `docs/`. Keep each page to one job:
+
+| Page | Job |
+|---|---|
+| Core API | The interface. One row per method or variant, no feature prose |
+| Features | What each feature does, a few sentences and one snippet |
+| Agents | Catalog, capability matrix, per-agent quirks |
+| Building an app | Glue code for a real app |
+| Architecture | Internals |
+
+If a fact belongs on another page, link to it rather than repeating it.

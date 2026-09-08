@@ -1,0 +1,354 @@
+---
+title: "Building an app"
+description: "A step-by-step walkthrough of a real chat app on anyagent: pick an agent, log in, open a session, stream, answer requests, persist, show usage."
+icon: "window"
+---
+
+This is the shape of an app like Comet, laptop-agent, or T3 Code: a thread
+list on the left, a chat on the right, a settings menu, and a usage page.
+Follow the steps in order; each one is a few lines of glue over the
+[Core API](/core-api).
+
+```text
+ ┌──────────────── your app ────────────────┐
+ │ thread list │ chat view      │ settings  │
+ │  badges     │ text, tools,   │ model,    │
+ │             │ permissions    │ effort    │
+ └──────┬──────┴───────▲────────┴─────┬─────┘
+        │              │              │
+   StatusChanged    Events        configure()
+        │              │              │
+        └──────► Session ◄────────────┘
+                    │
+                agent process
+```
+
+## 1. Find the agents and pick one
+
+`discover` is instant and gives you both lists: installed, and missing with
+install hints. Show both.
+
+```rust
+let runtime = Runtime::new();
+runtime.prewarm();                      // start scanning while the window opens
+
+let report = runtime.discover().await;
+for agent in &report.agents {
+    ui.agent_row(&agent.name, agent.auth.as_ref());   // auth here is a best-effort offline guess
+}
+for missing in &report.missing {
+    ui.install_row(&missing.name, &missing.install_hint);
+}
+let agent = report.require(&chosen_id)?.clone();
+```
+
+
+## 2. Check login, show the login command
+
+`probe` asks the agent itself. If it is logged out you get the exact command
+or env var to show; anyagent never runs a login flow.
+
+```rust
+let details = runtime.probe(&agent).await?;
+if let AuthStatus::Unauthenticated { login } = &details.auth {
+    for method in login {
+        match method {
+            LoginMethod::Terminal { command, description, .. } => ui.login_button(command, description),
+            LoginMethod::EnvVar { name } => ui.env_hint(name),
+            _ => {}
+        }
+    }
+    return Ok(());
+}
+```
+
+Keep `details`: its `capabilities` and `config_options` drive the next steps.
+
+
+## 3. Open a session
+
+Build the options from the thread's state. This is the whole decision
+table an app needs:
+
+```rust
+let mut options = SessionOptions::in_dir(&thread.repo_dir);
+if let Some(token) = &thread.resume_token {
+    options = options.resume(token.clone());                    // continue an old conversation
+}
+if thread.unattended {
+    options = options.permission_mode(PermissionMode::AutoApprove);
+}
+if let Some(model) = &thread.model {
+    options = options.configure("model", model.as_str());
+}
+
+let (session, events) = match runtime.open(&agent, options).await {
+    Ok(pair) => pair,
+    Err(AgentError::ResumeFailed(_)) => {
+        // the token went stale: start fresh, keep your transcript
+        runtime.open(&agent, SessionOptions::in_dir(&thread.repo_dir)).await?
+    }
+    Err(AgentError::AuthRequired { login }) => return ui.show_login(login),
+    Err(e) => return Err(e.into()),
+};
+thread.save_info(session.info());   // resume token, capabilities, options
+```
+
+
+## 4. One task per session, persist before render
+
+Hand `Events` to its own task. Keep a `Session` clone wherever the UI sends
+commands. Store every event first; replay needs nothing else because each
+carries `sequence` and `occurred_at`.
+
+```rust
+let thread_id = thread.id;
+let ui = ui.clone();
+tokio::spawn(async move {
+    while let Some(event) = events.next().await {
+        let event = match event {
+            Ok(e) => e,
+            Err(err) => { ui.thread_failed(thread_id, err); break }
+        };
+        store.append(thread_id, &event);
+        render(&ui, thread_id, event);
+    }
+    ui.thread_closed(thread_id);       // the stream ended: close() or the agent died
+});
+```
+
+
+## 5. Render the events
+
+One `match` covers every agent. Skip nested events for the main transcript
+and render them under their parent tool.
+
+```rust
+fn render(ui: &Ui, thread: ThreadId, event: Event) {
+    let nested = event.turn_info.as_ref().is_some_and(|t| t.parent_tool_id.is_some());
+    match event.kind {
+        // content
+        EventKind::TextDelta { message_id, text } if !nested => ui.append(thread, message_id, text),
+        EventKind::ReasoningDelta { text, .. } if !nested => ui.append_thinking(thread, text),
+        EventKind::MessageEnded { message_id } => ui.finish_message(thread, message_id),
+
+        // tools: ToolUpdated is a full snapshot, replace by id
+        EventKind::ToolUpdated(tool) => ui.upsert_tool(thread, event.turn_info, tool),
+        EventKind::ToolOutputDelta { tool_id, text } => ui.append_tool_output(thread, tool_id, text),
+        EventKind::PlanUpdated { entries } => ui.set_plan(thread, entries),   // replaces, not appends
+
+        // requests: step 6
+        EventKind::RequestOpened(request) => ui.open_request(thread, request),
+        EventKind::RequestClosed { request_id } => ui.close_request(thread, request_id),
+
+        // session state
+        EventKind::StatusChanged(status) => ui.set_badge(thread, status),
+        EventKind::SessionUpdated(info) => { store.save_info(thread, &info); ui.rebuild_settings(thread, &info) }
+        EventKind::ContextUsage { used_tokens, window_tokens, .. } => ui.set_gauge(thread, used_tokens, window_tokens),
+
+        // turn boundaries
+        EventKind::TurnStarted { .. } => ui.start_turn(thread),
+        EventKind::TurnEnded { stop, background } => ui.end_turn(thread, stop, background),
+
+        EventKind::Diagnostic(d) => tracing::warn!(?d),
+        _ => {}
+    }
+}
+```
+
+| `StopReason` | Show |
+|---|---|
+| `Completed { source: Protocol }` | done |
+| `Completed { source: Inferred }` | idle. anyagent stopped waiting; the agent did not say it was finished |
+| `Cancelled` | stopped |
+| `Refused` | the agent declined |
+| `Failed { message }` | error, with the message |
+
+`background` lists tools still running after the turn (subagents,
+backgrounded shells). Their completion usually shows up as a later turn
+with `TurnOrigin::Agent`.
+
+
+## 6. Permissions and questions
+
+Render exactly the choices the agent offered. Answer once. Clear the dialog
+on `RequestClosed`, which also fires when a cancelled turn withdraws the
+request.
+
+```rust
+fn open_request(ui: &Ui, session: Session, request: Request) {
+    match request {
+        Request::Permission(r) => {
+            // r.tool is the ToolUpdate awaiting approval (title, input, diffs)
+            ui.permission_dialog(r.tool, r.detail, r.options, move |choice| {
+                let session = session.clone();
+                async move { session.answer(r.id.clone(), Answer::Permission(choice)).await }
+            });
+        }
+        Request::Question(r) => {
+            // one answer per question, in order; choices or free text per q.allows_free_text
+            ui.question_form(r.questions, move |answers: Vec<QuestionAnswer>| {
+                let session = session.clone();
+                async move { session.answer(r.id.clone(), Answer::Question(answers)).await }
+            });
+        }
+    }
+}
+```
+
+While a request is open the thread's status is `NeedsInput`, so the thread
+list badge comes for free from step 5.
+
+
+## 7. Send, steer, cancel
+
+The send box calls `prompt` no matter what the session is doing. The
+`Delivery` tells you whether it started a turn, steered the running one, or
+queued.
+
+```rust
+async fn send(session: &Session, text: String, files: Vec<PathBuf>) -> Result<(), AgentError> {
+    let mut input = Input::text(text);
+    for f in files { input = input.attach(f); }
+    match session.prompt(input).await?.kind {
+        DeliveryKind::Started { .. } | DeliveryKind::Steered { .. } => {}
+        DeliveryKind::Queued { position } => ui.show_queued(position),
+    }
+    Ok(())
+}
+
+// stop button
+session.cancel(false).await?;    // true also drops queued prompts
+```
+
+Show attachments inline only when
+`capabilities.supports(Capability::Images)`; otherwise the agent reads them
+by path.
+
+
+## 8. Settings menu
+
+Render `config_options` as-is: each `Select` is a dropdown, each `Boolean`
+a toggle. Rebuild the menu from every `SessionUpdated`, because switching
+`model` changes which other options exist.
+
+```rust
+fn rebuild_settings(ui: &Ui, session: &Session, info: &SessionInfo) {
+    ui.clear_settings();
+    for option in &info.details.config_options {
+        let session = session.clone();
+        let id = option.id.clone();
+        match &option.kind {
+            ConfigKind::Select { choices } => ui.dropdown(&option.name, choices, &option.current, move |v| {
+                let s = session.clone(); let id = id.clone();
+                async move { s.configure(id, v).await }
+            }),
+            ConfigKind::Boolean => ui.toggle(&option.name, &option.current, move |b| {
+                let s = session.clone(); let id = id.clone();
+                async move { s.configure(id, b).await }
+            }),
+            _ => {}
+        }
+    }
+}
+```
+
+Feature buttons are gated the same way, never by agent name:
+
+```rust
+let caps = &info.details.capabilities;
+ui.show_fork(caps.supports(Capability::Fork));
+ui.show_rollback(caps.supports(Capability::Rollback), caps.supports(Capability::RollbackFiles));
+ui.show_compact(caps.supports(Capability::Compact));
+```
+
+
+## 9. Persist and resume
+
+Two things per thread: the event log (step 4) and the latest `SessionInfo`
+(step 3 and every `SessionUpdated`). The info carries the `resume_token`.
+
+```rust
+// tomorrow, after restart
+let info = store.load_info(thread_id);
+let token = info.resume_token.clone().ok_or("this agent cannot resume")?;
+let (session, events) = runtime
+    .open(&info.agent, SessionOptions::in_dir(&repo).resume(token))
+    .await?;
+```
+
+Resume brings back the agent's context, not your transcript, so render the
+stored events first, then attach the new stream. The token is opaque; store
+it as-is.
+
+
+## 10. Titles, commit messages, PR bodies
+
+These need text, not a conversation. `generate` opens a throwaway session
+with tools off, returns the reply, and closes.
+
+```rust
+let title = runtime
+    .generate(&agent, SessionOptions::in_dir(&repo), format!("five-word title for: {first_prompt}"))
+    .await?;
+store.set_title(thread_id, title);
+```
+
+
+## 11. Usage page
+
+Two gauges. Per thread: the `ContextUsage` event from step 5. Per account:
+
+```rust
+for entry in runtime.plan_usage_all().await {              // one call, every installed agent
+    match entry.usage {
+        Ok(usage) => ui.quota_card(&entry.agent.name, usage),   // plan name, 5-hour and weekly windows
+        Err(_) => {}                                            // no subscription or no PlanUsage capability
+    }
+}
+```
+
+
+## 12. Headless and background runs
+
+A worker that runs unattended (a kanban card, a scheduled task) is the same
+code with two option changes and no dialogs:
+
+```rust
+let options = SessionOptions::in_dir(&repo)
+    .permission_mode(PermissionMode::AutoApprove)   // allow every tool request
+    .configure("mode", "accept-edits");             // if the agent has such a mode
+```
+
+Questions still arrive as `RequestOpened`; a headless worker should answer
+them with a default or cancel the turn. Watch `Diagnostic` events for stall
+warnings (`stall_after`, default 120 s of silence).
+
+
+## 13. Test it without an agent installed
+
+Run the same code over a scripted agent with the `mock` feature. The
+engine, turn rules, and event shapes are real.
+
+```rust
+let runtime = Runtime::with_mock(Script::default().turn(vec![
+    Step::Emit(text("m1", "hi")),
+    Step::Emit(permission("p1")),
+    Step::AwaitAnswer,
+    Step::End(completed()),
+]));
+let agent = runtime.discover().await.require("mock")?.clone();
+// steps 3 to 7 run unchanged
+```
+
+
+## What your app never does
+
+| Not your job | anyagent does it |
+|---|---|
+| Parse a wire or know an agent's flags | the adapters |
+| Decide when a turn ended | one `TurnEnded` per turn, always |
+| Decide steer vs queue | `prompt` returns the `Delivery` |
+| Track which requests are open | `RequestClosed`, `NeedsInput` |
+| Hardcode models or feature support | `config_options`, `capabilities` |
+| Read credentials or call vendor HTTP | `probe`, `plan_usage` |

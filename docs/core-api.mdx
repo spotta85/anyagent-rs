@@ -1,0 +1,303 @@
+---
+title: "Core API"
+description: "The whole public interface on one page: Runtime, Session, SessionOptions, Events, requests, errors."
+icon: "code"
+---
+
+anyagent's whole public surface fits on one page. You create a `Runtime`,
+ask it to open a session, and from then on you send commands through
+`Session` and read what the agent does from `Events`. Everything below is
+exported from the crate root; full signatures are on
+[docs.rs](https://docs.rs/anyagent).
+
+```text
+Runtime ──open──► (Session, Events)
+   │                  │        │
+   │ discover         │ prompt │ Event { kind: EventKind, turn_info, extensions }
+   │ probe            │ answer │
+   │ generate         │ configure
+   │ plan_usage       │ rollback / compact / cancel / close
+```
+
+## Runtime
+
+The entry point. Create one when your app starts and keep it around: it
+knows the agent catalog, scans the machine for installed agents, and opens
+sessions on them. It is also where the one-off calls live that don't need a
+conversation, like one-shot text generation and reading account quota.
+
+| Method | Returns | What it does |
+|---|---|---|
+| `discover()` | `DiscoveryReport` | Instant, read-only scan: installed agents plus missing ones with install hints |
+| `prewarm()` | | Start the discovery scan early |
+| `probe(&agent)` | `AgentDetails` | Opens a throwaway session (~1 s) to learn version, auth, capabilities, config options, commands |
+| `probe_auth(&agent)` | `AuthStatus` | Cheaper probe when you only need the login state |
+| `open(&agent, options)` | `(Session, Events)` | Spawn the agent and hand back the two halves |
+| `generate(&agent, options, prompt)` | `String` | One-shot text: opens, prompts, declines tools, closes |
+| `plan_usage(&agent)` | `PlanUsage` | The account's subscription quota, from the agent itself |
+| `plan_usage_all()` | `Vec<AgentPlanUsage>` | The same for every installed agent |
+| `with_mock(script)` | `Runtime` | Feature `mock`: the real engine over a scripted agent |
+
+```rust
+let report = runtime.discover().await;
+let agent = report.require("codex")?;          // AgentError::NotInstalled if absent
+for missing in &report.missing {               // MissingAgent { name, install_hint, .. }
+    println!("{}: {}", missing.name, missing.install_hint);
+}
+```
+
+Discovery hands you `AgentInstallation` values, and every other `Runtime`
+call takes one. You can also build one by hand: `AgentInstallation::at(id, path)`
+points at a specific binary, and `AgentInstallation::acp(name, path, args)`
+describes an ACP agent that isn't in the catalog.
+
+## SessionOptions
+
+Everything `open` needs to know before the agent starts: where to run, whether
+to continue an old conversation, how to handle permissions, which settings to
+apply first. Start with `in_dir` and chain whatever else applies. Anything you
+can change later goes through `Session::configure` instead.
+
+| Builder | What it does |
+|---|---|
+| `in_dir(path)` | Working directory for the agent. Required. |
+| `configure(id, value)` | Set a config option before the first turn (`"model"`, `"effort"`, `"fast"`, `"mode"`) |
+| `resume(token)` | Reopen an earlier session |
+| `fork_from(token, at)` | Branch a new session off an old one, at a message or at the end |
+| `mcp_server(server)` | Hand the agent one of your MCP servers (stdio, HTTP, SSE) |
+| `permission_mode(mode)` | `Ask` (forward requests) or `AutoApprove` |
+| `config_home(dir)` | Separate config directory, for several logins of one agent |
+| `quiet_window(dur)` | How long silence may run before completion is inferred |
+| `stall_after(dur)` | Silence before a stall `Diagnostic` (default 120 s). Never ends the turn |
+| `record_wire(path)` | Dump the raw protocol traffic to a JSONL file. Unredacted, treat as sensitive |
+
+## Session
+
+Your handle on one live conversation. Everything you tell the agent goes
+through it: prompts, answers to its requests, setting changes, cancel, close.
+It is cheap to clone and every clone talks to the same session, so hand
+copies to whichever parts of your app need to send commands. Most calls
+return as soon as the command is accepted; the table says which event
+confirms the result.
+
+| Method | What it does | Confirmed by |
+|---|---|---|
+| `prompt(input)` | Send text or an `Input` with attachments. Returns a `Delivery` | `TurnStarted`, or `Delivery::Steered` / `Queued` |
+| `dequeue(prompt_id)` | Drop a queued prompt before it starts | |
+| `answer(request_id, answer)` | Answer a permission or question, exactly once | `RequestClosed` |
+| `configure(id, value)` | Change a live config option | `SessionUpdated` |
+| `rollback(turns, scope)` | Rewind completed turns in place. Session must be idle | `SessionUpdated`, or a `Diagnostic` on refusal |
+| `compact()` | Ask the agent to summarize its context. Session must be idle | `ContextCompacted` |
+| `cancel(clear_queue)` | Stop the running turn; optionally drop the queue too | `TurnEnded { Cancelled }` |
+| `close()` | End the agent session and wait for cleanup | stream ends |
+| `info()` | Snapshot: agent, details, configuration, resume token, title, status | |
+| `status()` | `Idle`, `Working`, or `NeedsInput`, without reading the stream | |
+
+`prompt` never fails for being busy. Instead it returns a `Delivery` that
+says what happened to your text:
+
+| `DeliveryKind` | Meaning |
+|---|---|
+| `Started { turn_id }` | Session was idle; this prompt began a turn |
+| `Steered { turn_id }` | A turn was running and the agent supports `Steer`; it went into that turn |
+| `Queued { position }` | A turn was running and the agent cannot steer; it waits its turn |
+
+A prompt is a plain `&str` or an `Input`, which is text plus file paths:
+`Input::text("…").attach("shot.png")`. On agents with `Capability::Images` the
+image bytes go inline; on the others the attachment becomes a path in the
+prompt text that the agent can open with its own tools.
+
+## Events
+
+The other half of `open`: a stream of everything the agent does, in order.
+Text as it streams, tool calls as they change, requests that need an answer,
+usage numbers, and the start and end of every turn. The same `EventKind`s
+arrive for every agent, so one `match` covers all of them.
+
+It is a `Stream<Item = Result<Event, AgentError>>`. Read it continuously
+from its own task: it buffers 1024 events, and a consumer that falls a full
+buffer behind is treated as gone and the session closes.
+
+```rust
+pub struct Event {
+    pub sequence: u64,                   // 1, 2, 3… per session; the true order
+    pub occurred_at: SystemTime,         // wall clock, for stored transcripts
+    pub session_id: SessionId,
+    pub turn_info: Option<TurnContext>,  // { id, parent_tool_id } when inside a turn
+    pub kind: EventKind,
+    pub extensions: Extensions,          // provider data, keyed "provider/name"
+}
+```
+
+`EventKind` is `#[non_exhaustive]`. Always keep a `_ => {}` arm so a new
+variant does not break your build.
+
+### Turn boundaries
+
+A turn is one stretch of agent work. It starts when you prompt (or when the
+agent wakes itself to finish background work) and ends exactly once. These
+two events bracket everything else.
+
+| Variant | Payload | Notes |
+|---|---|---|
+| `TurnStarted` | `origin` | `Prompt(id)` for yours, `Agent` when the agent woke itself (background work finishing) |
+| `TurnEnded` | `stop`, `background` | Exactly once per turn. `background` lists tools still running |
+
+`StopReason`:
+
+| Variant | Meaning |
+|---|---|
+| `Completed { source: Protocol }` | The wire said the turn was done |
+| `Completed { source: Inferred }` | The wire went quiet; anyagent called it. Show as "idle", not a checkmark |
+| `Cancelled` | You called `cancel` |
+| `Refused` | The agent declined the work |
+| `Failed { message }` | The turn broke |
+
+### Content
+
+The agent's words. Deltas arrive as they stream and are grouped by
+`message_id`; append them in order.
+
+| Variant | Payload | Notes |
+|---|---|---|
+| `TextDelta` | `message_id`, `text` | Assistant output. Append |
+| `ReasoningDelta` | `message_id`, `text` | The agent's thinking. Render separately or collapse |
+| `UserMessage` | `message_id`, `text` | Provider-originated user content (a parent steering a subagent). Never your own prompt replayed |
+| `MessageEnded` | `message_id` | No more deltas for this message |
+
+### Tools and plans
+
+What the agent is doing. Each tool call is one `ToolUpdate` that you replace
+whole every time it changes, so there is no delta merging to get wrong.
+
+| Variant | Payload | Notes |
+|---|---|---|
+| `ToolUpdated` | `ToolUpdate` | Cumulative snapshot of one tool call. Replace by `id`, don't merge |
+| `ToolOutputDelta` | `tool_id`, `text` | Streamed output of a running command |
+| `PlanUpdated` | `entries` | The agent's full task list. Replaces the previous one |
+
+```rust
+pub struct ToolUpdate {
+    pub id: ToolId,
+    pub kind: ToolKind,          // Read, Edit, Execute, Mcp { server, tool }, Subagent, …
+    pub title: String,           // ready to display
+    pub status: ToolStatus,
+    pub input: ToolInput,
+    pub output: Option<String>,
+    pub diffs: Vec<FileDiff>,    // typed, for edits
+    pub locations: Vec<PathBuf>, // files it touched
+    pub raw: Option<RawTool>,    // the agent's own name and raw input
+}
+```
+
+When `kind` is `Subagent`, every event the child produces carries that tool's
+id in `turn_info.parent_tool_id`. That is how you nest it in a UI.
+
+### Requests
+
+Moments where the agent stops and waits for a person: permission to run a
+tool, or a question with choices. The turn does not continue until you
+answer, and the session's status is `NeedsInput` meanwhile.
+
+| Variant | Payload | Notes |
+|---|---|---|
+| `RequestOpened` | `Request` | A permission or question. Answer once with `session.answer` |
+| `RequestClosed` | `request_id` | Resolved, by your answer or by the agent withdrawing it. Clear your UI here, not on your own answer |
+
+```rust
+use anyagent::{Answer, PermissionChoice, QuestionAnswer, Request};
+
+match request {
+    Request::Permission(r) => {
+        // r.options is what this agent actually offers; answers outside it are rejected
+        session.answer(r.id, Answer::Permission(PermissionChoice::AllowOnce)).await?;
+    }
+    Request::Question(r) => {
+        // one QuestionAnswer per question, in order
+        let answers = r.questions.iter().map(|_| QuestionAnswer::Text("yes".into())).collect();
+        session.answer(r.id, Answer::Question(answers)).await?;
+    }
+}
+```
+
+`PermissionChoice` is `AllowOnce`, `AllowAlways`, `DenyOnce`, `DenyAlways`.
+`QuestionAnswer` is `Text(String)` or `Choices(Vec<ChoiceId>)`.
+
+### Session state and usage
+
+Everything about the session that isn't part of the conversation: its
+settings, its UI state, how full its context window is, and how much of
+the account's quota is used.
+
+| Variant | Payload | Notes |
+|---|---|---|
+| `SessionUpdated` | `SessionInfo` | New snapshot after `configure`, `rollback`, or an agent rename |
+| `StatusChanged` | `SessionStatus` | `Idle`, `Working`, `NeedsInput`. Emitted only on change |
+| `ContextUsage` | `used_tokens`, `window_tokens`, `cost_usd` | How full this session's window is |
+| `ContextCompacted` | | The agent compacted; the next `ContextUsage` drops |
+| `PlanUsageUpdated` | `PlanUsage` | Account quota, pushed without asking |
+| `Diagnostic` | `Diagnostic` | Non-fatal but worth surfacing: a rejected rollback, a stall, a wire oddity. Log these |
+
+## AgentDetails and capabilities
+
+What the agent told anyagent about itself: its version, whether it is logged
+in, what it can do, which settings it exposes, and which slash commands it
+has. You get it from `probe` before opening, and from `session.info().details`
+once a session is live. It is the single source for feature-gating and for
+building a settings menu.
+
+```rust
+pub struct AgentDetails {
+    pub version: Option<String>,
+    pub auth: AuthStatus,               // Authenticated { kind, account } | Unauthenticated { login } | Unknown
+    pub capabilities: Capabilities,     // .supports(Capability::Fork)
+    pub config_options: Vec<ConfigOption>,  // id, name, kind (Select | Boolean), current, live
+    pub commands: Vec<SlashCommand>,
+}
+```
+
+A `Capability` is one optional thing this agent can do on this connection.
+Check `capabilities.supports(..)` before offering a feature, and never
+special-case an agent by name: the same agent can report different
+capabilities over different wires. The full matrix is on the
+[Agents](/agents#capability-matrix) page.
+
+| `Capability` | Unlocks |
+|---|---|
+| `Images` | Attachments go inline instead of as a path |
+| `Resume` | `SessionOptions::resume` |
+| `Steer` | A mid-turn prompt steers instead of queueing |
+| `Permissions` | The agent asks before tools; `generate` can run hands-off |
+| `Questions` | `Request::Question` can arrive |
+| `Rollback` | `session.rollback(.., Conversation)` |
+| `RollbackFiles` | `session.rollback(.., ConversationAndFiles)` |
+| `Fork` | `SessionOptions::fork_from` |
+| `Compact` | `session.compact()` |
+| `SlashCommands` | `details.commands` is populated and sendable as prompts |
+| `Plan` | `PlanUpdated` events |
+| `Subagents` | Nested `Subagent` tools with `parent_tool_id` on their events |
+| `ContextUsage` | `ContextUsage` events |
+| `PlanUsage` | `runtime.plan_usage` returns real numbers |
+
+## Errors
+
+Every failure a caller can see is one `AgentError` variant, so your app can
+match on the cause instead of parsing messages. The two worth handling
+specially are `AuthRequired`, which carries the login steps to show the user,
+and `ResumeFailed`, after which most apps simply open a fresh session. The
+enum is `#[non_exhaustive]`.
+
+| Variant | When |
+|---|---|
+| `NotInstalled(id)` | `report.require` for an absent agent |
+| `SpawnFailed` | The process would not start |
+| `AuthRequired { login }` | Logged out. `login` carries runnable `LoginMethod`s to show the user |
+| `HandshakeTimeout` | Launch plus handshake exceeded 30 s |
+| `UnsupportedFeature` | You called something the capability set does not include |
+| `InvalidConfiguration` | Bad option id or value, or an isolation request the agent cannot honour |
+| `InvalidRequest` | Answering a closed request, dequeueing a started prompt |
+| `ResumeFailed` | The token did not resolve |
+| `SessionBusy` | `rollback` or `compact` while a turn is running |
+| `ProtocolFailed` | The wire misbehaved |
+| `ProcessExited { status, stderr }` | The agent died |
+| `SessionClosed` | A call after `close` |

@@ -34,24 +34,23 @@
         "group": "Getting started",
         "pages": [
           "index",
-          "quickstart",
+          "quickstart"
+        ]
+      },
+      {
+        "group": "Using anyagent",
+        "pages": [
+          "core-api",
           "features",
-          "supported-agents"
+          "agents",
+          "building-an-app"
         ]
       },
       {
-        "group": "Concepts",
+        "group": "Internals",
         "pages": [
-          "concepts"
-        ]
-      },
-      {
-        "group": "Guides",
-        "pages": [
-          "guides/discovery",
-          "guides/sessions",
-          "guides/events",
-          "guides/conversations"
+          "architecture",
+          "contributing"
         ]
       }
     ]

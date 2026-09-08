@@ -1,0 +1,192 @@
+---
+title: "Architecture"
+description: "How anyagent is built: three layers, what each one owns, and how one prompt travels through them."
+icon: "sitemap"
+---
+
+## TLDR
+
+anyagent has three layers. Your app talks to the top one. The bottom one
+talks to the agent process. The middle one is where every rule lives.
+
+```text
+ ┌───────────────────────────────────────────────────────────┐
+ │  1. Public API        Runtime · Session · Events           │  what your app sees
+ ├───────────────────────────────────────────────────────────┤
+ │  2. Engine            one task per session                 │  the rules: turns, queue,
+ │                       (src/session.rs)                     │  requests, status, cleanup
+ ├───────────────────────────────────────────────────────────┤
+ │  3. Adapters          claude · codex · opencode · pi ·     │  one protocol each,
+ │                       antigravity · acp                    │  zero rules
+ └───────────────────────────────────────────────────────────┘
+                                │
+                         agent process (stdio or HTTP)
+```
+
+The one idea to keep: **adapters translate, the engine decides.** An
+adapter turns wire frames into a small vocabulary and back. It never decides
+when a turn ended, whether a prompt should steer or queue, or which requests
+are still open. The engine does all of that once, the same way for every
+agent. That is why every agent behaves identically through anyagent.
+
+## Codebase map
+
+```text
+src/
+├── lib.rs           public exports
+├── runtime.rs       layer 1: Runtime (discover, probe, open, generate, plan_usage)
+├── session.rs       layer 2: the engine, plus Session and Events handles
+├── event.rs         the public event and request types
+├── agent.rs         AgentInstallation, AgentDetails, Capability, SessionOptions
+├── error.rs         AgentError
+├── catalog.rs       per-agent facts as data: ids, launch flags, login markers
+├── discovery.rs     finds executables and login markers; never launches
+├── process.rs       spawns children, guarantees cleanup
+└── adapter/         layer 3
+    ├── mod.rs         the seam: Adapter trait, DriverCommand, DriverEvent
+    ├── claude.rs      native stream-json
+    ├── codex.rs       native app-server JSON-RPC
+    ├── opencode.rs    native HTTP + SSE against `opencode serve`
+    ├── pi.rs          native pi RPC
+    ├── antigravity.rs native agy headless stream-json
+    ├── acp.rs         one adapter for every ACP agent
+    ├── wire.rs        line-delimited JSON over stdio, plus the recorder
+    ├── attach.rs      attachment loading shared by adapters
+    ├── mock.rs        scripted adapter (feature `mock`)
+    └── conformance.rs engine contract tests, run over the mock
+```
+
+| Layer | File | Owns | Never does |
+|---|---|---|---|
+| Public API | `runtime.rs` | catalog, discovery, one adapter per agent, opening sessions | turn logic |
+| Engine | `session.rs` | start a turn, steer or queue, request lifetimes, turn end, status, cleanup | parse a wire, know an agent's flags |
+| Adapter | `adapter/*.rs` | launch, handshake, translate frames both ways | decide anything about turns |
+
+## The seam between engine and adapter
+
+The engine and an adapter talk through two private enums. This is the
+whole contract an adapter has to meet.
+
+```text
+              DriverCommand (engine → adapter)
+              ────────────────────────────────►
+   Engine     StartTurn · Steer · Answer · Configure       Adapter
+              Rollback · Compact · Cancel · Close
+              ◄────────────────────────────────
+              DriverEvent (adapter → engine)
+              Event { kind, parent_tool_id, extensions }
+              TurnAck · TurnEnded · Steered · InfoChanged
+              AuthLost · Exited
+```
+
+| `DriverEvent` | The adapter is saying |
+|---|---|
+| `Event { kind, .. }` | "the agent produced this content" (text, tool, request, usage) |
+| `TurnAck` | "I've started the turn you asked for; what follows belongs to it" |
+| `TurnEnded(reason)` | "the wire says the turn is over" |
+| `Steered(bool)` | "your steer was accepted" or "rejected, requeue it" |
+| `InfoChanged` | "the agent changed its settings or capabilities" |
+| `AuthLost` | "credentials stopped working mid-session" |
+| `Exited` | "the process died; here is stderr" |
+
+An adapter never sends `TurnStarted`, `TurnEnded`, `RequestClosed`,
+`SessionUpdated`, or `StatusChanged` as content. The engine owns those and
+drops any attempt.
+
+`Adapter::connect` is the only other thing an adapter implements. It
+launches the process, does the handshake, and returns a `DriverInfo`: the
+agent's details and capabilities, the initial configuration, the resume
+token, and whether this wire ends turns with its own frame.
+
+## One prompt, end to end
+
+```text
+ your app          session.prompt("fix the bug")
+     │
+     ▼
+ Session           Command::Prompt ─────────────────────────────┐
+                                                                ▼
+ Engine            idle?          → DriverCommand::StartTurn   ─┐
+                   running+Steer? → DriverCommand::Steer        │
+                   running, no?   → push onto queue, reply Queued
+                                                                ▼
+ Adapter           builds the wire frame, writes it ──────► agent
+                                                                │
+ Adapter           reads frames back ◄──────────────────────────┘
+                   translates each into a DriverEvent:
+                     TurnAck
+                     Event(TextDelta) …
+                     Event(RequestOpened)      ← engine remembers the id
+                     Event(ToolUpdated) …
+                     TurnEnded(Completed)
+                                                                
+ Engine            stamps sequence, session_id, turn_info
+                   emits TurnStarted → … → TurnEnded
+                   emits StatusChanged only when the state flips
+                   then: promote the next queued prompt, if any
+     │
+     ▼
+ Events            your app's match on EventKind
+```
+
+Three things happen in the engine that no adapter has to think about:
+
+1. **Attribution.** Frames that arrive before `TurnAck` belong to the
+   previous turn and are dropped instead of leaking into the new one.
+2. **Request tracking.** Every `RequestOpened` is remembered until your
+   answer or a cancel closes it, so `NeedsInput` and `RequestClosed` are
+   always right. An answer the request did not offer is rejected without
+   touching the wire.
+3. **Promotion.** When a turn ends and the queue is not empty, the next
+   prompt starts immediately, and the status stays `Working` without
+   flashing `Idle`.
+
+## How a turn ends
+
+Not every wire says "done". The engine handles both cases and tells you
+which one you got through `CompletionSource`.
+
+| Wire | How the engine ends the turn | You see |
+|---|---|---|
+| Sends its own end frame | On that frame | `Completed { source: Protocol }` |
+| Does not | After the quiet window passes with no frames, no running tool, and no open request | `Completed { source: Inferred }` |
+
+Every shipped adapter ends prompted turns with its own frame. ACP agents
+have no frame for agent-originated turns (the agent waking itself after
+background work), so those are inferred. Frames that arrive after the end
+and carry no new work (a late tool status, a usage update) are applied
+without a turn. A subagent's end frame never ends its parent's turn.
+
+## Native vs ACP
+
+There are two kinds of adapter. The choice per agent is about what the wire
+can express.
+
+| | Native adapter | ACP adapter |
+|---|---|---|
+| Agents | claude, codex, opencode, pi, antigravity (agy) | cursor, grok, hermes, kiro, qwen, antigravity server, any custom agent |
+| What it speaks | the agent's own protocol | the shared [Agent Client Protocol](https://agentclientprotocol.com) |
+| Capabilities | fixed in the adapter, verified live | read from the `initialize` handshake, plus some added on first sight |
+| Why | the agent's own wire exposes more: rollback, fork, compact, plan usage, subagents | one adapter covers every ACP agent for free |
+| Cost | one file per agent to keep in step with upstream | capped at what ACP schema 1.7 offers |
+
+When an agent has both wires installed, discovery prefers the richer one.
+
+## Adding an agent
+
+| Step | Where | What |
+|---|---|---|
+| 1 | `src/catalog.rs` | A profile: id, executable names, args for protocol mode, login markers, install hint, config-home env var. Only flags verified against a real install |
+| 2 | `src/adapter/<agent>.rs` | Implement `Adapter::connect`. Translate frames into `DriverEvent`s. Report only capabilities you have seen work |
+| 3 | `src/runtime.rs` | Register the adapter in `Runtime::new` |
+| 4 | `tests/<agent>.rs`, `tests/fixtures/<agent>/` | Recorded frames so `cargo test` covers it offline |
+| 5 | `tests/live.rs` | Add the harness to the roster so the live matrix runs against it |
+
+For an ACP agent, skip step 2: the shared adapter already speaks it. A
+catalog entry is only needed for verified quirks and login markers.
+
+The conformance suite in `src/adapter/conformance.rs` runs the engine over
+the mock adapter and pins the contract every adapter benefits from: one
+`TurnEnded` per turn, steer or queue, request lifetimes, cancel, close.
+Because the rules live in the engine, a new adapter gets them without
+writing any.

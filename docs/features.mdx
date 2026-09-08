@@ -1,189 +1,394 @@
 ---
 title: "Features"
-description: "Everything anyagent does, what each feature is for, and the API that drives it."
+description: "Everything anyagent does. Each section says what it is for, how to use it, what confirms it, and which capability gates it."
 icon: "sparkles"
 ---
 
-One section per feature: what it does, how it works, and where to start in
-the API. The guides go deeper; this page is the map.
+Every section has the same four parts: **what** it does, **how** to call it,
+what **confirms** it happened, and what **gates** it. Types and signatures are
+on the [Core API](/core-api) page. Which agents support what is on the
+[Agents](/agents#capability-matrix) page.
+
+```text
+Runtime   discover · probe · open · generate · plan_usage
+Session   prompt · answer · configure · cancel · rollback · compact · close
+Events    text · tools · plans · requests · status · usage · turn boundaries
+```
 
 ## Discovery
 
-**What:** find every supported agent installed on the machine — without
-launching anything.
-
-**How:** `discover()` checks env overrides, `PATH`, the login-shell `PATH`
+**What:** find every supported agent on the machine, instantly, without
+launching anything. Checks env overrides, `PATH`, the login-shell `PATH`
 (GUI apps often miss it), and known install directories, then reads offline
-login markers (credential files, keychain entries). It also lists supported
-agents that are *missing*, each with an install hint you can show the user.
+login markers. Agents that are supported but missing come back with an
+install hint.
 
 ```rust
-let report = runtime.discover().await;   // read-only, instant
-for agent in &report.agents { /* installed */ }
-for missing in &report.missing { /* show missing.install_hint */ }
+let report = runtime.discover().await;
+for agent in &report.agents {
+    println!("{} at {}", agent.name, agent.executable_path.display());
+}
+for missing in &report.missing {
+    println!("{} not installed: {}", missing.name, missing.install_hint);
+}
+let agent = report.require("claude")?;   // AgentError::NotInstalled if absent
 ```
 
-→ [Discovery guide](/guides/discovery)
+**Confirms:** the report itself. `agent.auth` is a best-effort offline guess;
+use probe for the truth.
+**Gates:** none. Call `runtime.prewarm()` at startup to scan early.
 
-## Probe
+Some agents have a richer, separately installed runtime (Antigravity's ACP
+server). When only the base CLI is found, `agent.upgrade` names what to
+install for more capabilities.
 
-**What:** everything only the agent itself can tell you — real login state,
-version, capabilities, config options (models, modes), slash commands.
+## Probe and auth
 
-**How:** `probe(agent)` opens a throwaway session (~1 s) and returns
-`AgentDetails`. `probe_auth(agent)` is the cheaper call when you only need
-the login state. Use discovery for an instant list, probe for the truth.
+**What:** ask the agent itself what it can do. Opens a throwaway session
+(about 1 s) and returns version, real login state, capabilities, config
+options, and slash commands. `probe_auth` is the cheaper call when you only
+need the login state.
 
 ```rust
 let details = runtime.probe(&agent).await?;
-details.version;         // "2.1.241"
-details.auth;            // AuthStatus: who is logged in, or how to log in
-details.config_options;  // models, modes, effort — with typed choices
-details.commands;        // slash commands
-details.capabilities;    // what this agent can do
+match &details.auth {
+    AuthStatus::Authenticated { kind, account } => {}       // Subscription | ApiKey | CloudProvider
+    AuthStatus::Unauthenticated { login } => {
+        for method in login {
+            match method {
+                LoginMethod::Terminal { command, .. } => ui.show_command(command),  // e.g. ["claude", "auth", "login"]
+                LoginMethod::EnvVar { name } => ui.show_env_var(name),
+                _ => {}
+            }
+        }
+    }
+    AuthStatus::Unknown => {}
+}
 ```
 
-## Sessions and events
+**Confirms:** `AgentDetails`. The same struct is available later as
+`session.info().details`.
+**Gates:** none.
 
-**What:** one live conversation per session; everything the agent does
-arrives on one typed stream, identical across agents.
+anyagent never reads or holds credentials and never drives a login flow. It
+tells you the exact command or env var to show the user. Keep several
+logins of one agent apart with `SessionOptions::config_home(dir)`.
 
-**How:** `open` spawns the agent process and returns a cloneable `Session`
-handle plus one `Events` stream. Turn rules are enforced by anyagent, not
-trusted from the provider: every turn ends exactly once with `TurnEnded`,
-even on wires that never say "done". Provider-specific extras ride in each
-event's `extensions` map instead of leaking into the types.
+## Sessions
+
+**What:** one live conversation with one agent process. `open` spawns the
+agent, handshakes, and returns two halves: `Session` (commands, cheap to
+clone) and `Events` (the stream, one consumer).
 
 ```rust
-let (session, mut events) = runtime.open(&agent, SessionOptions::in_dir(".")).await?;
+let (session, events) = runtime
+    .open(&agent, SessionOptions::in_dir("/path/to/repo"))
+    .await?;
 ```
 
-The session's UI state — `Working`, `NeedsInput`, `Idle` — is pushed as a
-`StatusChanged` event on every flip, and `session.status()` answers on
-demand, so thread lists and "needs you" badges need no event reducer.
+**Confirms:** `open` returns. `session.info()` has the resume token,
+capabilities, and config options.
+**Gates:** none. Fails typed: `AuthRequired { login }` when logged out,
+`HandshakeTimeout` after 30 s, `ResumeFailed` for a bad token.
 
-→ [Sessions guide](/guides/sessions) · [Events guide](/guides/events)
+Drain `Events` continuously. It buffers 1024 events; a consumer that falls a
+full buffer behind is treated as gone and the session closes. `close()` ends
+the process; dropping `Events` does the same.
 
-## Prompting, steering, queueing
+## Prompting
 
-**What:** send text, slash commands, and file attachments; keep typing while
-the agent works.
-
-**How:** `prompt()` returns a `Delivery` saying what happened — `Started` a
-turn, `Steered` the running one (agents with `Capability::Steer`), or
-`Queued` behind it. Queued prompts start their own turns in order and can be
-dropped with `dequeue`. Attachments are referenced by path, and images are
-inlined where the wire supports them.
+**What:** send text, slash commands, and file attachments. What happens
+depends on session state, and the returned `Delivery` tells you which.
 
 ```rust
-session.prompt(Input::text("what's wrong here?").attach("screenshot.png")).await?;
+let delivery = session
+    .prompt(Input::text("what's wrong here?").attach("screenshot.png"))
+    .await?;
+match delivery.kind {
+    DeliveryKind::Started { turn_id } => {}      // session was idle; a turn began
+    DeliveryKind::Steered { turn_id } => {}      // a turn was running; this went into it
+    DeliveryKind::Queued { position } => {}      // a turn was running; this waits its turn
+}
 ```
+
+| Session state | Agent has `Steer` | Result |
+|---|---|---|
+| Idle | any | `Started` |
+| Turn running | yes | `Steered`: the agent changes course mid-turn |
+| Turn running | no | `Queued`: starts its own turn when the current one ends |
+
+**Confirms:** `TurnStarted { origin: Prompt(id) }` for started and queued
+prompts.
+**Gates:** `Steer` decides steer vs queue. `Images` decides whether an
+attachment goes inline or degrades to a path in the prompt text.
+
+Drop a queued prompt before it starts with `session.dequeue(prompt_id)`.
+Slash commands from `details.commands` are sent as plain text:
+`session.prompt("/review")`. An unknown slash prompt is just text.
 
 ## Permissions and questions
 
-**What:** the agent's "may I run this?" and "which one do you want?" moments,
-forwarded to your app as typed requests.
+**What:** the agent's "may I run this?" and "which one?" moments, forwarded
+as typed requests with the choices the agent actually offers. Answer exactly
+once.
 
-**How:** a `RequestOpened` event carries the tool, the choices the agent
-actually offers, and a request id; answer exactly once with
-`session.answer(id, answer)`. `RequestClosed` tells you when it resolved —
-including when a cancelled turn withdrew it. For unattended runs, open with
-`PermissionMode::AutoApprove`.
+```rust
+EventKind::RequestOpened(Request::Permission(r)) => {
+    // r.tool is the ToolUpdate awaiting approval; r.options is what the agent accepts
+    session.answer(r.id, Answer::Permission(PermissionChoice::AllowOnce)).await?;
+}
+EventKind::RequestOpened(Request::Question(r)) => {
+    // one QuestionAnswer per question, in order; Choices(ids) or Text(string)
+    let answers = r.questions.iter().map(|q| QuestionAnswer::Choices(vec![q.choices[0].id.clone()])).collect();
+    session.answer(r.id, Answer::Question(answers)).await?;
+}
+EventKind::RequestClosed { request_id } => ui.clear(request_id),
+```
 
-## Live configuration
+**Confirms:** `RequestClosed`. It also arrives when a cancelled turn
+withdraws the request, so clear your UI on that event, not on your own
+answer. While a request is open, `session.status()` is `NeedsInput`.
+**Gates:** `Permissions` and `Questions`. An agent without `Permissions`
+runs tools without asking.
 
-**What:** models, modes, effort, sandbox — switched at runtime, no restart.
+For unattended runs, open with
+`SessionOptions::permission_mode(PermissionMode::AutoApprove)`: anyagent
+allows each request once without forwarding it.
 
-**How:** agents advertise their settings as `ConfigOption`s with typed
-choices; your picker renders what the agent offers instead of hardcoding a
-model list. `session.configure("model", "sonnet")` applies a live option;
-creation-only options go through `SessionOptions::configure` at open. The
-applied change comes back as a `SessionUpdated` event.
+## Cancel
 
-## Resume, fork, rollback
+**What:** stop the running turn. The session and its context survive.
 
-**What:** conversations that survive the process, branch, and rewind.
+```rust
+session.cancel(false).await?;   // stop the turn, keep queued prompts
+session.cancel(true).await?;    // stop the turn, drop the queue too
+```
 
-**How:** every session mints an opaque `resume_token`; store it with your
-transcript and reopen from any process with `SessionOptions::resume(token)`.
-`fork_from(token, at)` branches a new session off an old one's history —
-the original untouched. `session.rollback(turns, scope)` rewinds in place,
-and the `ConversationAndFiles` scope also restores the files the dropped
-turns changed. All three are capability-gated: unsupported agents refuse
-with a typed error.
+**Confirms:** `TurnEnded { stop: Cancelled }`, then `RequestClosed` for any
+request the turn had open.
+**Gates:** none.
 
-→ [Conversations guide](/guides/conversations)
+## Configuration
+
+**What:** models, effort, mode, sandbox, switched without a restart. Agents
+advertise their settings as `ConfigOption`s with typed choices, so a picker
+renders what the agent offers instead of a hardcoded list.
+
+```rust
+// at open: creation-only and live options alike
+let options = SessionOptions::in_dir(".").configure("model", "sonnet").configure("effort", "low");
+
+// mid-session: options with `live: true`
+session.configure("fast", true).await?;
+```
+
+| id | Kind | Notes |
+|---|---|---|
+| `model` | select | Switching it rebuilds the other options' choices |
+| `effort` | select | Choices follow the model; a model without levels drops the option |
+| `fast` | boolean | Only when the selected model supports it. Lower latency, higher usage |
+| `mode` | select | Agent-specific: `plan`, `accept-edits`, `ask`, … |
+| `sandbox` | select | Codex |
+
+**Confirms:** `SessionUpdated`, carrying the new `configuration` and the
+rebuilt `config_options`. Wait for it rather than for `configure` to return.
+**Gates:** the option must be in `details.config_options`, else
+`InvalidConfiguration`.
+
+## Status
+
+**What:** the one value a thread list needs. `Idle`, `Working`, or
+`NeedsInput`, pushed on every change and readable on demand.
+
+```rust
+EventKind::StatusChanged(status) => ui.set_badge(thread, status),
+let now = session.status();    // for a component that mounts late
+```
+
+**Confirms:** `StatusChanged` is emitted only on change. A turn ending with
+another prompt queued stays `Working`, never flashing `Idle`.
+**Gates:** none.
+
+## One-shot generation
+
+**What:** prompt in, string out, no session to manage. For thread titles,
+commit messages, branch names, PR bodies.
+
+```rust
+let title = runtime
+    .generate(&agent, SessionOptions::in_dir("."), "a five-word title for: fix the parser")
+    .await?;
+```
+
+It opens a throwaway session, disables tools where the wire allows (claude,
+pi) and declines every permission elsewhere, collects the text until the
+turn ends, and closes.
+
+**Confirms:** the returned `String`.
+**Gates:** `Permissions`, or a wire that can launch without tools. Requires
+a new session: `resume` and `fork_from` options are rejected. A tool event or
+a question needing a choice cancels generation. Put context inline;
+attachments cannot be opened without tools.
+
+## Resume
+
+**What:** continue a conversation from a new process. Every session mints an
+opaque `resume_token`; store it with your transcript.
+
+```rust
+let token = session.info().resume_token.clone().unwrap();   // grab it while alive
+// later, any process
+let (session, events) = runtime
+    .open(&agent, SessionOptions::in_dir(".").resume(token))
+    .await?;
+```
+
+**Confirms:** `open` returns; the agent has its context back. No old events
+are replayed, so keep your own transcript.
+**Gates:** `Resume`, else `ResumeFailed`. The token is agent-owned: store it
+as-is, never parse it. The session id is not a resume token.
+
+## Fork
+
+**What:** a new session starting from an old one's history. The original is
+untouched, which is what "try this a different way" needs.
+
+```rust
+let options = SessionOptions::in_dir(".").fork_from(token, Some(message_id));  // None = from the end
+let (branch, branch_events) = runtime.open(&agent, options).await?;
+```
+
+**Confirms:** `open` returns a new session with its own resume token.
+**Gates:** `Fork`.
+
+## Rollback
+
+**What:** rewind this session in place by whole turns.
+
+```rust
+session.rollback(NonZeroU32::new(2).unwrap(), RollbackScope::Conversation).await?;
+session.rollback(NonZeroU32::new(1).unwrap(), RollbackScope::ConversationAndFiles).await?;
+```
+
+| Scope | Rewinds | Gate |
+|---|---|---|
+| `Conversation` | The agent's context only | `Rollback` |
+| `ConversationAndFiles` | Context and the files those turns changed | `RollbackFiles` |
+
+**Confirms:** `SessionUpdated`. A refusal comes back as a `Diagnostic`, not
+an error from the call.
+**Gates:** above, plus an idle session (`SessionBusy` otherwise).
+
+<Warning>
+`ConversationAndFiles` writes to the working tree. Check `RollbackFiles`
+before offering the button and tell the user what it does.
+</Warning>
+
+## Compact
+
+**What:** ask the agent to summarize its own context, freeing room in the
+window without losing the thread.
+
+```rust
+session.compact().await?;
+```
+
+**Confirms:** `ContextCompacted`, then a lower `ContextUsage`. Compaction
+runs as an agent-originated turn: prompts sent meanwhile queue behind it. An
+agent that finds nothing to summarize says so as a `Diagnostic`.
+**Gates:** `Compact` (claude, codex, opencode, pi) and an idle session.
 
 ## Subagents
 
-**What:** agents that spawn agents (Codex multi-agent, Claude subagents)
-render as a nested tree, not interleaved noise.
+**What:** agents that spawn agents render as a tree, not interleaved noise.
 
-**How:** a subagent appears as a tool with `ToolKind::Subagent`; every event
-the child produces carries that tool's id in `parent_tool_id`. A child can
-never end the parent's turn — anyagent consumes the child's turn bookkeeping
-so your turn boundaries stay clean.
+```rust
+EventKind::ToolUpdated(tool) if tool.kind == ToolKind::Subagent => ui.open_child(tool.id),
+// every event the child produces:
+let parent = event.turn_info.as_ref().and_then(|t| t.parent_tool_id.clone());
+```
+
+**Confirms:** `parent_tool_id` on the child's events. A child can never end
+the parent's turn; anyagent consumes the child's turn bookkeeping.
+**Gates:** `Subagents`.
 
 ## Context and plan usage
 
-**What:** the two gauges apps show — how full this session's window is, and
-how much of the account's subscription is used.
+**What:** the two gauges apps show. They measure different things.
 
-**How:** `ContextUsage` events stream tokens-used / window / cost as the
-session runs, and `ContextCompacted` marks the drop after compaction —
-whether the agent compacted on its own or you asked it to with
-`session.compact()` (capability `Compact`). A compaction occupies the agent,
-so it runs as an agent-originated turn: prompts queue behind it, and a
-refusal ("nothing to compact") arrives as a diagnostic.
-`runtime.plan_usage(agent)` reads account quota windows (session, weekly,
-plan name) from the agent itself — no HTTP endpoints, no token handling —
-and `plan_usage_all()` fills a whole usage page in one call.
+| Gauge | Source | Measures |
+|---|---|---|
+| Context usage | `EventKind::ContextUsage { used_tokens, window_tokens, cost_usd }` | How full this session's window is |
+| Plan usage | `runtime.plan_usage(&agent)`, `EventKind::PlanUsageUpdated` | How much of the account's subscription is used, per window |
 
-## Auth without guessing
+```rust
+let usage = runtime.plan_usage(&agent).await?;        // plan name, 5-hour and weekly windows
+for entry in runtime.plan_usage_all().await {          // every installed agent, for a dashboard
+    ui.card(&entry.agent.name, entry.usage);
+}
+```
 
-**What:** whether each agent is logged in, as fact.
+**Confirms:** the events and return values above. Numbers come from the
+agent itself: no HTTP endpoints, no token handling.
+**Gates:** `ContextUsage` and `PlanUsage`. Plan usage also needs a
+subscription login (`AuthKind::Subscription`).
 
-**How:** discovery reads offline markers for an instant best-effort answer;
-`probe`/`probe_auth` answer for real — for every supported agent, including
-those with no credential file at all. A logged-out agent reports
-`Unauthenticated` with runnable `LoginMethod`s: the exact terminal command
-(`kiro-cli login`) or env var to surface to the user. Keep several logins of
-the same agent apart with `SessionOptions::config_home(dir)`.
+## MCP servers
 
-## MCP forwarding
+**What:** hand the agent your app's MCP servers for this session.
 
-**What:** hand the agent your app's MCP servers, per session.
+```rust
+let options = SessionOptions::in_dir(".")
+    .mcp_server(McpServer::stdio("local", "/usr/bin/my-server", ["--stdio"]))
+    .mcp_server(McpServer::http("remote", "https://example.com/mcp").with("Authorization", "Bearer …"))
+    .mcp_server(McpServer::sse("stream", "https://example.com/sse"));
+```
 
-**How:** declare stdio, HTTP, or SSE servers on `SessionOptions`; anyagent
-checks them against the agent's supported transports and refuses typed
-rather than silently dropping one. Calls into your servers come back as
-ordinary `ToolUpdated` events with `ToolKind::Mcp { server, tool }`.
-
-## Capabilities
-
-**What:** per-agent feature gating without special-casing agent names.
-
-**How:** `details.capabilities.supports(Capability::Fork)` — reported by the
-live connection, never assumed. The full set: `Images`, `Resume`, `Steer`,
-`Permissions`, `Questions`, `Rollback`, `RollbackFiles`, `Fork`, `Compact`,
-`SlashCommands`, `Plan`, `Subagents`, `ContextUsage`, `PlanUsage`.
+**Confirms:** calls into your servers arrive as `ToolUpdated` with
+`ToolKind::Mcp { server, tool }`.
+**Gates:** the agent's supported transports. An unsupported transport fails
+`open` typed rather than dropping the server.
 
 ## Wire recording
 
-**What:** a bug report that contains the actual bug.
+**What:** a bug report that contains the actual bug. Tees every raw protocol
+frame, both directions, to a JSONL file.
 
-**How:** `SessionOptions::record_wire(path)` tees every raw protocol frame,
-both directions, to a JSONL file. A recording failure never fails a turn.
+```rust
+SessionOptions::in_dir(".").record_wire("/tmp/claude.jsonl")
+```
+
+**Confirms:** the file. A recording failure never fails a turn.
+**Gates:** none.
 
 <Warning>
-A recording contains everything that crossed the wire: prompts, file
-contents, command output, paths — possibly secrets. It is unredacted and
-append-only. Treat the file as sensitive and delete it after debugging.
+The recording is unredacted: prompts, file contents, command output, paths.
+Treat it as sensitive and delete it after debugging.
 </Warning>
 
-## See it all run
+## Testing without a subprocess
 
-The [`examples/`](https://github.com/spotta85/anyagent-rs/tree/main/examples)
-folder is the tour: `chat.rs` (the core loop), `sessions.rs` (concurrent
-sessions + resume), `probe.rs` (discovery + probe). Each is small, commented,
-and runs against the agents on your machine.
+**What:** run your app over a scripted agent. The engine, turn rules, and
+event shapes are real; only the agent is fake.
+
+```toml Cargo.toml
+[dev-dependencies]
+anyagent = { version = "0.0.1", features = ["mock"] }
+```
+
+```rust
+use anyagent::mock::{Script, Step, completed, permission, text};
+
+let script = Script::default().turn(vec![
+    Step::Emit(text("m1", "hello")),     // TextDelta
+    Step::Emit(permission("p1")),        // RequestOpened
+    Step::AwaitAnswer,                   // pause until your app answers
+    Step::End(completed()),              // TurnEnded
+]);
+let runtime = Runtime::with_mock(script);
+let agent = runtime.discover().await.require("mock")?.clone();
+```
+
+**Confirms:** the same events your real code handles.
+**Gates:** feature `mock`. `Script` flags (`steer`, `deterministic`,
+`buffer`, …) model the wire shapes the engine has to cope with.
