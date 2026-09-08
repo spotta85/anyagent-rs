@@ -2,15 +2,23 @@
 title: "anyagent"
 description: "One Rust interface to the coding agents installed on a machine."
 icon: "house"
+mode: "wide"
 ---
 
+<div className="hero-lead">
 Users have Claude Code, Codex, Grok, opencode, Kiro, and friends on their
 machines — each with its own CLI, protocol, and quirks. If you build an app on
 top of them, you end up writing a driver per agent.
 
-anyagent is that layer, written once. It finds the agents, speaks each one's
-protocol (native or [ACP](https://agentclientprotocol.com)), and gives you one
-typed API.
+<b className="wordmark">anyagent</b> is that layer, written once. It finds the
+agents, speaks each one's protocol (native or
+[ACP](https://agentclientprotocol.com)), and gives you one typed API.
+</div>
+
+<div className="hero-cta">
+  <a className="btn btn-primary" href="/quickstart">Quickstart</a>
+  <a className="btn btn-secondary" href="https://crates.io/crates/anyagent">crates.io</a>
+</div>
 
 ## The whole flow
 

@@ -5,19 +5,17 @@
   "description": "One Rust interface to the coding agents installed on a machine.",
   "favicon": "/favicon.svg",
   "colors": {
-    "primary": "#8B5CF6",
-    "light": "#A78BFA",
-    "dark": "#6D28D9"
+    "primary": "#e8763a",
+    "light": "#e8763a",
+    "dark": "#c25a25"
   },
   "appearance": {
-    "default": "system"
-  },
-  "background": {
-    "decoration": "gradient"
+    "default": "dark",
+    "strict": true
   },
   "styling": {
     "codeblocks": {
-      "theme": "catppuccin-mocha"
+      "theme": "vesper"
     }
   },
   "contextual": {
