@@ -1,0 +1,18 @@
+{
+  "$schema": "https://context7.com/schema/context7.json",
+  "projectTitle": "anyagent",
+  "description": "One Rust interface to the coding agents installed on a machine: Claude Code, Codex, Cursor, opencode, Kiro, Grok, Hermes, Qwen, pi, Antigravity.",
+  "folders": ["docs", "examples"],
+  "excludeFolders": [".scratch", ".claude", ".agents", ".kiro", "research", "spikes", "target"],
+  "excludeFiles": ["PLAN.md", "contributions.md"],
+  "rules": [
+    "Always start with Runtime::discover(), then report.require(id), then runtime.open(agent, SessionOptions::in_dir(path)). in_dir is required.",
+    "Gate features on session.info().details.capabilities.supports(Capability::X), never on the agent's name. Unsupported calls fail with AgentError::UnsupportedFeature.",
+    "Read Events from its own task and match on EventKind with a `_ => {}` arm; the enum is #[non_exhaustive].",
+    "Answer every RequestOpened exactly once with session.answer(); clear UI on RequestClosed, not on your own answer.",
+    "ToolUpdated is a cumulative snapshot: replace the stored tool by id, never merge deltas.",
+    "TurnEnded arrives exactly once per turn. Show StopReason::Completed { source: Inferred } as idle, not as success.",
+    "Session::configure is confirmed by a SessionUpdated event, not by the call returning.",
+    "Read models and options from details.config_options; never hardcode model names."
+  ]
+}
