@@ -223,10 +223,21 @@ async fn shell_path(shell: &str, flags: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Runs `script` under node, the one interpreter both platforms have.
+    fn node(script: &str) -> Spawn {
+        Spawn {
+            exec_path: PathBuf::from("node"),
+            args: vec!["-e".into(), script.into()],
+            cwd: std::env::temp_dir(),
+            env: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
     fn sh(script: &str) -> Spawn {
         Spawn {
             exec_path: PathBuf::from("/bin/sh"),
@@ -239,15 +250,20 @@ mod tests {
     /// compose_path dedupes and orders exec dir > own PATH > login-shell PATH.
     #[test]
     fn compose_path_orders_and_dedupes() {
+        let joined = |dirs: [&str; 3]| std::env::join_paths(dirs).unwrap().into_string().unwrap();
         let path = compose_path(
             Path::new("/opt/agent/bin/claude"),
-            Some("/usr/bin:/opt/agent/bin"),
-            Some("/usr/bin:/home/u/.volta/bin"),
+            Some(&joined(["/usr/bin", "/opt/agent/bin", "/usr/bin"])),
+            Some(&joined(["/usr/bin", "/home/u/.volta/bin", "/usr/bin"])),
         );
-        assert_eq!(path, "/opt/agent/bin:/usr/bin:/home/u/.volta/bin");
+        assert_eq!(
+            path,
+            OsString::from(joined(["/opt/agent/bin", "/usr/bin", "/home/u/.volta/bin"]))
+        );
     }
 
     /// Shutdown escalates to SIGKILL when child traps SIGTERM within grace.
+    #[cfg(unix)]
     #[tokio::test]
     async fn shutdown_escalates_to_sigkill_within_grace() {
         let mut child = spawn(sh("trap '' TERM; sleep 30")).await.unwrap();
@@ -257,6 +273,7 @@ mod tests {
     }
 
     /// Shutdown lets cooperative child exit cleanly on SIGTERM.
+    #[cfg(unix)]
     #[tokio::test]
     async fn shutdown_lets_a_cooperative_child_exit_on_sigterm() {
         let mut child = spawn(sh("sleep 30")).await.unwrap();
@@ -266,11 +283,14 @@ mod tests {
     /// stderr_tail retains last 6 lines for ProcessExited reports.
     #[tokio::test]
     async fn stderr_tail_keeps_the_last_lines() {
-        let mut child = spawn(sh("for i in 1 2 3 4 5 6 7 8; do echo line$i 1>&2; done"))
-            .await
-            .unwrap();
+        let mut child = spawn(node(
+            "for (let i = 1; i <= 8; i++) console.error('line' + i)",
+        ))
+        .await
+        .unwrap();
+        // "exit status: 0" on unix, "exit code: 0" on windows.
         let status = child.exit_status(Duration::from_secs(5)).await;
-        assert_eq!(status, "exit status: 0");
+        assert!(status.ends_with(": 0"), "{status}");
         assert_eq!(
             child.stderr_tail(),
             "line3\nline4\nline5\nline6\nline7\nline8"

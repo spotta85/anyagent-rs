@@ -2,8 +2,6 @@
 //! the recorded fixture agent (tests/fixtures/acp/fixture.mjs; needs `node`).
 //! The catalog wrappers are `sh` scripts, so the file is unix-only for now.
 
-#![cfg(unix)]
-
 use std::path::Path;
 use std::time::Duration;
 
@@ -15,6 +13,8 @@ use anyagent::{
     McpTransport, PermissionChoice, QuestionAnswer, Request, ResumeToken, Runtime, Session,
     SessionOptions, StopReason,
 };
+
+mod common;
 
 fn fixture(extra: &[&str]) -> AgentInstallation {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/acp/fixture.mjs");
@@ -50,21 +50,7 @@ fn allow() -> Answer {
 /// flags, ignoring the profile's protocol args appended after them. Needed
 /// because auth truth (open-proves-auth, logged-out hints) is catalog data.
 fn catalog_wrapper(agent: &str, name: &str, flags: &str) -> AgentInstallation {
-    use std::os::unix::fs::PermissionsExt;
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/acp/fixture.mjs");
-    let dir = std::env::temp_dir().join(format!("anyagent-acp-{name}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(agent);
-    std::fs::write(
-        &path,
-        format!(
-            "#!/bin/sh\nexec node '{}' {flags} \"$@\"\n",
-            fixture.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    AgentInstallation::at(agent, path)
+    AgentInstallation::at(agent, common::wrapper("acp", agent, name, flags))
 }
 
 /// Full turn maps every ACP update kind: text, reasoning, tool, plan, usage, SessionUpdated, permission request, and agent-originated turn.

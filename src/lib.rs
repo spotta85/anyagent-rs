@@ -130,6 +130,8 @@ mod event;
 mod process;
 mod runtime;
 mod session;
+#[cfg(test)]
+mod testutil;
 
 pub use agent::*;
 pub use error::AgentError;

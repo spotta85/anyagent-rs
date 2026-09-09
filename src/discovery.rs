@@ -295,7 +295,7 @@ pub(crate) fn login_methods(profile: &AgentProfile, exe: &Path) -> Vec<LoginMeth
     methods
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::catalog::Connection;
@@ -318,20 +318,19 @@ mod tests {
         }
     }
 
-    fn install(dir: &Path, name: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::create_dir_all(dir).unwrap();
-        let exe = dir.join(name);
-        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
-        exe
-    }
+    use crate::testutil::stub as install;
 
     /// search_dirs follows PATH > LoginShellPath > VersionManager > KnownLocation > extra_paths order.
     #[test]
     fn search_follows_the_resolution_order() {
         let home = Path::new("/h");
-        let dirs = search_dirs(&profile(), home, Some("/a:/b"), Some("/b:/c"));
+        let path = |dirs: [&str; 2]| std::env::join_paths(dirs).unwrap().into_string().unwrap();
+        let dirs = search_dirs(
+            &profile(),
+            home,
+            Some(&path(["/a", "/b"])),
+            Some(&path(["/b", "/c"])),
+        );
         let find = |path: &str| {
             dirs.iter()
                 .position(|(dir, _)| dir == Path::new(path))

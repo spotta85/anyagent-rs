@@ -579,8 +579,7 @@ mod tests {
         assert_eq!(text, "Let me check. Done.");
     }
 
-    /// Discovery through the runtime, over sh fixture wrappers on disk.
-    #[cfg(unix)]
+    /// Discovery through the runtime, over fixture shims on disk.
     mod discovery {
         use super::*;
         use std::sync::{Mutex, OnceLock};
@@ -590,14 +589,7 @@ mod tests {
             LOCK.get_or_init(|| Mutex::new(()))
         }
 
-        fn make_exe(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::create_dir_all(dir).unwrap();
-            let exe = dir.join(name);
-            std::fs::write(&exe, "#!/bin/sh\nexit 0\n").unwrap();
-            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
-            exe
-        }
+        use crate::testutil::{shim, stub as make_exe};
 
         #[tokio::test]
         // The lock deliberately spans the awaits: it serializes tests that
@@ -649,14 +641,12 @@ mod tests {
             // CLI's login, and the handshake does that itself.
             let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/acp/fixture.mjs");
-            std::fs::write(
-                &server,
-                format!(
-                    "#!/bin/sh\nexec node '{}' --auth-adopt \"$@\"\n",
-                    fixture.display()
-                ),
-            )
-            .unwrap();
+            shim(
+                server.parent().unwrap(),
+                "agy_acp_server.par",
+                &fixture,
+                "--auth-adopt",
+            );
             let (session, _events) = Runtime::new()
                 .open(agent, SessionOptions::in_dir(home.path()))
                 .await
@@ -675,14 +665,12 @@ mod tests {
             // Refused for good (the server's capitalised "Authentication
             // required", no runnable method of its own): typed, and the login
             // it names is the CLI's TUI, not the server.
-            std::fs::write(
-            &server,
-            format!(
-                "#!/bin/sh\nexec node '{}' --auth-required --capitalized-auth --no-auth-methods \"$@\"\n",
-                fixture.display()
-            ),
-        )
-        .unwrap();
+            shim(
+                server.parent().unwrap(),
+                "agy_acp_server.par",
+                &fixture,
+                "--auth-required --capitalized-auth --no-auth-methods",
+            );
             let err = Runtime::new()
                 .open(agent, SessionOptions::in_dir(home.path()))
                 .await

@@ -2,9 +2,7 @@
 //! against the fixture agent (tests/fixtures/pi/fixture.mjs; needs `node`).
 //! A wrapper script pins the catalog's `pi` id to the fixture.
 
-#![cfg(unix)]
-
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -15,24 +13,12 @@ use anyagent::{
     ResumeToken, Runtime, Session, SessionOptions, StopReason, ToolInput, ToolKind, ToolStatus,
 };
 
+mod common;
+
 /// A `pi` stand-in: a script that execs the fixture with scenario flags,
 /// ignoring the real launch args appended after them.
 fn wrapper(name: &str, flags: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/fixture.mjs");
-    let dir = std::env::temp_dir().join(format!("anyagent-pi-{name}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("pi");
-    std::fs::write(
-        &path,
-        format!(
-            "#!/bin/sh\nexec node {} {flags} \"$@\"\n",
-            fixture.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
+    common::wrapper("pi", "pi", name, flags)
 }
 
 async fn open_with(
