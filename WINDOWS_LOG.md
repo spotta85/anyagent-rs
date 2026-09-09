@@ -189,6 +189,69 @@ harness.
   Verified on Windows and on the Mac (`PASS codex: death maps to Failed +
   ProcessExited + closed`).
 
+## Step 5 — opencode — 2026-09-09
+
+opencode 1.18.30, `npm install -g opencode-ai` (**not** the PowerShell
+installer), `C:\Users\sshdev\AppData\Roaming\npm\opencode.cmd`. `~\.opencode\bin`
+does not exist, so the registry-PATH-edit concern did not arise: npm's dir was
+already on PATH.
+
+`opencode models` lists `opencode/big-pickle`, so the pin was valid — but see
+B11; it was changed for a different reason.
+
+| step | result |
+|---|---|
+| 1. install + location | npm, `%APPDATA%\npm\opencode.cmd` |
+| 2. probe | FOUND, source `Path`. 7 models, 3 commands, fork/rollback |
+| 3. known-dirs fix | not needed; npm's dir is on PATH |
+| 4. auth marker | none matched — and that is correct, see B13 |
+| 5. live suite | 31 passed, 1 failed, 352s. 8 SKIP |
+
+Offline suite 221/221 (Mac 223). One `opencode.exe` remains on the box but
+carries no `serve` and predates the run — the user's own, not a leak.
+
+### B11 the pinned model could not see images, on both platforms
+- Symptom: `opencode: image answer was "I can't read the image - this model
+  doesn't support image input."`
+- Cause: not a Windows issue. `opencode/big-pickle` answers image prompts this
+  way about a third of the time on macOS too — measured 2 PASS / 1 FAIL in
+  three Mac runs, each failure worded differently. The suite had a latent flake
+  that this step happened to surface.
+- Fix: `OPENCODE_MODEL` pinned to `opencode/muse-spark-1.2-contributor-free`,
+  which passed 3/3 on the Mac and then on Windows. `tests/live.rs`, 1 line,
+  commit `f0f4a24`. Test-only.
+
+### B12 the opencode kill pattern assumed an unquoted command line
+- Symptom: `opencode: no process matched "opencode serve"`
+- Cause: the npm install leaves a single `opencode.exe`, but its command line
+  quotes the executable and pads before the argument:
+  `"...\opencode-ai\bin\opencode.exe"    serve --hostname 127.0.0.1 --port N`.
+  The literal `opencode serve` appears nowhere.
+- Fix: pattern widened to `opencode(\.exe)?"? +serve`, matching both platforms.
+  `tests/live.rs`, 1 line, commit `f0f4a24`. Test-only. Verified on the Mac
+  (`PASS opencode: death maps to Failed + ProcessExited + closed`) and Windows.
+
+### B13 discovery_finds_authenticated_harnesses — not a bug, the box is logged out
+- Symptom: `opencode: not authenticated: Some(Unauthenticated { ... })`
+- Investigated, **no change made**. `opencode auth list` reports 2 credentials
+  on the Mac and **0 on Windows**, and names the same path on both
+  (`~/.local/share/opencode/auth.json` / `~\.local\share\opencode\auth.json`).
+  The catalog's `config_dir` is correct on Windows; there is simply no login on
+  that box. Discovery reporting `Unauthenticated` is the truth.
+- The other 31 tests pass because the free Zen models need no credential, and
+  the adapter's own open-time view reports `Other("connected provider")` —
+  a different and also correct notion of auth.
+- To clear it: run `opencode auth login` on the Windows box and rerun. Left to
+  the user; the suite never touches real auth.
+
+### Windows-vs-Mac triage for this step
+Two failures in the first Windows run turned out to be neither Windows bugs nor
+reproducible: `opencode_child_session_permissions_reach_the_caller` (handshake
+timeout) and `turn_events_are_bracketed_ordered_and_quiet_after_end`
+(`SessionUpdated` arriving after turn end). Both passed on the Mac, and both
+passed on Windows once the model changed. Recorded here rather than "fixed" —
+if either returns, the model swap is the first thing to suspect.
+
 ### Open — graceful shutdown has no cross-platform path
 Not a Windows-only issue. `CLOSE_GRACE` means "time to exit after being asked
 nicely", but the only ask is a unix SIGTERM. These agents speak JSON-lines over
