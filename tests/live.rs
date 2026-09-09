@@ -1899,13 +1899,8 @@ fn kill_child(harness: &str, session: &Session) {
         ),
         _ => (&["-n", "-f"], "opencode serve".to_owned()),
     };
-    let out = std::process::Command::new("pgrep")
-        .args(args)
-        .arg(&pattern)
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let pids: Vec<&str> = stdout.lines().collect();
+    let pids = matching_pids(args, &pattern);
+    let pids: Vec<&str> = pids.iter().map(String::as_str).collect();
     if pids.is_empty() {
         panic!("{harness}: no process matched {pattern:?}");
     }
@@ -1916,11 +1911,68 @@ fn kill_child(harness: &str, session: &Session) {
         vec![*pids.last().unwrap()]
     };
     for pid in last {
-        std::process::Command::new("kill")
-            .args(["-9", pid])
-            .status()
-            .unwrap();
+        kill_pid(pid);
     }
+}
+
+/// Pids matching `pattern`, oldest first: `-x` matches the executable name
+/// exactly, anything else the full command line, and `-n` keeps the newest.
+#[cfg(unix)]
+fn matching_pids(args: &[&str], pattern: &str) -> Vec<String> {
+    let out = std::process::Command::new("pgrep")
+        .args(args)
+        .arg(pattern)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[cfg(windows)]
+fn matching_pids(args: &[&str], pattern: &str) -> Vec<String> {
+    let test = if args.contains(&"-x") {
+        "($_.Name -replace '\\.exe$', '') -eq $p"
+    } else {
+        "$_.CommandLine -match $p"
+    };
+    let newest = if args.contains(&"-n") {
+        "| Select-Object -Last 1"
+    } else {
+        ""
+    };
+    let script = format!(
+        "$p = '{pattern}'; Get-CimInstance Win32_Process \
+         | Where-Object {{ {test} }} | Sort-Object CreationDate \
+         | Select-Object -ExpandProperty ProcessId {newest}"
+    );
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|line| line.trim().to_owned())
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+/// Kills one pid outright, leaving any children of its own alone.
+#[cfg(unix)]
+fn kill_pid(pid: &str) {
+    std::process::Command::new("kill")
+        .args(["-9", pid])
+        .status()
+        .unwrap();
+}
+
+#[cfg(windows)]
+fn kill_pid(pid: &str) {
+    std::process::Command::new("taskkill")
+        .args(["/F", "/PID", pid])
+        .status()
+        .unwrap();
 }
 
 fn allow() -> Answer {
