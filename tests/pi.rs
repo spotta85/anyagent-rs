@@ -2,7 +2,7 @@
 //! against the fixture agent (tests/fixtures/pi/fixture.mjs; needs `node`).
 //! A wrapper script pins the catalog's `pi` id to the fixture.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -181,7 +181,7 @@ async fn handshake_advertises_state_models_levels_and_commands() {
     assert!(
         info.resume_token
             .as_ref()
-            .is_some_and(|t| t.as_str().ends_with("sessions/s1.jsonl")),
+            .is_some_and(|t| Path::new(t.as_str()).ends_with("sessions/s1.jsonl")),
         "{:?}",
         info.resume_token
     );
@@ -559,7 +559,7 @@ async fn resume_binds_the_session_file_and_config_home_reaches_the_child() {
     let (session, _events) = open_with("home", "", options).await.unwrap();
     assert_eq!(
         session.info().resume_token.map(|t| t.as_str().to_owned()),
-        Some(dir.join("sessions/s1.jsonl").display().to_string())
+        Some(dir.join("sessions").join("s1.jsonl").display().to_string())
     );
 }
 
