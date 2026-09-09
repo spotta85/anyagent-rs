@@ -178,6 +178,15 @@ const EXE_SUFFIXES: &[&str] = &[""];
 #[cfg(windows)]
 const EXE_SUFFIXES: &[&str] = &[".exe", ".cmd", ".bat"];
 
+/// Whether `path` is the executable named `cli`, suffix or not: an npm
+/// install of `agy_acp_server.par` is `agy_acp_server.par.cmd` on windows.
+pub(crate) fn is_named(path: &Path, cli: &str) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|name| name.strip_prefix(cli))
+        .is_some_and(|suffix| EXE_SUFFIXES.contains(&suffix))
+}
+
 /// First search dir that holds the executable.
 fn resolve(
     cli: &str,
