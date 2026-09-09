@@ -96,7 +96,7 @@ Any other ACP agent works without a catalog entry via
 `AgentInstallation::acp(name, path, args)`.
 
 ## Docs
-
+**[Context7](https://context7.com/spotta85/anyagent-rs)**
 **[anyagent.mintlify.site](https://anyagent.mintlify.site)**
 
 | Page | What it covers |
