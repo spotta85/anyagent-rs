@@ -96,6 +96,7 @@ Any other ACP agent works without a catalog entry via
 `AgentInstallation::acp(name, path, args)`.
 
 ## Docs
+**[context7](https://context7.com/spotta85/anyagent-rs)**
 
 **[anyagent.mintlify.site](https://anyagent.mintlify.site)**
 
@@ -107,6 +108,7 @@ Any other ACP agent works without a catalog entry via
 | [Agents](https://anyagent.mintlify.site/agents) | Catalog, capability matrix, per-agent quirks, custom ACP agents |
 | [Building an app](https://anyagent.mintlify.site/building-an-app) | Step-by-step chat app: threads, permissions, settings, persistence, usage |
 | [Architecture](https://anyagent.mintlify.site/architecture) | Layers, the engine/adapter seam, adding an agent |
+
 
 Generated API reference, every type and signature: [docs.rs/anyagent](https://docs.rs/anyagent).
 
