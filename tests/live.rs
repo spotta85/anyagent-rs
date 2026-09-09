@@ -40,7 +40,7 @@ const HARNESSES: &[&str] = &[
     "qwen",
 ];
 const EVENT_TIMEOUT: Duration = Duration::from_secs(120);
-const OPENCODE_MODEL: &str = "opencode/big-pickle";
+const OPENCODE_MODEL: &str = "opencode/muse-spark-1.2-contributor-free";
 /// The host config's default (`gpt-6-astra`) needs a newer CLI; luna is cheap and available.
 const CODEX_MODEL: &str = "gpt-5.6-luna";
 /// pi's model values are `provider/modelId`.
@@ -1914,7 +1914,9 @@ fn kill_child(harness: &str, session: &Session) {
             &["-n", "-f"],
             "agy( --input-format=stream-json|_acp_server)".to_owned(),
         ),
-        _ => (&["-n", "-f"], "opencode serve".to_owned()),
+        // The npm shim leaves one opencode.exe, whose command line quotes the
+        // exe and pads before the argument: `opencode.exe"    serve`.
+        _ => (&["-n", "-f"], r#"opencode(\.exe)?"? +serve"#.to_owned()),
     };
     let pids = matching_pids(args, &pattern);
     let pids: Vec<&str> = pids.iter().map(String::as_str).collect();
