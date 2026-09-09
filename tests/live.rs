@@ -1890,13 +1890,22 @@ fn kill_child(harness: &str, session: &Session) {
         // The launcher script execs node under its own name; the user's
         // own TUI never ends in `acp`.
         "cursor" => (&["-n", "-f"], "cursor-agent .*index.js acp$".to_owned()),
-        "codex" => (&["-n", "-f"], "codex app-server".to_owned()),
+        // The npm shim runs cmd -> node -> codex.exe, so the real agent is
+        // the leaf: `codex.exe app-server` there, plain `codex app-server`
+        // on unix. The node and cmd links carry `.js"`/`.cmd"` instead.
+        "codex" => (&["-n", "-f"], r"codex(\.exe)? app-server".to_owned()),
         // The user's own grok TUI never runs `agent ... stdio`.
-        "grok" => (&["-n", "-f"], "grok --no-auto-update agent".to_owned()),
+        "grok" => (
+            &["-n", "-f"],
+            r#"grok(\.exe)?"? --no-auto-update agent"#.to_owned(),
+        ),
         // The npm shim runs node -> cli.js, which re-execs itself as a
         // worker inheriting the pipes: both halves, as with kiro. The
         // user's own TUI has no `--experimental-acp`.
-        "qwen" => (&["-f"], r"qwen-code/cli\.js --experimental-acp$".to_owned()),
+        "qwen" => (
+            &["-f"],
+            r"qwen-code[/\\]cli\.js --experimental-acp$".to_owned(),
+        ),
         // pi overwrites its argv with its own process title, so there is no
         // command line to match: the exact name plus newest-first is ours.
         "pi" => (&["-n", "-x"], "pi".to_owned()),
