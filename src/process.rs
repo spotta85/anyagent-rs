@@ -1,6 +1,7 @@
 //! Launches agent processes and guarantees child cleanup.
 
 use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -31,6 +32,7 @@ pub(crate) struct Child {
     inner: tokio::process::Child,
     /// The group id, captured at spawn: `id()` is gone once the leader is
     /// reaped, but workers in the group may still be running.
+    #[cfg(unix)]
     pgid: Option<i32>,
     /// `shutdown` ran; `Drop` has nothing left to kill.
     finished: bool,
@@ -81,6 +83,7 @@ pub(crate) async fn spawn(spec: Spawn) -> Result<Child, AgentError> {
     Ok(Child {
         stdin: child.stdin.take(),
         stdout: child.stdout.take(),
+        #[cfg(unix)]
         pgid: child.id().map(|pid| pid as i32),
         finished: false,
         inner: child,
@@ -159,26 +162,21 @@ impl Drop for Child {
 }
 
 /// Child PATH in lookup order, with duplicates removed.
-fn compose_path(exec_path: &Path, own: Option<&str>, login: Option<&str>) -> String {
+fn compose_path(exec_path: &Path, own: Option<&str>, login: Option<&str>) -> OsString {
     let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
     let dirs = exec_path
         .parent()
-        .map(|d| d.to_string_lossy().into_owned())
+        .map(Path::to_path_buf)
         .into_iter()
         .chain(split_path(own))
-        .chain(split_path(login));
-    for dir in dirs {
-        if !dir.is_empty() && seen.insert(dir.clone()) {
-            out.push(dir);
-        }
-    }
-    out.join(":")
+        .chain(split_path(login))
+        .filter(|dir| !dir.as_os_str().is_empty() && seen.insert(dir.clone()));
+    std::env::join_paths(dirs).unwrap_or_default()
 }
 
 /// The entries of a PATH string, empty ones included (callers filter).
-fn split_path(path: Option<&str>) -> impl Iterator<Item = String> + '_ {
-    path.unwrap_or_default().split(':').map(str::to_owned)
+fn split_path(path: Option<&str>) -> impl Iterator<Item = PathBuf> + '_ {
+    std::env::split_paths(path.unwrap_or_default())
 }
 
 /// Returns the login-shell PATH, captured once per process.
@@ -187,9 +185,10 @@ pub(crate) async fn login_shell_path() -> Option<String> {
     CACHE.get_or_init(capture_login_shell_path).await.clone()
 }
 
-/// Runs the login shell with a non-interactive fallback.
+/// Runs the login shell with a non-interactive fallback. Windows has no
+/// login shell; GUI apps there already get the registry PATH.
 async fn capture_login_shell_path() -> Option<String> {
-    if std::env::var("ANYAGENT_NO_LOGIN_SHELL").is_ok_and(|v| v == "1") {
+    if cfg!(windows) || std::env::var("ANYAGENT_NO_LOGIN_SHELL").is_ok_and(|v| v == "1") {
         return None;
     }
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
@@ -224,7 +223,7 @@ async fn shell_path(shell: &str, flags: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

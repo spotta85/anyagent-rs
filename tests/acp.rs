@@ -1,5 +1,8 @@
 //! The ACP adapter driven end to end through the public interface, against
 //! the recorded fixture agent (tests/fixtures/acp/fixture.mjs; needs `node`).
+//! The catalog wrappers are `sh` scripts, so the file is unix-only for now.
+
+#![cfg(unix)]
 
 use std::path::Path;
 use std::time::Duration;

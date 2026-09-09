@@ -21,9 +21,7 @@ pub(crate) async fn discover(profiles: &[AgentProfile]) -> DiscoveryReport {
     if profiles.is_empty() {
         return report;
     }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    let home = std::env::home_dir().unwrap_or_default();
     let path = std::env::var("PATH").ok();
     let login = login_shell_path().await;
     let scans = profiles
@@ -172,14 +170,24 @@ fn search_dirs(
     dirs
 }
 
+/// Suffixes an executable can carry, in preference order. Windows installs
+/// are `.exe` (native) or `.cmd` / `.bat` shims (npm); the bare file there
+/// is a bash shim that cannot be spawned.
+#[cfg(unix)]
+const EXE_SUFFIXES: &[&str] = &[""];
+#[cfg(windows)]
+const EXE_SUFFIXES: &[&str] = &[".exe", ".cmd", ".bat"];
+
 /// First search dir that holds the executable.
 fn resolve(
     cli: &str,
     dirs: &[(PathBuf, InstallationSource)],
 ) -> Option<(PathBuf, InstallationSource)> {
     dirs.iter().find_map(|(dir, source)| {
-        let exe = dir.join(cli);
-        is_executable(&exe).then(|| (exe, source.clone()))
+        EXE_SUFFIXES.iter().find_map(|suffix| {
+            let exe = dir.join(format!("{cli}{suffix}"));
+            is_executable(&exe).then(|| (exe, source.clone()))
+        })
     })
 }
 
@@ -231,12 +239,9 @@ fn version_key(name: &str) -> Vec<u64> {
         .collect()
 }
 
-/// The non-empty directories of a PATH string.
+/// The directories of a PATH string, empty ones included (callers filter).
 fn split_path(path: Option<&str>) -> impl Iterator<Item = PathBuf> + '_ {
-    path.unwrap_or_default()
-        .split(':')
-        .filter(|dir| !dir.is_empty())
-        .map(PathBuf::from)
+    std::env::split_paths(path.unwrap_or_default())
 }
 
 /// A regular file with an execute bit (any file on non-unix).
@@ -290,7 +295,7 @@ pub(crate) fn login_methods(profile: &AgentProfile, exe: &Path) -> Vec<LoginMeth
     methods
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::catalog::Connection;
@@ -313,7 +318,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     fn install(dir: &Path, name: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir_all(dir).unwrap();
@@ -349,7 +353,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     /// Resolves newest version-manager install (v20.1.0 over v9.9.9).
     #[test]
     fn resolves_the_newest_version_manager_install() {

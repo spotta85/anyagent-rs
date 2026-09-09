@@ -14,8 +14,6 @@
 //! it hung at. Model-output flakes (wrong word from a weak model) are the
 //! operator's judgment call; structural failures fail hard.
 
-#![cfg(unix)]
-
 use std::num::NonZeroU32;
 use std::time::Duration;
 
@@ -1959,8 +1957,8 @@ fn claude_transcripts() -> std::collections::BTreeSet<std::path::PathBuf> {
     let mut found = std::collections::BTreeSet::new();
     let home = match std::env::var_os("CLAUDE_CONFIG_DIR") {
         Some(dir) => std::path::PathBuf::from(dir),
-        None => match std::env::var_os("HOME") {
-            Some(home) => std::path::PathBuf::from(home).join(".claude"),
+        None => match std::env::home_dir() {
+            Some(home) => home.join(".claude"),
             None => return found,
         },
     };
