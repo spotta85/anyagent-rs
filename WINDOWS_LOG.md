@@ -219,7 +219,7 @@ carries no `serve` and predates the run — the user's own, not a leak.
   that this step happened to surface.
 - Fix: `OPENCODE_MODEL` pinned to `opencode/muse-spark-1.2-contributor-free`,
   which passed 3/3 on the Mac and then on Windows. `tests/live.rs`, 1 line,
-  commit `f0f4a24`. Test-only.
+  commit `27b5565`. Test-only.
 
 ### B12 the opencode kill pattern assumed an unquoted command line
 - Symptom: `opencode: no process matched "opencode serve"`
@@ -228,7 +228,7 @@ carries no `serve` and predates the run — the user's own, not a leak.
   `"...\opencode-ai\bin\opencode.exe"    serve --hostname 127.0.0.1 --port N`.
   The literal `opencode serve` appears nowhere.
 - Fix: pattern widened to `opencode(\.exe)?"? +serve`, matching both platforms.
-  `tests/live.rs`, 1 line, commit `f0f4a24`. Test-only. Verified on the Mac
+  `tests/live.rs`, 1 line, commit `27b5565`. Test-only. Verified on the Mac
   (`PASS opencode: death maps to Failed + ProcessExited + closed`) and Windows.
 
 ### B13 discovery_finds_authenticated_harnesses — not a bug, the box is logged out
