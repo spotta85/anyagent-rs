@@ -138,7 +138,7 @@ library needed no Windows change for claude.
   `taskkill /F` terminates with exit code 1. The library reported both
   correctly — the assertion just hardcoded the unix number.
 - Fix: `KILLED_STATUS` cfg pair in `tests/live.rs`, ~5 lines, commit
-  `59d81ad`. Test-only.
+  `39a1c91`. Test-only.
 
 ### Note — mixed path separators in discovered paths
 `FOUND claude at C:\Users\sshdev\.local/bin\claude.exe`. The forward slash
