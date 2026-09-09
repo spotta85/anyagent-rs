@@ -1951,6 +1951,11 @@ fn matching_pids(args: &[&str], pattern: &str) -> Vec<String> {
         .args(["-NoProfile", "-Command", &script])
         .output()
         .unwrap();
+    eprintln!(
+        "DEBUG match {pattern:?} -> {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    eprintln!("DEBUG procs: {:?}", String::from_utf8_lossy(&std::process::Command::new("powershell").args(["-NoProfile","-Command","Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'claude|node' } | ForEach-Object { \"$($_.ProcessId) $($_.Name) $($_.CommandLine)\" }"]).output().unwrap().stdout));
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .map(|line| line.trim().to_owned())
