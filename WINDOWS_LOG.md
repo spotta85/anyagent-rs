@@ -140,11 +140,54 @@ library needed no Windows change for claude.
 - Fix: `KILLED_STATUS` cfg pair in `tests/live.rs`, ~5 lines, commit
   `39a1c91`. Test-only.
 
-### Note — mixed path separators in discovered paths
-`FOUND claude at C:\Users\sshdev\.local/bin\claude.exe`. The forward slash
-comes from `extra_paths: &[".local/bin"]` surviving `home.join()`. Functionally
-fine (Windows accepts both) but it reaches users through `MissingAgent.searched`
-and login commands. Cosmetic; not fixed.
+### B9 mixed path separators in every home-relative path
+- Symptom: `FOUND claude at C:\Users\sshdev\.local/bin\claude.exe`
+- Cause: catalog paths are written with forward slashes (`.local/bin`,
+  `.local/share/opencode`, `.pi/agent`) and `home.join()` kept them verbatim.
+  Functionally fine — Windows accepts both — but it reaches users through
+  `MissingAgent.searched`, `config_home` and login commands.
+- Fix: `under(home, rel)` in `src/discovery.rs` folds one component at a time;
+  used by `version_manager_dirs`, `versions_newest_first`, `search_dirs`
+  extras, `resolve_upgrade` extras and `config_home`. ~10 lines, commit
+  `cde7882`. Verified: `C:\Users\sshdev\.local\bin\claude.exe`.
+
+## Step 4 — codex — 2026-09-09
+
+codex 0.153.4, `npm install -g @openai/codex`,
+`C:\Users\sshdev\AppData\Roaming\npm\codex.cmd`. npm works on this box; the
+earlier claude npm failure did not repeat.
+
+`where.exe codex` returns both the bare bash shim and `codex.cmd`;
+`EXE_SUFFIXES` correctly skipped the unusable bare one. This is the first real
+`.cmd` shim exercised by a live agent rather than a fixture.
+
+| step | result |
+|---|---|
+| 1. install + location | npm, `%APPDATA%\npm\codex.cmd` |
+| 2. probe | FOUND, source `Path` |
+| 3. known-dirs fix | not needed; npm's dir is on PATH |
+| 4. auth marker | `ConfigFile("auth.json")` at `%USERPROFILE%\.codex\auth.json`. Subscription, 3 models, 6 commands, steer/fork/rollback/plan-usage |
+| 5. live suite | 32 passed, 0 failed, 345s. 6 SKIP (2 cursor, 1 opencode not enabled; question request did not fire, file rollback not advertised, recording asserted on claude) |
+
+Offline suite 221/221. No process of ours left after the run: four `codex`/
+`node` processes remain, but none carries `app-server` and all predate the run
+— they are the user's own codex sessions.
+
+The library again needed no Windows change. The one failure was the live
+harness.
+
+### B10 the codex kill pattern assumed a one-process agent
+- Symptom: `codex: no process matched "codex app-server"`
+- Cause: the npm shim makes the agent a three-link chain on Windows —
+  `cmd.exe "codex.cmd" app-server` -> `node.exe "...\codex.js" app-server` ->
+  `codex.exe ...\vendor\...\codex.exe app-server`. The real agent is the leaf,
+  and none of the three command lines contains the literal `codex app-server`.
+- Fix: pattern widened to `codex(\.exe)? app-server`, which matches the leaf on
+  both platforms and deliberately misses the `.js"` and `.cmd"` links.
+  `tests/live.rs`, 1 line, commit `8759cc4`. Test-only. Killing the leaf
+  cascades cleanly: node exits, then cmd, then the pipes close.
+  Verified on Windows and on the Mac (`PASS codex: death maps to Failed +
+  ProcessExited + closed`).
 
 ### Open — graceful shutdown has no cross-platform path
 Not a Windows-only issue. `CLOSE_GRACE` means "time to exit after being asked
