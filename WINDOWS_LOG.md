@@ -86,6 +86,66 @@ Orphaned `node.exe` after a full run: 20 before, 0 after.
 - Fix: `Path::ends_with` and a second `join` in `tests/pi.rs:180,547`,
   ~2 lines. Test-only.
 
+## Step 3 — claude — 2026-09-09
+
+claude 2.1.267, native installer (`irm https://claude.ai/install.ps1 | iex`),
+`C:\Users\sshdev\.local\bin\claude.exe`.
+
+The npm install on this box never completed: `%APPDATA%\npm\node_modules\
+@anthropic-ai` is an empty directory and there are 0 `.cmd` shims, so
+`where.exe claude` finds nothing and the two-install comparison was not
+available. Only the native install was exercised. Both installs would share
+one credential store anyway — auth lives in `%USERPROFILE%\.claude`, not
+beside the binary.
+
+| step | result |
+|---|---|
+| 1. install + location | native installer, `%USERPROFILE%\.local\bin\claude.exe` |
+| 2. probe | FOUND, source `KnownLocation` — tier 5 (`extra_paths: .local/bin`), not PATH |
+| 3. known-dirs fix | not needed; `extra_paths` already covered it |
+| 4. auth marker | `ConfigFile(".credentials.json")` at `%USERPROFILE%\.claude\.credentials.json`. Keychain is macOS-only and correctly unused. Subscription, 5 models, 52 commands |
+| 5. live suite | 32 passed, 0 failed, 179s. 3 SKIP (cursor x2, opencode — not enabled) |
+
+Offline suite 221/221. No `node.exe` or `claude.exe` left after either run.
+
+Both bugs below are in the live suite's own harness, not the library. The
+library needed no Windows change for claude.
+
+### B6 the live suite killed processes with pgrep
+- Symptom: `a_killed_agent_fails_the_turn_and_closes_the_session` panicked
+  with `Error { kind: NotFound, message: "program not found" }`
+- Cause: `kill_child` shelled out to `pgrep` and `kill`, neither of which
+  exists on Windows.
+- Fix: `matching_pids` and `kill_pid` cfg pairs in `tests/live.rs` — pgrep on
+  unix, a `Win32_Process` query honouring the same `-x`/`-n`/`-f` flags plus
+  `taskkill /F` on Windows. ~45 lines, commit `3c115c3`. Test-only.
+
+### B7 the process query matched itself
+- Symptom: after B6, the turn ended `Completed { source: Protocol }` instead
+  of `Failed`. The query returned two pids where only one was claude.
+- Cause: the pattern was inlined into the PowerShell command, so that
+  process's own command line contained the session id and matched. Sorted
+  newest-first, the query process was the one that got killed — the agent was
+  never touched.
+- Fix: the pattern rides `ANYAGENT_KILL_PATTERN` in the environment, which is
+  not part of any command line. `tests/live.rs`, ~4 lines, commit `e2ac5b4`.
+  Test-only. It also removes the quoting hazard of inlining a pattern.
+
+### B8 the kill assertion encoded a unix signal number
+- Symptom: `claude: status was "exit status: 1"` against
+  `assert!(status.contains('9'))`
+- Cause: on unix `kill -9` reports `signal: 9 (SIGKILL)`; on Windows
+  `taskkill /F` terminates with exit code 1. The library reported both
+  correctly — the assertion just hardcoded the unix number.
+- Fix: `KILLED_STATUS` cfg pair in `tests/live.rs`, ~5 lines, commit
+  `59d81ad`. Test-only.
+
+### Note — mixed path separators in discovered paths
+`FOUND claude at C:\Users\sshdev\.local/bin\claude.exe`. The forward slash
+comes from `extra_paths: &[".local/bin"]` surviving `home.join()`. Functionally
+fine (Windows accepts both) but it reaches users through `MissingAgent.searched`
+and login commands. Cosmetic; not fixed.
+
 ### Open — graceful shutdown has no cross-platform path
 Not a Windows-only issue. `CLOSE_GRACE` means "time to exit after being asked
 nicely", but the only ask is a unix SIGTERM. These agents speak JSON-lines over
