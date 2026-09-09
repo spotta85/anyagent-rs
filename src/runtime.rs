@@ -582,14 +582,13 @@ mod tests {
     /// Discovery through the runtime, over fixture shims on disk.
     mod discovery {
         use super::*;
+        use crate::testutil::{HOME_VAR, shim, stub};
         use std::sync::{Mutex, OnceLock};
 
         fn env_lock() -> &'static Mutex<()> {
             static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
             LOCK.get_or_init(|| Mutex::new(()))
         }
-
-        use crate::testutil::{HOME_VAR, shim, stub as make_exe};
 
         #[tokio::test]
         // The lock deliberately spans the awaits: it serializes tests that
@@ -599,7 +598,7 @@ mod tests {
             let _guard = env_lock().lock().unwrap();
             let home = tempfile::tempdir().unwrap();
             let bin = home.path().join(".local/bin");
-            let agy = make_exe(&bin, "agy");
+            let agy = stub(&bin, "agy");
             // The fixture wrappers exec `node`, so the real PATH stays behind
             // the fake bin.
             let path = std::env::var_os("PATH").unwrap_or_default();
@@ -626,7 +625,7 @@ mod tests {
             );
 
             // The server installed: it wins, over ACP, with nothing left to add.
-            let server = make_exe(
+            let server = stub(
                 &home.path().join(".local/agy-acp-server"),
                 "agy_acp_server.par",
             );
@@ -693,7 +692,7 @@ mod tests {
             let _guard = env_lock().lock().unwrap();
             let home = tempfile::tempdir().unwrap();
             let bin = home.path().join(".local/bin");
-            let agy = make_exe(&bin, "agy");
+            let agy = stub(&bin, "agy");
             // The fixture wrappers exec `node`, so the real PATH stays behind
             // the fake bin.
             let path = std::env::var_os("PATH").unwrap_or_default();
@@ -716,7 +715,7 @@ mod tests {
 
             // The server installed: the override still forces headless, and
             // there is nothing missing left to name.
-            make_exe(
+            stub(
                 &home.path().join(".local/agy-acp-server"),
                 "agy_acp_server.par",
             );

@@ -60,7 +60,9 @@ pub(crate) async fn spawn(spec: Spawn) -> Result<Child, AgentError> {
     // kiro-cli-chat, which inherits the pipes; a windows `.cmd` shim runs
     // through cmd.exe) are then killed as a unit.
     let mut child = command
-        .group_spawn()
+        .group()
+        .kill_on_drop(true)
+        .spawn()
         .map_err(|e| AgentError::SpawnFailed(format!("{}: {e}", spec.exec_path.display())))?;
 
     let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
@@ -133,19 +135,13 @@ impl Child {
     }
 }
 
-/// One wording on every platform: windows' `ExitStatus` says "exit code",
-/// unix says "exit status". Abnormal windows codes keep their own hex form.
-#[cfg(windows)]
+/// "exit status: N" on every platform; signals and abnormal windows codes
+/// keep std's own wording.
 fn status_text(status: std::process::ExitStatus) -> String {
     match status.code() {
         Some(code) if code >= 0 => format!("exit status: {code}"),
         _ => status.to_string(),
     }
-}
-
-#[cfg(unix)]
-fn status_text(status: std::process::ExitStatus) -> String {
-    status.to_string()
 }
 
 impl Child {

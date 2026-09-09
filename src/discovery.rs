@@ -308,6 +308,7 @@ pub(crate) fn login_methods(profile: &AgentProfile, exe: &Path) -> Vec<LoginMeth
 mod tests {
     use super::*;
     use crate::catalog::Connection;
+    use crate::testutil::stub;
 
     fn profile() -> AgentProfile {
         AgentProfile {
@@ -326,8 +327,6 @@ mod tests {
             upgrade: None,
         }
     }
-
-    use crate::testutil::stub as install;
 
     /// search_dirs follows PATH > LoginShellPath > VersionManager > KnownLocation > extra_paths order.
     #[test]
@@ -365,11 +364,11 @@ mod tests {
     #[test]
     fn resolves_the_newest_version_manager_install() {
         let home = tempfile::tempdir().unwrap();
-        install(
+        stub(
             &home.path().join(".nvm/versions/node/v9.9.9/bin"),
             "fake-agent",
         );
-        let newest = install(
+        let newest = stub(
             &home.path().join(".nvm/versions/node/v20.1.0/bin"),
             "fake-agent",
         );

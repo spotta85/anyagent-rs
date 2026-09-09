@@ -131,6 +131,7 @@ mod process;
 mod runtime;
 mod session;
 #[cfg(test)]
+#[path = "../tests/common/mod.rs"]
 mod testutil;
 
 pub use agent::*;
