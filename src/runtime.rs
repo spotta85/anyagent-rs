@@ -599,7 +599,7 @@ mod tests {
             let _guard = env_lock().lock().unwrap();
             let home = tempfile::tempdir().unwrap();
             let bin = home.path().join(".local/bin");
-            make_exe(&bin, "agy");
+            let agy = make_exe(&bin, "agy");
             // The fixture wrappers exec `node`, so the real PATH stays behind
             // the fake bin.
             let path = std::env::var_os("PATH").unwrap_or_default();
@@ -614,7 +614,7 @@ mod tests {
             // named upgrade with its own install hint.
             let report = Runtime::new().discover().await;
             let agent = report.require("antigravity").unwrap();
-            assert_eq!(agent.executable_path, bin.join("agy"));
+            assert_eq!(agent.executable_path, agy);
             assert!(agent.acp_args.is_none());
             let upgrade = agent.upgrade.as_ref().expect("upgrade named");
             assert_eq!(upgrade.name, "Antigravity ACP server");

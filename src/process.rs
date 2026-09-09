@@ -117,7 +117,7 @@ impl Child {
             let _ = tokio::time::timeout(grace, task).await;
         }
         match status {
-            Ok(Ok(status)) => status.to_string(),
+            Ok(Ok(status)) => status_text(status),
             _ => "unknown".into(),
         }
     }
@@ -141,6 +141,21 @@ impl Child {
             let _ = tokio::time::timeout(grace, task).await;
         }
     }
+}
+
+/// One wording on every platform: windows' `ExitStatus` says "exit code",
+/// unix says "exit status". Abnormal windows codes keep their own hex form.
+#[cfg(windows)]
+fn status_text(status: std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) if code >= 0 => format!("exit status: {code}"),
+        _ => status.to_string(),
+    }
+}
+
+#[cfg(unix)]
+fn status_text(status: std::process::ExitStatus) -> String {
+    status.to_string()
 }
 
 impl Child {
@@ -288,9 +303,8 @@ mod tests {
         ))
         .await
         .unwrap();
-        // "exit status: 0" on unix, "exit code: 0" on windows.
         let status = child.exit_status(Duration::from_secs(5)).await;
-        assert!(status.ends_with(": 0"), "{status}");
+        assert_eq!(status, "exit status: 0");
         assert_eq!(
             child.stderr_tail(),
             "line3\nline4\nline5\nline6\nline7\nline8"
