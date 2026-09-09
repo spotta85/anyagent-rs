@@ -7,6 +7,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout, Command};
 use tokio::sync::OnceCell;
@@ -29,11 +30,9 @@ pub(crate) struct Spawn {
 pub(crate) struct Child {
     pub stdin: Option<ChildStdin>,
     pub stdout: Option<ChildStdout>,
-    inner: tokio::process::Child,
-    /// The group id, captured at spawn: `id()` is gone once the leader is
-    /// reaped, but workers in the group may still be running.
-    #[cfg(unix)]
-    pgid: Option<i32>,
+    /// Owns the group: a pgid on unix, a Job Object on windows. Killing it
+    /// takes the workers with it, so no worker outlives the session.
+    inner: AsyncGroupChild,
     /// `shutdown` ran; `Drop` has nothing left to kill.
     finished: bool,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
@@ -57,17 +56,15 @@ pub(crate) async fn spawn(spec: Spawn) -> Result<Child, AgentError> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    // Own process group: agents that dispatch to a worker (kiro-cli spawns
-    // kiro-cli-chat, which inherits the pipes) are then signalled as a unit,
-    // so no worker outlives the session holding stderr open.
-    #[cfg(unix)]
-    command.process_group(0);
+    // Own group: agents that dispatch to a worker (kiro-cli spawns
+    // kiro-cli-chat, which inherits the pipes; a windows `.cmd` shim runs
+    // through cmd.exe) are then killed as a unit.
     let mut child = command
-        .spawn()
+        .group_spawn()
         .map_err(|e| AgentError::SpawnFailed(format!("{}: {e}", spec.exec_path.display())))?;
 
     let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
-    let stderr_task = child.stderr.take().map(|stderr| {
+    let stderr_task = child.inner().stderr.take().map(|stderr| {
         let tail = Arc::clone(&stderr_tail);
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
@@ -81,10 +78,8 @@ pub(crate) async fn spawn(spec: Spawn) -> Result<Child, AgentError> {
         })
     });
     Ok(Child {
-        stdin: child.stdin.take(),
-        stdout: child.stdout.take(),
-        #[cfg(unix)]
-        pgid: child.id().map(|pid| pid as i32),
+        stdin: child.inner().stdin.take(),
+        stdout: child.inner().stdout.take(),
         finished: false,
         inner: child,
         stderr_tail,
@@ -122,17 +117,12 @@ impl Child {
         }
     }
 
-    /// SIGTERM to the group, a grace period for the leader, then SIGKILL to
-    /// the group: workers that ignored the SIGTERM must not outlive it.
+    /// Asks the group to exit, then kills it: workers that ignored the ask
+    /// must not outlive the session.
     pub async fn shutdown(&mut self, grace: Duration) {
-        #[cfg(unix)]
-        if let Some(pgid) = self.pgid {
-            // Negative pid signals the whole group; the child leads its own.
-            unsafe { libc::kill(-pgid, libc::SIGTERM) };
-        }
-        let _ = tokio::time::timeout(grace, self.inner.wait()).await;
+        self.request_exit(grace).await;
         self.kill_group();
-        let _ = self.inner.kill().await;
+        let _ = self.inner.wait().await;
         self.finished = true;
         // The reader ends at stderr EOF; joining it here makes `stderr_tail`
         // complete for error reports (a child that dies at spawn can lose the
@@ -159,13 +149,23 @@ fn status_text(status: std::process::ExitStatus) -> String {
 }
 
 impl Child {
-    /// SIGKILL to the group; harmless when it is already gone.
-    fn kill_group(&self) {
-        #[cfg(unix)]
-        if let Some(pgid) = self.pgid {
-            unsafe { libc::kill(-pgid, libc::SIGKILL) };
-        }
+    /// Kills the whole group; harmless when it is already gone.
+    fn kill_group(&mut self) {
+        let _ = self.inner.start_kill();
     }
+
+    /// SIGTERM to the group, then up to `grace` for it to exit on its own.
+    #[cfg(unix)]
+    async fn request_exit(&mut self, grace: Duration) {
+        use command_group::{Signal, UnixChildExt};
+        let _ = self.inner.signal(Signal::SIGTERM);
+        let _ = tokio::time::timeout(grace, self.inner.wait()).await;
+    }
+
+    /// Windows has no signal that asks a process to exit, so there is nothing
+    /// to ask and nothing to wait for: `shutdown` goes straight to the kill.
+    #[cfg(windows)]
+    async fn request_exit(&mut self, _grace: Duration) {}
 }
 
 impl Drop for Child {
