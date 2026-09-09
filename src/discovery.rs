@@ -97,7 +97,7 @@ fn resolve_upgrade(
         upgrade
             .extra_paths
             .iter()
-            .map(|extra| (home.join(extra), InstallationSource::KnownLocation)),
+            .map(|extra| (under(home, extra), InstallationSource::KnownLocation)),
     );
     match resolve(upgrade.cli, &dirs) {
         Some((exe, source)) => Ok((
@@ -163,7 +163,7 @@ fn search_dirs(
         let dir = if dir.is_absolute() {
             dir.to_owned()
         } else {
-            home.join(dir)
+            under(home, extra)
         };
         add(dir, InstallationSource::KnownLocation);
     }
@@ -200,25 +200,32 @@ fn resolve(
     })
 }
 
+/// `home` plus a `/`-separated relative path, one component at a time, so
+/// the result carries the platform's own separator throughout.
+fn under(home: &Path, rel: &str) -> PathBuf {
+    rel.split('/')
+        .fold(home.to_path_buf(), |path, part| path.join(part))
+}
+
 /// Bin dirs of the common Node version managers, newest version first.
 fn version_manager_dirs(home: &Path) -> Vec<PathBuf> {
     let mut dirs = vec![
-        home.join(".volta/bin"),
-        home.join(".bun/bin"),
-        home.join(".local/share/pnpm"),
-        home.join("Library/pnpm"),
-        home.join(".npm-global/bin"),
+        under(home, ".volta/bin"),
+        under(home, ".bun/bin"),
+        under(home, ".local/share/pnpm"),
+        under(home, "Library/pnpm"),
+        under(home, ".npm-global/bin"),
     ];
     dirs.extend(versions_newest_first(
-        &home.join(".nvm/versions/node"),
+        &under(home, ".nvm/versions/node"),
         "bin",
     ));
     dirs.extend(versions_newest_first(
-        &home.join(".local/share/fnm/node-versions"),
+        &under(home, ".local/share/fnm/node-versions"),
         "installation/bin",
     ));
     dirs.extend(versions_newest_first(
-        &home.join("Library/Application Support/fnm/node-versions"),
+        &under(home, "Library/Application Support/fnm/node-versions"),
         "installation/bin",
     ));
     dirs
@@ -236,7 +243,7 @@ fn versions_newest_first(root: &Path, suffix: &str) -> Vec<PathBuf> {
     versions.sort_by(|a, b| b.0.cmp(&a.0));
     versions
         .into_iter()
-        .map(|(_, path)| path.join(suffix))
+        .map(|(_, path)| under(&path, suffix))
         .collect()
 }
 

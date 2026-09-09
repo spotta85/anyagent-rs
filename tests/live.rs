@@ -1866,8 +1866,8 @@ async fn quiet(events: &mut Events, secs: u64, step: &str) {
     }
 }
 
-/// How an outright kill shows up in the exit status: the signal on unix,
-/// taskkill's own exit code on windows.
+/// How an outright kill shows up in the exit status: the signal on unix, the
+/// exit code taskkill gives the process it terminates on windows.
 #[cfg(unix)]
 const KILLED_STATUS: &str = "9";
 #[cfg(windows)]
