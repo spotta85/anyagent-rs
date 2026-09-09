@@ -1546,7 +1546,8 @@ async fn runtime_plan_usage_probes_without_a_session() {
     }
 }
 
-/// Killed (-9) agent maps to TurnEnded(Failed) + ProcessExited(status 9) and closes the session.
+/// Killed agent maps to TurnEnded(Failed) + ProcessExited(`KILLED_STATUS`)
+/// and closes the session.
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn a_killed_agent_fails_the_turn_and_closes_the_session() {
@@ -1573,7 +1574,7 @@ async fn a_killed_agent_fails_the_turn_and_closes_the_session() {
                     let AgentError::ProcessExited { status, .. } = &error else {
                         panic!("{h}: stream error was {error}");
                     };
-                    assert!(status.contains('9'), "{h}: status was {status:?}");
+                    assert!(status.contains(KILLED_STATUS), "{h}: status was {status:?}");
                 }
                 Ok(None) => break,
                 Err(_) => panic!("{h}: hung after kill"),
@@ -1865,7 +1866,14 @@ async fn quiet(events: &mut Events, secs: u64, step: &str) {
     }
 }
 
-/// kill -9 the session's own agent process, found by a session-unique marker.
+/// How an outright kill shows up in the exit status: the signal on unix,
+/// taskkill's own exit code on windows.
+#[cfg(unix)]
+const KILLED_STATUS: &str = "9";
+#[cfg(windows)]
+const KILLED_STATUS: &str = "exit status: 1";
+
+/// Kills the session's own agent process, found by a session-unique marker.
 fn kill_child(harness: &str, session: &Session) {
     // claude carries our minted session id in argv; opencode is matched by
     // its newest `opencode serve` process.
