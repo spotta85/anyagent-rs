@@ -1942,20 +1942,18 @@ fn matching_pids(args: &[&str], pattern: &str) -> Vec<String> {
     } else {
         ""
     };
+    // The pattern rides an env var: inlined, it would appear in this very
+    // query's own command line, which then matches itself.
     let script = format!(
-        "$p = '{pattern}'; Get-CimInstance Win32_Process \
+        "$p = $env:ANYAGENT_KILL_PATTERN; Get-CimInstance Win32_Process \
          | Where-Object {{ {test} }} | Sort-Object CreationDate \
          | Select-Object -ExpandProperty ProcessId {newest}"
     );
     let out = std::process::Command::new("powershell")
         .args(["-NoProfile", "-Command", &script])
+        .env("ANYAGENT_KILL_PATTERN", pattern)
         .output()
         .unwrap();
-    eprintln!(
-        "DEBUG match {pattern:?} -> {:?}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-    eprintln!("DEBUG procs: {:?}", String::from_utf8_lossy(&std::process::Command::new("powershell").args(["-NoProfile","-Command","Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'claude|node' } | ForEach-Object { \"$($_.ProcessId) $($_.Name) $($_.CommandLine)\" }"]).output().unwrap().stdout));
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .map(|line| line.trim().to_owned())
