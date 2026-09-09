@@ -589,7 +589,7 @@ mod tests {
             LOCK.get_or_init(|| Mutex::new(()))
         }
 
-        use crate::testutil::{shim, stub as make_exe};
+        use crate::testutil::{HOME_VAR, shim, stub as make_exe};
 
         #[tokio::test]
         // The lock deliberately spans the awaits: it serializes tests that
@@ -606,7 +606,7 @@ mod tests {
             let mut paths = vec![bin.clone()];
             paths.extend(std::env::split_paths(&path));
             let _env = EnvGuard::set(&[
-                ("HOME", home.path().as_os_str().to_owned()),
+                (HOME_VAR, home.path().as_os_str().to_owned()),
                 ("PATH", std::env::join_paths(paths).unwrap()),
             ]);
 
@@ -700,7 +700,7 @@ mod tests {
             let mut paths = vec![bin.clone()];
             paths.extend(std::env::split_paths(&path));
             let _env = EnvGuard::set(&[
-                ("HOME", home.path().as_os_str().to_owned()),
+                (HOME_VAR, home.path().as_os_str().to_owned()),
                 ("PATH", std::env::join_paths(paths).unwrap()),
                 ("ANYAGENT_ANTIGRAVITY_BIN", agy.as_os_str().to_owned()),
             ]);

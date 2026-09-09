@@ -45,3 +45,9 @@ fn write_stub(dir: &Path, name: &str) -> PathBuf {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
 }
+
+/// The variable `std::env::home_dir` reads, for tests that redirect home.
+#[cfg(unix)]
+pub const HOME_VAR: &str = "HOME";
+#[cfg(windows)]
+pub const HOME_VAR: &str = "USERPROFILE";
