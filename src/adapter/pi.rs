@@ -228,9 +228,12 @@ async fn auth_status(
     if report["status"].as_str() != Some("ready") {
         return unauthenticated();
     }
+    // `oauth` is how pi logged in, not how it bills: anthropic's OAuth is a
+    // Claude subscription; openrouter's PKCE flow hands out a pay-per-token
+    // key (auth.json probed 2026-09-09).
     AuthStatus::Authenticated {
-        kind: match report["authType"].as_str() {
-            Some("oauth") => AuthKind::Subscription,
+        kind: match (report["authType"].as_str(), provider) {
+            (Some("oauth"), "anthropic") => AuthKind::Subscription,
             _ => AuthKind::ApiKey,
         },
         account: None,

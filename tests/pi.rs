@@ -125,10 +125,11 @@ async fn handshake_advertises_state_models_levels_and_commands() {
     let details = &info.details;
 
     assert_eq!(details.version.as_deref(), Some("0.84.4"));
+    // An openrouter OAuth login is a pay-per-token key, not a subscription.
     assert_eq!(
         details.auth,
         AuthStatus::Authenticated {
-            kind: AuthKind::Subscription,
+            kind: AuthKind::ApiKey,
             account: None,
         }
     );
@@ -531,7 +532,8 @@ async fn logged_out_is_reported_from_pi_s_own_readiness_check() {
     );
 }
 
-/// Api-key login reported as Authenticated ApiKey.
+/// Api-key login reported as Authenticated ApiKey; only anthropic's OAuth
+/// login is a Subscription.
 #[tokio::test]
 async fn an_api_key_login_is_reported_as_one() {
     let runtime = Runtime::new();
@@ -540,6 +542,17 @@ async fn an_api_key_login_is_reported_as_one() {
         runtime.probe_auth(&agent).await.unwrap(),
         AuthStatus::Authenticated {
             kind: AuthKind::ApiKey,
+            account: None,
+        }
+    );
+
+    let options =
+        SessionOptions::in_dir(std::env::temp_dir()).configure("model", "anthropic/claude-x");
+    let (session, _events) = open_with("anthropic-oauth", "", options).await.unwrap();
+    assert_eq!(
+        session.info().details.auth,
+        AuthStatus::Authenticated {
+            kind: AuthKind::Subscription,
             account: None,
         }
     );

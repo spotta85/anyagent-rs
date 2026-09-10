@@ -26,9 +26,11 @@ if (flag('--version')) {
 }
 if (process.argv.includes('auth')) {
   const ready = !flag('--logged-out');
+  // Echoes the `--provider` it was asked about, as pi does.
+  const provider = process.argv[process.argv.indexOf('--provider') + 1] ?? 'openrouter';
   process.stdout.write(JSON.stringify(
     ready
-      ? { status: 'ready', provider: 'openrouter', authType: flag('--api-key') ? 'api_key' : 'oauth' }
+      ? { status: 'ready', provider, authType: flag('--api-key') ? 'api_key' : 'oauth' }
       : { status: 'not_ready', provider: 'openrouter', reason: 'credentials_not_configured' },
   ) + '\n');
   process.exit(0);
@@ -47,7 +49,10 @@ const LEVELS = { 'nemo-1': ['off', 'low', 'medium'], 'claude-x': ['off', 'high',
 const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), '.pi', 'agent');
 const sessionArg = process.argv[process.argv.indexOf('--session') + 1];
 
-let model = flag('--logged-out') ? UNKNOWN : MODELS[0];
+// A creation-time `--provider <p> --model <id>` selects that model, as pi does.
+const arg = (name) => process.argv[process.argv.indexOf(name) + 1];
+const launched = MODELS.find((m) => m.provider === arg('--provider') && m.id === arg('--model'));
+let model = flag('--logged-out') ? UNKNOWN : (launched ?? MODELS[0]);
 let thinking = 'medium';
 let sessionFile = process.argv.includes('--session') ? sessionArg : join(agentDir, 'sessions', 's1.jsonl');
 if (flag('--no-session')) sessionFile = undefined;
