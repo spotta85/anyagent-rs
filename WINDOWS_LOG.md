@@ -252,6 +252,122 @@ timeout) and `turn_events_are_bracketed_ordered_and_quiet_after_end`
 passed on Windows once the model changed. Recorded here rather than "fixed" —
 if either returns, the model swap is the first thing to suspect.
 
+## Step 6 — the rest — 2026-09-09
+
+**Every harness ships for Windows.** Nothing to record as "not available":
+all ten in the catalog were installed, discovered and (bar cursor) reported
+their auth. Nine resolve through `Path`; only claude needs `extra_paths`. Ten
+for ten on PATH means the handoff's predicted Windows `known_dirs()` cfg pair
+was **never needed** and has not been written.
+
+| harness | found at | source |
+|---|---|---|
+| antigravity 1.2.0 | `%LOCALAPPDATA%\agy\bin\agy.exe` | Path |
+| cursor | `%LOCALAPPDATA%\cursor-agent\cursor-agent.cmd` | Path |
+| grok | `%APPDATA%\npm\grok.cmd` | Path |
+| hermes 0.21.1 | `%LOCALAPPDATA%\hermes\bin\hermes.exe` | Path |
+| kiro 2.21.2 | `%LOCALAPPDATA%\Kiro-Cli\kiro-cli.exe` | Path |
+| pi 0.85.1 | `%APPDATA%\npm\pi.cmd` | Path |
+| qwen 0.23.2 | `%APPDATA%\npm\qwen.cmd` | Path |
+
+`ANYAGENT_LIVE=all`: 27 passed / 5 failed at first, 29 / 3 after the fixes
+below, 1448 s. B13 closed once the user logged into opencode.
+
+### The recurring root cause
+Five separate bugs were one mistake: comparing an executable name exactly,
+which never survives Windows' `.exe`/`.cmd` suffix, and matching a command
+line that joins the exe to its first argument, which **Rust's `Command`
+separates with a quote** (`"...\agy.exe" --input-format=...`). B3 was the
+library instance; B14-B17 are the harness ones. A grep of `src/` afterwards
+found no others: the only remaining `file_name()` uses are `is_named` itself
+and version-directory sorting, where names carry no suffix.
+
+### B14 HEADLESS_AGY missed the .exe suffix
+- Symptom: `antigravity: no question request opened`
+- Cause: the flag compared `file_name() == "agy"`, but windows installs
+  `agy.exe`, so it stayed false and the test's own
+  `SKIP antigravity: headless agy cannot ask` branch never fired — it demanded
+  a question from a CLI that structurally cannot ask one.
+- Fix: `file_stem()`, which still tells the CLI from `agy_acp_server.par`.
+  `tests/live.rs`, 1 line. Test-only. Mac still passes.
+
+### B15 kiro kill pattern
+- Symptom: `kiro: no process matched "kiro-cli(-chat)? acp$"`
+- Cause: windows has no `kiro-cli-chat` worker, and our spawn quotes the path:
+  `"...\kiro-cli.exe" acp`. Note a *manually* launched kiro is unquoted — the
+  quote comes from how we spawn it, which is why the first fix attempt
+  (`(\.exe)?` alone) still failed.
+- Fix: `kiro-cli(-chat)?(\.exe)?"? acp$`. The `$` anchor is kept so the user's
+  own `kiro-cli acp --agent <name>` processes stay out. Test-only.
+
+### B16 cursor kill pattern
+- Symptom: `cursor: no process matched "cursor-agent .*index.js acp$"`
+- Cause: windows runs a four-link chain — `cmd -> cursor-agent.ps1 -> node
+  index.js acp` — and the node leaf's path reads `cursor-agent\versions\...`,
+  a path separator exactly where the pattern demanded a literal space.
+- Fix: `cursor-agent.*index\.js acp$`. Test-only.
+
+### B17 antigravity kill pattern
+- Symptom: `antigravity: no process matched`
+- Cause: the quoted exe path again, between `agy` and ` --input-format=`.
+- Fix: `agy(\.exe)?"?( --input-format=stream-json|_acp_server)`. Test-only.
+
+### B18 ANYAGENT_LIVE=all silently selected nothing
+- Symptom: 32 tests reported `ok` in 0.02 s with no PASS lines.
+- Cause: the comma-list branch trimmed each name but the `all` branch compared
+  the raw string, and cmd's `set ANYAGENT_LIVE=all && cargo test` assigns a
+  **trailing space**. `claude` worked; `all` did not.
+- Fix: `list.trim() == "all"`. Test-only, but it would have silently voided any
+  windows `all` run.
+
+### B19 hermes auth lives in %LOCALAPPDATA%
+- Symptom: `hermes: not authenticated`, while its own open-time view said
+  `Authenticated { kind: ApiKey }`
+- Cause: hermes keeps `auth.json` in `~/.hermes` on macOS but in
+  `%LOCALAPPDATA%\hermes` on windows, so no marker matched and discovery
+  reported a logged-in agent as logged out.
+- Fix: `#[cfg]` on the `config_dir` field of the hermes profile only —
+  no new struct field, no per-profile `None` noise, no dead code on unix.
+  `src/catalog.rs`, 4 lines. **Library fix.** Verified:
+  `PASS hermes: discovered and authenticated`.
+
+### Not our bugs, investigated and left alone
+- **kiro `effort`**: windows defaults to model `auto`, which lists no effort
+  levels; the Mac is pinned to `claude-opus-4.8`, which lists five. Pinning
+  the Mac's model on windows reproduces all five. Config, not platform, and
+  our parsing of `session/new` has no platform branch.
+- **cursor discovery auth**: `.cursor` holds no credential file at all
+  (`acp-config.json` 2 B, `agent-cli-state.json` 94 B of tip flags), so cursor
+  keeps its token in the OS credential store. The catalog's only non-env
+  marker is `Keychain`, which is macOS-only. Reading Windows Credential
+  Manager is a feature, not a catalog tweak. **Open.**
+
+### Cross-platform findings that Windows merely surfaced
+- **Late `SessionUpdated`**: reproduces on the Mac (1 PASS / 1 FAIL in two
+  hermes runs). The agent sets the session title asynchronously and the event
+  can land after `TurnEnded`; `quiet()` sanctions `Diagnostic`,
+  `PlanUsageUpdated` and `StatusChanged` but not `SessionUpdated`. Step 5's
+  opencode instance was the same race — the model swap hid it, it did not fix
+  it. Loosening the contract is a product decision; **not changed**.
+- **pi is gated on a variable it does not need**: `build_roster` skips pi
+  unless `OPENROUTER_API_KEY` is set, but pi is logged in through
+  `~/.pi/agent/auth.json` on both machines. pi's profile has **no `ConfigFile`
+  marker**, only `ApiKeyEnv` ones, so discovery cannot see that login. Setting
+  the variable to pass the gate then makes an empty config home look
+  authenticated and fails `config_home_isolates_login`. Two bugs stacked, both
+  cross-platform. **Owner: user.**
+- **pi `compact`**: `compaction refused: Nothing to compact (session too
+  small)` on both platforms once pi actually runs.
+- **grok and qwen have no live coverage anywhere** — they are in the catalog
+  and discovered, but absent from `HARNESSES`, so `ANYAGENT_LIVE=all` covers
+  eight harnesses, not ten.
+
+### Environment note
+`OPENROUTER_API_KEY` was set as a User variable on the windows box during this
+step to get past the roster gate. It distorts pi's auth state and should be
+removed; the key itself should be rotated, having passed through a command
+line and a chat transcript.
+
 ### Open — graceful shutdown has no cross-platform path
 Not a Windows-only issue. `CLOSE_GRACE` means "time to exit after being asked
 nicely", but the only ask is a unix SIGTERM. These agents speak JSON-lines over
