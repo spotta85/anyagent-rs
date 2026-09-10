@@ -103,7 +103,7 @@ impl Child {
 
     /// Waits for the child and stderr reader for at most `grace` each. A
     /// leader that already died takes its workers with it; once reaped, the
-    /// pgid may be recycled, so `Drop` must not signal it again.
+    /// pgid may be recycled, so nothing may signal it again (`finished`).
     pub async fn exit_status(&mut self, grace: Duration) -> String {
         if !self.is_running() {
             self.kill_group();
@@ -119,14 +119,19 @@ impl Child {
         }
     }
 
-    /// Asks the group to exit, then kills it: workers that ignored the ask
-    /// must not outlive the session. A group that left on its own is fully
-    /// reaped, so its id may already belong to someone else: no kill then.
+    /// Asks the group to exit, then kills it: a worker that ignored the ask,
+    /// or outlived a cooperative leader, must not outlive the session. Only
+    /// the leader is ours to reap, so its exit proves nothing about workers.
+    /// The kill follows the reap within microseconds, before the OS could
+    /// hand the group id to anyone else; a group reaped by an earlier call is
+    /// never signalled again.
     pub async fn shutdown(&mut self, grace: Duration) {
-        if !self.request_exit(grace).await {
-            self.kill_group();
-            let _ = self.inner.wait().await;
+        if self.finished {
+            return;
         }
+        self.request_exit(grace).await;
+        self.kill_group();
+        let _ = self.inner.wait().await;
         self.finished = true;
         // The reader ends at stderr EOF; joining it here makes `stderr_tail`
         // complete for error reports (a child that dies at spawn can lose the
@@ -152,24 +157,18 @@ impl Child {
         let _ = self.inner.start_kill();
     }
 
-    /// SIGTERM to the group, then up to `grace` for it to exit on its own.
-    /// True when it did.
+    /// SIGTERM to the group, then up to `grace` for the leader to exit.
     #[cfg(unix)]
-    async fn request_exit(&mut self, grace: Duration) -> bool {
+    async fn request_exit(&mut self, grace: Duration) {
         use command_group::{Signal, UnixChildExt};
         let _ = self.inner.signal(Signal::SIGTERM);
-        matches!(
-            tokio::time::timeout(grace, self.inner.wait()).await,
-            Ok(Ok(_))
-        )
+        let _ = tokio::time::timeout(grace, self.inner.wait()).await;
     }
 
     /// Windows has no signal that asks a process to exit, so there is nothing
     /// to ask and nothing to wait for: `shutdown` goes straight to the kill.
     #[cfg(windows)]
-    async fn request_exit(&mut self, _grace: Duration) -> bool {
-        false
-    }
+    async fn request_exit(&mut self, _grace: Duration) {}
 }
 
 impl Drop for Child {
