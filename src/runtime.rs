@@ -102,15 +102,14 @@ impl Runtime {
             id,
             executable_path: PathBuf::from("mock"),
             source: InstallationSource::Pinned,
-            auth: None,
             upgrade: None,
             acp_args: None,
         });
         runtime
     }
 
-    /// Best-effort, read-only inventory: which agents exist, where, and
-    /// whether a login marker is present. Never launches an agent. An agent
+    /// Read-only inventory: which agents exist and where. Never launches an
+    /// agent; login state comes from `probe` or `probe_auth`. An agent
     /// whose adapter is not implemented never appears as usable.
     pub async fn discover(&self) -> DiscoveryReport {
         let mut report = crate::discovery::discover(self.profiles).await;

@@ -345,7 +345,7 @@ fn model_choices(models: &Value) -> Vec<ConfigChoice> {
 /// Login state from `initialize`'s `account` (probed 2026-08-27, 2.1.241):
 /// email/plan = a login; `apiProvider: bedrock` = cloud credentials;
 /// `apiKeySource` or a known `tokenSource` = API key; `tokenSource: none`
-/// = logged out unless the gateway token env is set; else the marker.
+/// = logged out unless the gateway token env is set; else unknown.
 fn account_status(account: &Value, request: &ConnectRequest) -> AuthStatus {
     let email = account["email"].as_str();
     let plan = account["subscriptionType"].as_str();
@@ -377,7 +377,7 @@ fn account_status(account: &Value, request: &ConnectRequest) -> AuthStatus {
         };
     }
     // Some CLI versions name the credential in `tokenSource` instead; only
-    // the known spellings count, other values fall to the marker.
+    // the known spellings count, other values are unknown.
     let token_source = account["tokenSource"].as_str().unwrap_or_default();
     let normalized = token_source.to_lowercase().replace(['_', '-', ' '], "");
     if matches!(
@@ -402,11 +402,7 @@ fn account_status(account: &Value, request: &ConnectRequest) -> AuthStatus {
             login: login_methods(&request.installation, Some(&request.options)),
         };
     }
-    request
-        .installation
-        .auth
-        .clone()
-        .unwrap_or(AuthStatus::Unknown)
+    AuthStatus::Unknown
 }
 
 /// What the `initialize` response tells us, folded into the engine vocabulary.

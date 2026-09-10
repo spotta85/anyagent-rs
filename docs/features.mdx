@@ -19,9 +19,8 @@ Events    text · tools · plans · requests · status · usage · turn boundari
 
 **What:** find every supported agent on the machine, instantly, without
 launching anything. Checks env overrides, `PATH`, the login-shell `PATH`
-(GUI apps often miss it), and known install directories, then reads offline
-login markers. Agents that are supported but missing come back with an
-install hint.
+(GUI apps often miss it), and known install directories. Agents that are
+supported but missing come back with an install hint.
 
 ```rust
 let report = runtime.discover().await;
@@ -34,8 +33,8 @@ for missing in &report.missing {
 let agent = report.require("claude")?;   // AgentError::NotInstalled if absent
 ```
 
-**Confirms:** the report itself. `agent.auth` is a best-effort offline guess;
-use probe for the truth.
+**Confirms:** the report itself. Discovery never guesses login state; `probe`
+or `probe_auth` asks the agent.
 **Gates:** none. Call `runtime.prewarm()` at startup to scan early.
 
 Some agents have a richer, separately installed runtime (Antigravity's ACP

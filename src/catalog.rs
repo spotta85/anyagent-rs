@@ -10,15 +10,13 @@ pub(crate) struct AgentProfile {
     pub cli: &'static str,
     /// Env var that overrides executable resolution (tests, custom installs).
     pub executable_env: &'static str,
-    /// Config directory under the user's home (`.claude`), and the env var
-    /// that relocates it.
-    pub config_dir: &'static str,
+    /// Env var that relocates the agent's config directory.
     pub config_home_env: Option<&'static str>,
     /// Which adapter drives it and how to put the CLI in protocol mode.
     pub connection: Connection,
-    /// Presence of any marker means "logged in", read offline. Empty when
-    /// the agent has no known marker (auth reported as `None`).
-    pub auth_markers: &'static [AuthMarker],
+    /// API-key env vars the agent documents; each is an `EnvVar` login
+    /// method when it reports logged out.
+    pub api_key_env: &'static [&'static str],
     /// `Some(kind)` when a successful session open proves the agent is logged
     /// in with this kind (probed: the agent refuses to open logged out).
     /// `None` when an open proves nothing (opencode serves free models
@@ -72,16 +70,6 @@ pub(crate) enum NativeKind {
     Opencode,
 }
 
-/// Offline auth markers for fast discovery.
-pub(crate) enum AuthMarker {
-    /// File under the agent's config home.
-    ConfigFile(&'static str, AuthKind),
-    /// macOS keychain generic-password service.
-    Keychain(&'static str, AuthKind),
-    /// API key environment variable; doubles as the `EnvVar` login method.
-    ApiKeyEnv(&'static str),
-}
-
 /// The supported agents. A profile ships only with launch flags verified
 /// against a real install; guessed wire flags do not ship.
 pub(crate) static PROFILES: &[AgentProfile] = &[
@@ -90,14 +78,9 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         name: "Claude Code",
         cli: "claude",
         executable_env: "ANYAGENT_CLAUDE_BIN",
-        config_dir: ".claude",
         config_home_env: Some("CLAUDE_CONFIG_DIR"),
         connection: Connection::Native(NativeKind::Claude),
-        auth_markers: &[
-            AuthMarker::ConfigFile(".credentials.json", AuthKind::Subscription),
-            AuthMarker::Keychain("Claude Code-credentials", AuthKind::Subscription),
-            AuthMarker::ApiKeyEnv("ANTHROPIC_API_KEY"),
-        ],
+        api_key_env: &["ANTHROPIC_API_KEY"],
         open_auth_kind: None,
         auth_error_hints: &[],
         login_args: &["auth", "login"],
@@ -110,12 +93,11 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         name: "Codex",
         cli: "codex",
         executable_env: "ANYAGENT_CODEX_BIN",
-        config_dir: ".codex",
         config_home_env: Some("CODEX_HOME"),
         connection: Connection::Native(NativeKind::Codex),
-        // No env marker: app-server 0.147.0 ignores `OPENAI_API_KEY`
-        // (probed 2026-08-27); auth comes only from auth.json.
-        auth_markers: &[AuthMarker::ConfigFile("auth.json", AuthKind::Subscription)],
+        // app-server 0.147.0 ignores `OPENAI_API_KEY` (probed 2026-08-27);
+        // auth comes only from `codex login`.
+        api_key_env: &[],
         open_auth_kind: None,
         auth_error_hints: &[],
         login_args: &["login"],
@@ -130,14 +112,9 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         name: "Antigravity",
         cli: "agy",
         executable_env: "ANYAGENT_ANTIGRAVITY_BIN",
-        config_dir: ".gemini",
         config_home_env: None,
         connection: Connection::Native(NativeKind::Antigravity),
-        // Both sit directly under ~/.gemini (verified on disk 2026-08-24).
-        auth_markers: &[
-            AuthMarker::ConfigFile("jetski-standalone-oauth-token", AuthKind::Subscription),
-            AuthMarker::ConfigFile("oauth_creds.json", AuthKind::Subscription),
-        ],
+        api_key_env: &[],
         // Logged out, `agy` exits before its `init` frame (probed 1.1.24).
         open_auth_kind: Some(AuthKind::Subscription),
         auth_error_hints: &["authentication required", "authentication failed"],
@@ -170,16 +147,10 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         name: "Cursor CLI",
         cli: "cursor-agent",
         executable_env: "ANYAGENT_CURSOR_BIN",
-        config_dir: ".cursor",
         config_home_env: None,
         connection: Connection::Acp { args: &["acp"] },
-        // `cursor-agent login` stores the token in the macOS keychain
-        // (probed 2026-09-07); the env key is Cursor's documented headless
-        // alternative.
-        auth_markers: &[
-            AuthMarker::Keychain("cursor-access-token", AuthKind::Subscription),
-            AuthMarker::ApiKeyEnv("CURSOR_API_KEY"),
-        ],
+        // Cursor's documented headless alternative to `cursor-agent login`.
+        api_key_env: &["CURSOR_API_KEY"],
         open_auth_kind: Some(AuthKind::Subscription),
         // Every session call logged out fails with the auth code and this
         // text (read from the 2026.09.02 bundle).
@@ -194,7 +165,6 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         name: "Grok",
         cli: "grok",
         executable_env: "ANYAGENT_GROK_BIN",
-        config_dir: ".grok",
         config_home_env: None,
         // Verified against grok 1.0.4: top-level `--no-auto-update` skips a
         // multi-second update check; `--no-leader` starts a fresh agent
@@ -202,12 +172,8 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         connection: Connection::Acp {
             args: &["--no-auto-update", "agent", "--no-leader", "stdio"],
         },
-        // OAuth login writes ~/.grok/auth.json (probed 2026-08-28); the env
-        // key is the API-key alternative.
-        auth_markers: &[
-            AuthMarker::ConfigFile("auth.json", AuthKind::Subscription),
-            AuthMarker::ApiKeyEnv("XAI_API_KEY"),
-        ],
+        // The API-key alternative to the OAuth login.
+        api_key_env: &["XAI_API_KEY"],
         open_auth_kind: Some(AuthKind::Subscription),
         // Grok's -32000 carries no runnable method (probed 1.0.x: "no auth
         // method id provided"); login is its own TUI, so the fallback
@@ -224,10 +190,9 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         name: "Hermes Agent",
         cli: "hermes",
         executable_env: "ANYAGENT_HERMES_BIN",
-        config_dir: ".hermes",
         config_home_env: None,
         connection: Connection::Acp { args: &["acp"] },
-        auth_markers: &[AuthMarker::ConfigFile("auth.json", AuthKind::ApiKey)],
+        api_key_env: &[],
         open_auth_kind: Some(AuthKind::ApiKey),
         auth_error_hints: &["No LLM provider configured"],
         login_args: &["login"],
@@ -241,13 +206,12 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         cli: "opencode",
         executable_env: "ANYAGENT_OPENCODE_BIN",
         // Data home; `opencode auth login` writes auth.json here.
-        config_dir: ".local/share/opencode",
         // `XDG_DATA_HOME` relocates opencode's db/state but not its login
         // (auth stays in the shared keychain/auth.json), so it does not
         // isolate accounts — left unset, an isolation request fails typed.
         config_home_env: None,
         connection: Connection::Native(NativeKind::Opencode),
-        auth_markers: &[AuthMarker::ConfigFile("auth.json", AuthKind::Subscription)],
+        api_key_env: &[],
         open_auth_kind: None,
         auth_error_hints: &[],
         login_args: &["auth", "login"],
@@ -260,13 +224,9 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         name: "Kiro CLI",
         cli: "kiro-cli",
         executable_env: "ANYAGENT_KIRO_BIN",
-        config_dir: ".kiro",
         config_home_env: None,
         connection: Connection::Acp { args: &["acp"] },
-        // The credential is a row in a platform data-dir sqlite (auth_kv in
-        // data.sqlite3), which also exists logged out — no honest offline
-        // marker, so discovery reports Unknown and `probe` answers for real.
-        auth_markers: &[],
+        api_key_env: &[],
         open_auth_kind: Some(AuthKind::Subscription),
         auth_error_hints: &["not logged in"],
         login_args: &["login"],
@@ -281,18 +241,11 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         executable_env: "ANYAGENT_PI_BIN",
         // The agent dir itself, which is what `PI_CODING_AGENT_DIR` replaces
         // (documented in `pi --help`, probed 2026-08-30).
-        config_dir: ".pi/agent",
         config_home_env: Some("PI_CODING_AGENT_DIR"),
         connection: Connection::Native(NativeKind::Pi),
-        // No file marker: `auth.json` is written empty on first run, so it
-        // exists logged out too (probed 2026-08-30). The adapter answers for
-        // real from `pi auth check`; these are the API-key alternatives pi
-        // documents, and they double as its `EnvVar` login methods.
-        auth_markers: &[
-            AuthMarker::ApiKeyEnv("ANTHROPIC_API_KEY"),
-            AuthMarker::ApiKeyEnv("OPENAI_API_KEY"),
-            AuthMarker::ApiKeyEnv("OPENROUTER_API_KEY"),
-        ],
+        // The adapter answers auth for real from `pi auth check`; these are
+        // the API-key alternatives pi documents.
+        api_key_env: &["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"],
         // A session opens fine with no provider configured, so an open proves
         // nothing (probed 2026-08-30).
         open_auth_kind: None,
@@ -310,16 +263,12 @@ pub(crate) static PROFILES: &[AgentProfile] = &[
         name: "Qwen Code",
         cli: "qwen",
         executable_env: "ANYAGENT_QWEN_BIN",
-        config_dir: ".qwen",
         config_home_env: None,
         connection: Connection::Acp {
             args: &["--experimental-acp"],
         },
-        auth_markers: &[
-            AuthMarker::ConfigFile("oauth_creds.json", AuthKind::Subscription),
-            // Advertised by qwen's own auth method (probed 0.22.0).
-            AuthMarker::ApiKeyEnv("OPENAI_API_KEY"),
-        ],
+        // Advertised by qwen's own auth method (probed 0.22.0).
+        api_key_env: &["OPENAI_API_KEY"],
         open_auth_kind: Some(AuthKind::Subscription),
         auth_error_hints: &[],
         login_args: &[],

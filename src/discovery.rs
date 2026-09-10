@@ -1,19 +1,17 @@
-//! Finds installed agents and reads their login markers. Never launches an
-//! agent and never touches the network.
-//! Marker state is best effort because markers can be absent or stale.
+//! Finds installed agents. Never launches an agent and never touches the
+//! network; login state is the adapter's to report at open.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::agent::{AgentId, AgentInstallation, AuthStatus, InstallationSource, LoginMethod};
-use crate::catalog::{AgentProfile, AuthMarker, Upgrade};
+use crate::agent::{AgentId, AgentInstallation, InstallationSource, LoginMethod};
+use crate::catalog::{AgentProfile, Upgrade};
 use crate::event::{Diagnostic, DiagnosticLevel};
 use crate::process::login_shell_path;
 use crate::runtime::{DiscoveryReport, MissingAgent};
 
-/// Scans every profile concurrently: env override, then the search dirs,
-/// then the login markers of whatever was found. Report order follows the
-/// catalog.
+/// Scans every profile concurrently: env override, then the search dirs.
+/// Report order follows the catalog.
 pub(crate) async fn discover(profiles: &[AgentProfile]) -> DiscoveryReport {
     let mut report = DiscoveryReport {
         agents: Vec::new(),
@@ -52,7 +50,7 @@ async fn scan(
 ) -> (Result<AgentInstallation, MissingAgent>, Vec<Diagnostic>) {
     let mut diagnostics = Vec::new();
     if let Some(exe) = env_override(profile, &mut diagnostics) {
-        let mut agent = installation(profile, exe, InstallationSource::EnvOverride, home).await;
+        let mut agent = installation(profile, exe, InstallationSource::EnvOverride);
         // The override pins the base CLI, but a missing upgrade still rides
         // along as installation guidance.
         let dirs = search_dirs(profile, home, path, login);
@@ -68,12 +66,12 @@ async fn scan(
         .map(|upgrade| resolve_upgrade(profile, upgrade, &dirs, home));
     let found = match (resolve(profile.cli, &dirs), upgrade) {
         (_, Some(Ok((exe, source, args)))) => {
-            let mut agent = installation(profile, exe, source, home).await;
+            let mut agent = installation(profile, exe, source);
             agent.acp_args = Some(args);
             Ok(agent)
         }
         (Some((exe, source)), upgrade) => {
-            let mut agent = installation(profile, exe, source, home).await;
+            let mut agent = installation(profile, exe, source);
             agent.upgrade = upgrade.and_then(Result::err);
             Ok(agent)
         }
@@ -256,17 +254,15 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
-/// One found executable as an installation, with its offline auth state.
-async fn installation(
+/// One found executable as an installation.
+fn installation(
     profile: &AgentProfile,
     executable: PathBuf,
     source: InstallationSource,
-    home: &Path,
 ) -> AgentInstallation {
     AgentInstallation {
         id: AgentId::new(profile.id),
         name: profile.name.into(),
-        auth: read_auth(profile, home, &executable).await,
         executable_path: executable,
         source,
         upgrade: None,
@@ -274,35 +270,7 @@ async fn installation(
     }
 }
 
-/// Login state from offline markers (existence doesn't guarantee user is logged in)
-async fn read_auth(profile: &AgentProfile, home: &Path, exe: &Path) -> Option<AuthStatus> {
-    if profile.auth_markers.is_empty() {
-        return None;
-    }
-    for marker in profile.auth_markers {
-        let kind = match marker {
-            AuthMarker::ConfigFile(rel, kind) if config_home(profile, home).join(rel).is_file() => {
-                kind.clone()
-            }
-            AuthMarker::Keychain(service, kind) if keychain_present(service).await => kind.clone(),
-            AuthMarker::ApiKeyEnv(var)
-                if std::env::var(var).is_ok_and(|v| !v.trim().is_empty()) =>
-            {
-                crate::agent::AuthKind::ApiKey
-            }
-            _ => continue,
-        };
-        return Some(AuthStatus::Authenticated {
-            kind,
-            account: None,
-        });
-    }
-    Some(AuthStatus::Unauthenticated {
-        login: login_methods(profile, exe),
-    })
-}
-
-/// The profile's login command plus one `EnvVar` method per API-key marker.
+/// The profile's login command plus one `EnvVar` method per documented key.
 pub(crate) fn login_methods(profile: &AgentProfile, exe: &Path) -> Vec<LoginMethod> {
     let mut methods = Vec::new();
     if !profile.login_args.is_empty() {
@@ -314,51 +282,17 @@ pub(crate) fn login_methods(profile: &AgentProfile, exe: &Path) -> Vec<LoginMeth
             env: BTreeMap::new(),
         });
     }
-    for marker in profile.auth_markers {
-        if let AuthMarker::ApiKeyEnv(var) = marker {
-            methods.push(LoginMethod::EnvVar {
-                name: var.to_string(),
-            });
-        }
+    for var in profile.api_key_env {
+        methods.push(LoginMethod::EnvVar {
+            name: var.to_string(),
+        });
     }
     methods
-}
-
-/// The agent's config directory: env override, else `~/<config_dir>`.
-fn config_home(profile: &AgentProfile, home: &Path) -> PathBuf {
-    profile
-        .config_home_env
-        .and_then(std::env::var_os)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(profile.config_dir))
-}
-
-/// Presence check for a macOS keychain item; reads no secret, so no prompt.
-#[cfg(target_os = "macos")]
-async fn keychain_present(service: &str) -> bool {
-    use std::process::Stdio;
-    let status = tokio::process::Command::new("security")
-        .args(["find-generic-password", "-s", service])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .status();
-    tokio::time::timeout(std::time::Duration::from_secs(2), status)
-        .await
-        .map(|s| s.is_ok_and(|s| s.success()))
-        .unwrap_or(false)
-}
-
-#[cfg(not(target_os = "macos"))]
-async fn keychain_present(_service: &str) -> bool {
-    false
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::AuthKind;
     use crate::catalog::Connection;
 
     fn profile() -> AgentProfile {
@@ -367,13 +301,9 @@ mod tests {
             name: "Fake",
             cli: "fake-agent",
             executable_env: "ANYAGENT_TEST_UNSET",
-            config_dir: ".fake",
             config_home_env: None,
             connection: Connection::Acp { args: &[] },
-            auth_markers: &[
-                AuthMarker::ConfigFile("auth.json", AuthKind::Subscription),
-                AuthMarker::ApiKeyEnv("ANYAGENT_TEST_UNSET_KEY"),
-            ],
+            api_key_env: &["ANYAGENT_TEST_UNSET_KEY"],
             open_auth_kind: None,
             auth_error_hints: &[],
             login_args: &["login"],
@@ -438,17 +368,10 @@ mod tests {
         assert_eq!(source, InstallationSource::VersionManager);
     }
 
-    #[cfg(unix)]
-    /// Auth markers decide logged-in (file present) vs logged-out (no marker) with terminal + EnvVar methods.
-    #[tokio::test]
-    async fn auth_markers_decide_logged_in_or_out() {
-        let home = tempfile::tempdir().unwrap();
-        let exe = Path::new("/h/bin/fake-agent");
-
-        let auth = read_auth(&profile(), home.path(), exe).await.unwrap();
-        let AuthStatus::Unauthenticated { login } = auth else {
-            panic!("no marker present means logged out");
-        };
+    /// Login methods: the terminal command first, then one EnvVar per documented key.
+    #[test]
+    fn login_methods_list_the_command_then_the_keys() {
+        let login = login_methods(&profile(), Path::new("/h/bin/fake-agent"));
         assert!(matches!(
             &login[0],
             LoginMethod::Terminal { command, .. } if command == &vec!["/h/bin/fake-agent".to_string(), "login".to_string()]
@@ -457,16 +380,6 @@ mod tests {
             &login[1],
             LoginMethod::EnvVar { name } if name == "ANYAGENT_TEST_UNSET_KEY"
         ));
-
-        std::fs::create_dir_all(home.path().join(".fake")).unwrap();
-        std::fs::write(home.path().join(".fake/auth.json"), "{}").unwrap();
-        let auth = read_auth(&profile(), home.path(), exe).await.unwrap();
-        assert!(matches!(
-            auth,
-            AuthStatus::Authenticated {
-                kind: AuthKind::Subscription,
-                ..
-            }
-        ));
+        assert_eq!(login.len(), 2);
     }
 }

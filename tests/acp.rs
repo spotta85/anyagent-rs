@@ -399,7 +399,7 @@ async fn configuring_the_mode_round_trips_and_updates_the_session() {
 #[tokio::test]
 async fn probe_confirms_login_when_an_open_proves_it() {
     // kiro refuses to open logged out (probed 2026-08-28), so a successful
-    // open is proof of login — no offline marker needed.
+    // open is proof of login.
     let agent = catalog_wrapper("kiro", "auth-in", "--commands-on-open");
     let details = Runtime::new().probe(&agent).await.unwrap();
     assert_eq!(
@@ -411,11 +411,13 @@ async fn probe_confirms_login_when_an_open_proves_it() {
     );
 }
 
-/// Stale Unauthenticated marker overridden to Authenticated ApiKey after proven open.
+/// ACP cannot say which credential opened the session: with the profile's documented API key in the env, a proven open is reported as an API-key login, not the catalog's subscription.
 #[tokio::test]
-async fn probe_overrides_a_stale_logged_out_marker_after_a_proven_open() {
-    let mut agent = catalog_wrapper("hermes", "auth-stale", "");
-    agent.auth = Some(AuthStatus::Unauthenticated { login: Vec::new() });
+async fn an_api_key_in_the_env_is_reported_as_one() {
+    // std guards env access with its own lock, and no other test in this
+    // binary reads XAI_API_KEY.
+    unsafe { std::env::set_var("XAI_API_KEY", "xai-test") };
+    let agent = catalog_wrapper("grok", "api-key", "");
     let details = Runtime::new().probe(&agent).await.unwrap();
     assert_eq!(
         details.auth,
@@ -424,24 +426,6 @@ async fn probe_overrides_a_stale_logged_out_marker_after_a_proven_open() {
             account: None
         }
     );
-}
-
-/// Existing Authenticated ApiKey kind preserved after proven open.
-#[tokio::test]
-async fn probe_preserves_a_marker_kind_after_a_proven_open() {
-    let mut agent = catalog_wrapper("qwen", "auth-kind", "");
-    agent.auth = Some(AuthStatus::Authenticated {
-        kind: AuthKind::ApiKey,
-        account: None,
-    });
-    let details = Runtime::new().probe(&agent).await.unwrap();
-    assert!(matches!(
-        details.auth,
-        AuthStatus::Authenticated {
-            kind: AuthKind::ApiKey,
-            ..
-        }
-    ));
 }
 
 /// Pre-protocol exit (kiro not logged in) mapped to Unauthenticated with terminal login method.
@@ -493,7 +477,7 @@ async fn probe_uses_the_profile_fallback_when_auth_methods_are_empty() {
         panic!("expected a terminal login method");
     };
     assert_eq!(command, &[agent.executable_path.to_string_lossy()]);
-    // The profile's API-key marker rides along as the alternative.
+    // The profile's documented API key rides along as the alternative.
     assert!(
         login
             .iter()

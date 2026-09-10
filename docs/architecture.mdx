@@ -39,8 +39,8 @@ src/
 ├── event.rs         the public event and request types
 ├── agent.rs         AgentInstallation, AgentDetails, Capability, SessionOptions
 ├── error.rs         AgentError
-├── catalog.rs       per-agent facts as data: ids, launch flags, login markers
-├── discovery.rs     finds executables and login markers; never launches
+├── catalog.rs       per-agent facts as data: ids, launch flags, login commands
+├── discovery.rs     finds executables; never launches
 ├── process.rs       spawns children, guarantees cleanup
 └── adapter/         layer 3
     ├── mod.rs         the seam: Adapter trait, DriverCommand, DriverEvent
@@ -176,14 +176,14 @@ When an agent has both wires installed, discovery prefers the richer one.
 
 | Step | Where | What |
 |---|---|---|
-| 1 | `src/catalog.rs` | A profile: id, executable names, args for protocol mode, login markers, install hint, config-home env var. Only flags verified against a real install |
+| 1 | `src/catalog.rs` | A profile: id, executable names, args for protocol mode, login command, install hint, config-home env var. Only flags verified against a real install |
 | 2 | `src/adapter/<agent>.rs` | Implement `Adapter::connect`. Translate frames into `DriverEvent`s. Report only capabilities you have seen work |
 | 3 | `src/runtime.rs` | Register the adapter in `Runtime::new` |
 | 4 | `tests/<agent>.rs`, `tests/fixtures/<agent>/` | Recorded frames so `cargo test` covers it offline |
 | 5 | `tests/live.rs` | Add the harness to the roster so the live matrix runs against it |
 
 For an ACP agent, skip step 2: the shared adapter already speaks it. A
-catalog entry is only needed for verified quirks and login markers.
+catalog entry is only needed for verified quirks and login commands.
 
 The conformance suite in `src/adapter/conformance.rs` runs the engine over
 the mock adapter and pins the contract every adapter benefits from: one
