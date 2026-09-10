@@ -35,6 +35,28 @@ Main functions hold the high-level flow and read top to bottom; helpers sit
 below them. Adapters never decide turn rules; see
 [Architecture](/architecture#the-seam).
 
+### Platforms
+
+macOS, Linux, and Windows all build and test in CI. When something differs
+per OS, pick the first row that fits. Never put `#[cfg]` inside a function
+body.
+
+| Situation | Do this | Example |
+|---|---|---|
+| std has a cross-platform API | Use it, no cfg | `std::env::split_paths`, `home_dir` in `discovery.rs` |
+| One value differs | One `#[cfg(unix)]` / `#[cfg(windows)]` const pair | `EXE_SUFFIXES` in `discovery.rs` |
+| Whole behaviour differs | Two same-signature functions, one per OS; callers see no cfg | `request_exit` in `process.rs` |
+| Early return on one OS | `if cfg!(windows) { return ... }`, so both branches still type-check | `capture_login_shell_path` |
+| Needs an OS API | A crate that owns both halves | `command-group` (process group on unix, Job Object on Windows) |
+| A test needs a script on disk | Write it per OS in `tests/common/mod.rs` | `shim`, `stub` |
+
+Check the other OS without leaving your machine:
+
+```sh
+rustup target add x86_64-pc-windows-msvc
+cargo clippy --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+```
+
 ## Test tiers
 
 | Tier | Command | What it proves | Needs |
