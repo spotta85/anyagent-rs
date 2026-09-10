@@ -298,6 +298,29 @@ mod tests {
         child.shutdown(Duration::from_secs(5)).await;
     }
 
+    /// Shutdown kills a worker that ignored SIGTERM after its leader exited:
+    /// only the leader is ours to reap, so its exit proves nothing about the
+    /// rest of the group.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_kills_a_worker_that_outlived_its_leader() {
+        let mut child = spawn(sh("trap '' TERM; sleep 30 & echo $!; exit 0"))
+            .await
+            .unwrap();
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let worker = lines.next_line().await.unwrap().unwrap();
+        child.shutdown(Duration::from_millis(200)).await;
+        // The orphaned worker stays a zombie until init reaps it.
+        for _ in 0..50 {
+            let alive = Command::new("kill").args(["-0", &worker]).status().await;
+            if !alive.unwrap().success() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        panic!("worker {worker} survived shutdown");
+    }
+
     /// stderr_tail retains last 6 lines for ProcessExited reports.
     #[tokio::test]
     async fn stderr_tail_keeps_the_last_lines() {
