@@ -14,10 +14,12 @@ async fn main() {
     let runtime = Runtime::new();
     let report = runtime.discover().await;
     let agent = report.require(&id).expect("agent not installed");
-    let (session, _events) = runtime
-        .open(agent, SessionOptions::in_dir(&dir).record_wire(&log))
-        .await
-        .expect("open failed");
+    let mut options = SessionOptions::in_dir(&dir).record_wire(&log);
+    if let Some(model) = std::env::args().nth(2) {
+        println!("configuring model = {model}");
+        options = options.configure("model", model);
+    }
+    let (session, _events) = runtime.open(agent, options).await.expect("open failed");
 
     let info = session.info();
     println!("version: {:?}", info.details.version);
