@@ -1917,9 +1917,10 @@ fn kill_child(harness: &str, session: &Session) {
         // command line to match: the exact name plus newest-first is ours.
         "pi" => (&["-n", "-x"], "pi".to_owned()),
         // The CLI's wire flag, or the ACP server's own executable name.
+        // Windows spawns the CLI as `"...\agy.exe" --input-format=...`.
         "antigravity" => (
             &["-n", "-f"],
-            "agy( --input-format=stream-json|_acp_server)".to_owned(),
+            r#"agy(\.exe)?"?( --input-format=stream-json|_acp_server)"#.to_owned(),
         ),
         // The npm shim leaves one opencode.exe, whose command line quotes the
         // exe and pads before the argument: `opencode.exe"    serve`.
