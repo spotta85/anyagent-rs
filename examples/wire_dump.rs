@@ -5,7 +5,9 @@ use anyagent::{ConfigKind, Runtime, SessionOptions};
 
 #[tokio::main]
 async fn main() {
-    let id = std::env::args().nth(1).expect("usage: wire_dump <agent-id>");
+    let id = std::env::args()
+        .nth(1)
+        .expect("usage: wire_dump <agent-id>");
     let dir = std::env::temp_dir().join("anyagent-wire-dump");
     std::fs::create_dir_all(&dir).unwrap();
     let log = dir.join(format!("{id}.jsonl"));
