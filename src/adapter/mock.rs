@@ -256,6 +256,7 @@ fn info(script: &Script) -> DriverInfo {
         deterministic_turn_end: script.deterministic,
         deterministic_agent_turn_end: script.deterministic_agent,
         tools_disabled: false,
+        effort_wire: None,
     }
 }
 

@@ -21,6 +21,15 @@ let nextId = 100, pending = {}, turn = null, mcpDecl = [], effort = 'high', spur
 // `reasoningEffort` there is a static default; the effort in force is only
 // reported by the `model_changed` session notification.
 let grokModel = 'grok-4.5', grokEffort = 'high';
+// --kiro adds a model without effort levels; --qwen adds its
+// `reasoning_effort` (category thought_level), as qwen 0.23.2 names it.
+let qwenEffort = 'default', qwenModel = 'sonnet';
+// --qwen: opus names its thought level plainly, as a later model list may.
+const qwenEffortId = () => qwenModel === 'opus' ? 'effort' : 'reasoning_effort';
+const configOptions = () => [
+  { id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: qwenModel, options: [{ value: 'sonnet', name: 'Sonnet' }, { value: 'opus', name: 'Opus' }, ...(flag('--kiro') ? [{ value: 'claude-haiku-4.5', name: 'Haiku' }] : [])] },
+  ...(flag('--qwen') ? [{ id: qwenEffortId(), name: 'Reasoning effort', category: 'thought_level', type: 'select', currentValue: qwenEffort, options: [{ value: 'default', name: 'Default' }, { value: 'high', name: 'High' }] }] : []),
+];
 const grokModels = () => ({ currentModelId: grokModel, availableModels: [
   { modelId: 'grok-4.5', name: 'Grok 4.5', description: 'fast', _meta: { reasoningEffort: 'high', reasoningEfforts: [{ value: 'low', label: 'Low Effort' }, { value: 'high', label: 'High Effort', description: 'default' }] } },
   { modelId: 'grok-4.6', name: 'Grok 4.6', _meta: { reasoningEffort: 'high', reasoningEfforts: [{ value: 'low', label: 'Low Effort' }, { value: 'high', label: 'High Effort' }, { value: 'xhigh', label: 'Extra High' }] } },
@@ -104,9 +113,7 @@ async function onRequest(m) {
       // --grok-models: the first-class models state (no model configOption);
       // switching must ride session/set_model.
       if (flag('--grok-models')) return reply({ sessionId: 'sess-1', models: grokModels() });
-      // --kiro adds a model without effort levels.
-      const models = [{ value: 'sonnet', name: 'Sonnet' }, { value: 'opus', name: 'Opus' }, ...(flag('--kiro') ? [{ value: 'claude-haiku-4.5', name: 'Haiku' }] : [])];
-      reply({ sessionId: 'sess-1', modes: { currentModeId: 'default', availableModes: [{ id: 'default', name: 'Default' }, { id: 'plan', name: 'Plan' }] }, configOptions: [{ id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'sonnet', options: models }], _meta: { claude: { sessionId: 'uuid-1' } } });
+      reply({ sessionId: 'sess-1', modes: { currentModeId: 'default', availableModes: [{ id: 'default', name: 'Default' }, { id: 'plan', name: 'Plan' }] }, configOptions: configOptions(), _meta: { claude: { sessionId: 'uuid-1' } } });
       // Real ACP agents push the command list as an update just after
       // session/new; --commands-on-open reproduces it so probe can wait for it.
       if (flag('--commands-on-open')) notify('sess-1', { sessionUpdate: 'available_commands_update', availableCommands: [{ name: 'compact', description: 'Compact context' }] });
@@ -127,6 +134,10 @@ async function onRequest(m) {
         if (m.params.configId === 'model') cursorModel = m.params.value; else cursorOpts[m.params.configId] = m.params.value;
         return reply({ configOptions: cursorConfig() });
       }
+      // --qwen: the thought level is `reasoning_effort` on the wire, and a
+      // switch answers with the full option list like any config response.
+      if (flag('--qwen') && m.params.configId === qwenEffortId()) { qwenEffort = m.params.value; return reply({ configOptions: configOptions() }); }
+      if (flag('--qwen') && m.params.configId === 'model') { qwenModel = m.params.value; return reply({ configOptions: configOptions() }); }
       // Under --grok-models there is no model configOption: only set_model works.
       if (m.params.configId !== 'model' || flag('--grok-models')) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32602, message: `unknown config ${m.params.configId}` } });
       // --config-slow=N: delay the reply so a second configure overlaps it.
@@ -188,9 +199,13 @@ async function runTurn(m) {
   }
   // Grok extensions (wire shapes cross-checked against comet + t3code).
   if (ptext.includes('grok-question')) {
+    // The question's tool call rides alongside, tagged `ask_user` in _meta.
+    notify(sid, { sessionUpdate: 'tool_call', toolCallId: 'call_q', title: 'ask_user_question', status: 'pending', _meta: { 'x.ai/tool': { name: 'ask_user_question', kind: 'ask_user' } } });
     const q = await request('_x.ai/ask_user_question', { sessionId: sid, toolCallId: 'call_q', mode: 'default', questions: [{ id: 'q1', question: 'Pick a fruit', options: [{ id: 'g', label: 'Grape', description: 'purple' }, { label: 'Mango' }], multiSelect: false }] });
     const answers = q.result?.answers ? JSON.stringify(q.result.answers) : (q.result?.outcome ?? 'error');
     notify(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `q=${answers} ` } });
+    // The completion update for the question carries no tag (wire, 2026-09-09).
+    notify(sid, { sessionUpdate: 'tool_call_update', toolCallId: 'call_q', status: 'completed' });
     done('end_turn');
     return;
   }

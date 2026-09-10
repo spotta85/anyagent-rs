@@ -412,6 +412,7 @@ fn driver_info(
         // No agent-originated turns on opencode; the same signal covers it.
         deterministic_agent_turn_end: true,
         tools_disabled: false,
+        effort_wire: None,
     }
 }
 

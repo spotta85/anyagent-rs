@@ -139,6 +139,9 @@ pub(crate) struct DriverInfo {
     /// The adapter honoured `SessionOptions::no_tools`: the agent cannot
     /// run any tool this session.
     pub tools_disabled: bool,
+    /// The wire id behind the `effort` option when the agent names it
+    /// differently (qwen: `reasoning_effort`); `None` when it is `effort`.
+    pub effort_wire: Option<String>,
 }
 
 #[derive(Clone)]
