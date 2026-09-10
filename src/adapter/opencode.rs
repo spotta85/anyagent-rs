@@ -116,8 +116,24 @@ struct Launched {
 }
 
 /// Spawns the server, waits for health, subscribes to the event bus, binds
-/// the session, and reads the catalogs behind the advertised options.
+/// the session, and reads the catalogs behind the advertised options. A
+/// squatter on the picked port (the pick-then-bind race) kills the server at
+/// once with EADDRINUSE; that gets a fresh port, up to three tries.
 async fn launch(
+    request: &ConnectRequest,
+    recorder: Option<WireRecorder>,
+) -> Result<Launched, AgentError> {
+    for _ in 0..2 {
+        match launch_once(request, recorder.clone()).await {
+            Err(AgentError::ProcessExited { stderr, .. }) if stderr.contains("EADDRINUSE") => {}
+            outcome => return outcome,
+        }
+    }
+    launch_once(request, recorder).await
+}
+
+/// One try at `launch`, on one freshly picked port.
+async fn launch_once(
     request: &ConnectRequest,
     recorder: Option<WireRecorder>,
 ) -> Result<Launched, AgentError> {
