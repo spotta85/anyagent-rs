@@ -607,6 +607,7 @@ fn driver_info(
         deterministic_turn_end: true,
         deterministic_agent_turn_end: true,
         tools_disabled: false,
+        effort_wire: None,
     };
     let model = info.configuration.options.get(&ConfigId::new("model"));
     let supported =

@@ -492,6 +492,7 @@ fn driver_info(init: &Value, version: Option<String>, request: &ConnectRequest) 
         },
         title: None,
         tools_disabled: request.options.no_tools,
+        effort_wire: None,
         // Every turn shape ends with its own `result` frame.
         deterministic_turn_end: true,
         deterministic_agent_turn_end: true,

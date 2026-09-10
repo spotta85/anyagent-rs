@@ -544,6 +544,26 @@ async fn overlapping_configures_both_apply() {
     session.close().await.unwrap();
 }
 
+/// A thought-level option under another name (qwen: `reasoning_effort`) is advertised as `effort`, and a switch reaches the wire under the agent's own id.
+#[tokio::test]
+async fn a_thought_level_option_under_another_name_is_effort() {
+    let (session, mut events) = open(&["--qwen"]).await;
+    let effort = option(&session, "effort").expect("an effort option");
+    assert_eq!(effort.category.as_deref(), Some("thought_level"));
+    assert_eq!(effort.current, Some(ConfigValue::Text("default".into())));
+    assert!(
+        option(&session, "reasoning_effort").is_none(),
+        "the wire id leaked"
+    );
+    // The fixture only knows `reasoning_effort`: the switch applying
+    // proves the wire id was mapped back.
+    session.configure("effort", "high").await.unwrap();
+    wait_options(&session, &mut events, |s| {
+        option(s, "effort").and_then(|o| o.current) == Some(ConfigValue::Text("high".into()))
+    })
+    .await;
+}
+
 /// MCP http+stdio servers forwarded; capabilities advertised and wire contains http:voice/stdio:tool.
 #[tokio::test]
 async fn mcp_servers_forward_when_the_transport_is_supported() {
@@ -844,7 +864,7 @@ async fn grok_prompt_complete_ends_a_hung_turn_and_stale_ids_are_ignored() {
     assert!(text.starts_with("Hello"), "got: {text}");
 }
 
-/// Grok questions surface typed with header/choices; answer returns labels keyed by question text.
+/// Grok questions surface typed with header/choices; answer returns labels keyed by question text; the `ask_user` tool call around it stays hidden.
 #[tokio::test]
 async fn grok_questions_surface_typed_and_answers_return_labels() {
     let (session, mut events) = open(&[]).await;
@@ -853,6 +873,7 @@ async fn grok_questions_surface_typed_and_answers_return_labels() {
     loop {
         let event = next(&mut events).await;
         match event.kind {
+            EventKind::ToolUpdated(tool) => panic!("question leaked as a tool: {}", tool.title),
             EventKind::RequestOpened(Request::Question(request)) => {
                 let q = &request.questions[0];
                 assert_eq!(q.text, "Pick a fruit");

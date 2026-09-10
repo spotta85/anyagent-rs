@@ -321,6 +321,7 @@ fn driver_info(
         deterministic_turn_end: true,
         deterministic_agent_turn_end: true,
         tools_disabled: no_tools,
+        effort_wire: None,
     };
     set_effort_option(&mut info, thinking_choices(&levels["levels"]), effort);
     info

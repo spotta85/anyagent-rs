@@ -321,7 +321,13 @@ async fn handshake(
         let first_class = first_class_model
             .then(|| selected(&info, "model"))
             .flatten();
-        let (method, params) = config_call(&session_id, id, value, first_class.as_deref());
+        let (method, params) = config_call(
+            &session_id,
+            id,
+            value,
+            first_class.as_deref(),
+            info.effort_wire.as_deref(),
+        );
         let result = wire.roundtrip(method, params).await.map_err(|e| match e {
             WireError::Rpc { message, .. } => {
                 AgentError::InvalidConfiguration(format!("agent rejected `{id}`: {message}"))
@@ -531,13 +537,19 @@ fn effort_prompt(session_id: &str, value: &ConfigValue) -> Value {
 /// session/set_mode; with the first-class models surface (`first_class` is
 /// the selected model), `model` maps to session/set_model and `effort` to
 /// the same call carrying grok's `_meta.reasoningEffort` (verified live,
-/// 2026-09-05); anything else to session/set_config_option.
+/// 2026-09-05); anything else to session/set_config_option under the wire's
+/// own id (`effort_wire` when the agent names effort differently).
 fn config_call(
     session_id: &str,
     id: &ConfigId,
     value: &ConfigValue,
     first_class: Option<&str>,
+    effort_wire: Option<&str>,
 ) -> (&'static str, Value) {
+    let wire_id = match (id.as_str(), effort_wire) {
+        ("effort", Some(wire)) => wire,
+        (id, _) => id,
+    };
     match (id.as_str(), value, first_class) {
         ("mode", ConfigValue::Text(mode), _) => (
             "session/set_mode",
@@ -553,11 +565,11 @@ fn config_call(
         ),
         (_, ConfigValue::Text(chosen), _) => (
             "session/set_config_option",
-            json!({ "sessionId": session_id, "configId": id.as_str(), "value": chosen }),
+            json!({ "sessionId": session_id, "configId": wire_id, "value": chosen }),
         ),
         (_, ConfigValue::Bool(on), _) => (
             "session/set_config_option",
-            json!({ "sessionId": session_id, "configId": id.as_str(), "type": "boolean", "value": on }),
+            json!({ "sessionId": session_id, "configId": wire_id, "type": "boolean", "value": on }),
         ),
     }
 }
@@ -662,9 +674,18 @@ fn driver_info(
     }
     let mut capabilities = Capabilities::new(features);
     capabilities.mcp_transports = mcp_transports(init);
+    // Grok sends no `agentInfo`; its version rides in `_meta`.
+    let meta_version = || {
+        let meta = init.meta.as_ref()?;
+        Some(meta.get("agentVersion")?.as_str()?.to_owned())
+    };
     DriverInfo {
         details: AgentDetails {
-            version: init.agent_info.as_ref().map(|i| i.version.clone()),
+            version: init
+                .agent_info
+                .as_ref()
+                .map(|i| i.version.clone())
+                .or_else(meta_version),
             // ACP has no auth-status field on the wire. A marker with a kind
             // wins (it knows subscription vs key); otherwise reaching this
             // point proves login for agents that refuse to open logged out
@@ -688,6 +709,7 @@ fn driver_info(
         deterministic_turn_end: true,
         deterministic_agent_turn_end: false,
         tools_disabled: false,
+        effort_wire: None,
     }
 }
 
@@ -778,12 +800,22 @@ fn apply_session_config(
         );
     }
     for option in options.unwrap_or_default() {
+        // One effort id everywhere: `<x>_effort` (qwen: `reasoning_effort`)
+        // is `effort`, its wire id kept for `config_call`. Not by category:
+        // cursor lists `thinking` and `effort` both as thought levels.
+        let wire_id = option.id.0.as_ref();
+        let id = if wire_id.ends_with("_effort") {
+            info.effort_wire = Some(wire_id.to_owned());
+            "effort"
+        } else {
+            wire_id
+        };
         // Cursor lists `mode` here as well as in the mode state.
         if info
             .details
             .config_options
             .iter()
-            .any(|o| o.id.as_str() == option.id.0.as_ref())
+            .any(|o| o.id.as_str() == id)
         {
             continue;
         }
@@ -803,10 +835,10 @@ fn apply_session_config(
         if let Some(current) = &current {
             info.configuration
                 .options
-                .insert(ConfigId::new(option.id.0.as_ref()), current.clone());
+                .insert(ConfigId::new(id), current.clone());
         }
         info.details.config_options.push(ConfigOption {
-            id: ConfigId::new(option.id.0.as_ref()),
+            id: ConfigId::new(id),
             name: option.name.clone(),
             category: option.category.as_ref().map(config_category),
             kind,
@@ -1053,8 +1085,13 @@ impl Drive {
                             .or_else(|| selected(&self.info, "model"))
                     })
                     .flatten();
-                let (method, params) =
-                    config_call(&self.session_id, &id, &value, first_class.as_deref());
+                let (method, params) = config_call(
+                    &self.session_id,
+                    &id,
+                    &value,
+                    first_class.as_deref(),
+                    self.info.effort_wire.as_deref(),
+                );
                 let wire_id = self.wire.request(method, params).await?;
                 self.configs.push((wire_id, id, value));
             }
@@ -1205,10 +1242,15 @@ impl Drive {
             U::UserMessageChunk(chunk) => text_kind(chunk, |message_id, text| {
                 EventKind::UserMessage { message_id, text }
             }),
-            // An interaction is a question, surfaced by its permission
-            // request alone; the tool call around it is wire noise.
-            U::ToolCall(call) if self.is_interaction(&call.tool_call_id.0) => None,
-            U::ToolCallUpdate(update) if self.is_interaction(&update.tool_call_id.0) => None,
+            // A question is surfaced by its request alone (antigravity's
+            // interaction permission, grok's `_x.ai/ask_user_question`);
+            // the tool call around it is wire noise.
+            U::ToolCall(call) if self.is_question_tool(&call.tool_call_id.0, &call.meta) => None,
+            U::ToolCallUpdate(update)
+                if self.is_question_tool(&update.tool_call_id.0, &update.meta) =>
+            {
+                None
+            }
             U::ToolCall(call) => {
                 let tool = fresh_tool(call);
                 self.tools.insert(tool.id.as_str().to_owned(), tool.clone());
@@ -1371,6 +1413,16 @@ impl Drive {
     /// other agent's ids are opaque.
     fn is_interaction(&self, tool_call_id: &str) -> bool {
         self.antigravity && tool_call_id.starts_with("interaction_")
+    }
+
+    /// The tool call an agent wraps its question in: antigravity's
+    /// interaction, or grok's `ask_user_question` (`_meta["x.ai/tool"].kind`
+    /// is `ask_user`, wire-captured 2026-09-09).
+    fn is_question_tool(&self, tool_call_id: &str, meta: &Option<acp::Meta>) -> bool {
+        let kind = meta
+            .as_ref()
+            .and_then(|m| m.get("x.ai/tool")?.get("kind")?.as_str());
+        kind == Some("ask_user") || self.is_interaction(tool_call_id)
     }
 
     /// Antigravity's question (see `QuestionWire::Interaction`): the title
