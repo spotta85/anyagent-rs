@@ -107,7 +107,7 @@ async fn build_roster() -> Roster {
     let selected: Vec<&'static str> = HARNESSES
         .iter()
         .copied()
-        .filter(|h| list == "all" || list.split(',').any(|p| p.trim() == *h))
+        .filter(|h| list.trim() == "all" || list.split(',').any(|p| p.trim() == *h))
         .collect();
 
     let report = Runtime::new().discover().await;
