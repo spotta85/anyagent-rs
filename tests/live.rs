@@ -38,6 +38,8 @@ const HARNESSES: &[&str] = &[
     "pi",
     "cursor",
     "antigravity",
+    "grok",
+    "qwen",
 ];
 const EVENT_TIMEOUT: Duration = Duration::from_secs(120);
 const OPENCODE_MODEL: &str = "opencode/big-pickle";
@@ -108,15 +110,6 @@ async fn build_roster() -> Roster {
         .iter()
         .copied()
         .filter(|h| list == "all" || list.split(',').any(|p| p.trim() == *h))
-        .filter(|h| {
-            // pi is pinned to an openrouter model; opencode uses its own
-            // cost-free zen model, so it needs no key.
-            let keyless = *h == "pi" && std::env::var("OPENROUTER_API_KEY").is_err();
-            if keyless {
-                println!("SKIP {h}: OPENROUTER_API_KEY is not set");
-            }
-            !keyless
-        })
         .collect();
 
     let report = Runtime::new().discover().await;
@@ -133,6 +126,11 @@ async fn build_roster() -> Roster {
     let mut skipped = Vec::new();
     for h in selected {
         match report.require(h) {
+            // pi is pinned to an openrouter model, and its login lives in
+            // its own auth.json (or the key env var): ask pi, not the env.
+            Ok(agent) if h == "pi" && !pi_ready(&agent.executable_path, "openrouter") => {
+                skipped.push("pi: not logged in to openrouter (`/login openrouter` in pi)".into());
+            }
             Ok(_) => installed.push(h),
             Err(_) => skipped.push(missing_line(&report, h)),
         }
@@ -148,6 +146,14 @@ async fn build_roster() -> Roster {
         println!("Their tests are skipped, not failed.\n");
     }
     Roster { installed, skipped }
+}
+
+/// pi's own readiness check for one provider (`pi auth check`).
+fn pi_ready(exe: &std::path::Path, provider: &str) -> bool {
+    std::process::Command::new(exe)
+        .args(["auth", "check", "--provider", provider])
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "ready")
 }
 
 /// "codex: not installed (searched 14 dirs) — install: npm i -g ..."
@@ -175,9 +181,12 @@ async fn discovery_finds_authenticated_harnesses() {
             .unwrap_or_else(|_| panic!("{h}: not discovered"));
         assert!(agent.executable_path.exists(), "{h}: executable missing");
         // pi writes an empty auth.json on first run, so its existence proves
-        // nothing: the only offline markers are the provider key env vars,
-        // and `probe` answers for real from `pi auth check`.
-        if h == "pi" && !matches!(agent.auth, Some(AuthStatus::Authenticated { .. })) {
+        // nothing, and qwen's provider key can live in settings.json: for
+        // both the only offline markers are the key env vars, and `probe`
+        // answers for real.
+        if matches!(h, "pi" | "qwen")
+            && !matches!(agent.auth, Some(AuthStatus::Authenticated { .. }))
+        {
             assert!(
                 matches!(agent.auth, Some(AuthStatus::Unauthenticated { .. })),
                 "{h}: unexpected marker: {:?}",
@@ -364,8 +373,9 @@ async fn open_reports_token_capabilities_and_options() {
                 caps.supports(Capability::Permissions),
                 "{h}: no Permissions"
             );
-            // opencode's native wire exposes `model`, not a session `mode`.
-            if h != "opencode" {
+            // opencode's native wire exposes `model`, not a session `mode`;
+            // grok has no modes either, only `model` and `effort`.
+            if !matches!(h, "opencode" | "grok") {
                 assert!(has_option("mode"), "{h}: no `mode` config option");
             }
         }
@@ -383,8 +393,8 @@ async fn open_reports_token_capabilities_and_options() {
                 "claude: no slash commands"
             );
         }
-        if h == "opencode" {
-            assert!(has_option("model"), "opencode: no `model` config option");
+        if matches!(h, "opencode" | "grok") {
+            assert!(has_option("model"), "{h}: no `model` config option");
         }
         if h == "codex" {
             assert!(caps.supports(Capability::Steer), "codex: missing Steer");
@@ -396,22 +406,13 @@ async fn open_reports_token_capabilities_and_options() {
     }
 }
 
-/// Effort is one option everywhere it exists: `effort`, a live select whose choices follow the model, switched via `configure` and confirmed by `SessionUpdated`; verified on kiro, grok, opencode, pi.
+/// Effort is one option everywhere it exists: `effort`, a live select whose choices follow the model, switched via `configure` and confirmed by `SessionUpdated`; verified on kiro, grok, opencode, pi, cursor, qwen (whose wire calls it `reasoning_effort`).
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn effort_switches_live() {
-    // grok is not in the shared matrix (no modes, so other tests would
-    // fail on it); this test names its own harnesses.
-    let list = std::env::var("ANYAGENT_LIVE").unwrap_or_default();
-    let named = |h: &str| list == "all" || list.split(',').any(|p| p.trim() == h);
-    for h in ["kiro", "grok", "opencode", "pi", "cursor"]
-        .into_iter()
-        .filter(|h| named(h))
-    {
-        let runtime = Runtime::new();
-        let report = runtime.discover().await;
-        if report.require(h).is_err() {
-            println!("SKIP {}", missing_line(&report, h));
+    for h in enabled().await {
+        if !matches!(h, "kiro" | "grok" | "opencode" | "pi" | "cursor" | "qwen") {
+            println!("SKIP {h}: effort asserted on kiro, grok, opencode, pi, cursor, qwen");
             continue;
         }
         let (session, mut events, _dir) = open(h).await;
@@ -436,6 +437,20 @@ async fn effort_switches_live() {
         }
         let Some(effort) = option(&session) else {
             assert_ne!(h, "kiro", "kiro: no `effort` option");
+            // One id everywhere: an effort knob under another name (qwen
+            // advertises `reasoning_effort`) is an adapter gap, not a model
+            // without levels.
+            let other = session
+                .info()
+                .details
+                .config_options
+                .into_iter()
+                .find(|o| o.id.as_str().contains("effort"));
+            assert!(
+                other.is_none(),
+                "{h}: effort advertised as {:?}",
+                other.map(|o| o.id)
+            );
             println!("SKIP {h}: the selected model has no effort levels");
             session.close().await.unwrap();
             continue;
@@ -459,8 +474,11 @@ async fn effort_switches_live() {
             }
         }
         let current = option(&session).and_then(|o| o.current);
+        // Not "thinking off": a provider can refuse it (qwen on OpenRouter's
+        // glm-5.3-flash: "Reasoning is mandatory for this endpoint").
         let target = levels
             .iter()
+            .filter(|l| !matches!(**l, "none" | "off"))
             .find(|l| Some(ConfigValue::Text((**l).to_owned())) != current)
             .copied()
             .expect("a level other than the current one");
@@ -581,9 +599,7 @@ async fn generate_returns_text_without_a_session() {
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn pi_generate_stays_text_only() {
-    // Pi can authenticate through OAuth without OPENROUTER_API_KEY.
-    let selected = std::env::var("ANYAGENT_LIVE").unwrap_or_default();
-    if selected != "all" && !selected.split(',').any(|h| h.trim() == "pi") {
+    if !enabled().await.contains(&"pi") {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -591,10 +607,7 @@ async fn pi_generate_stays_text_only() {
     let log = dir.path().join("wire.jsonl");
     let runtime = Runtime::new();
     let report = runtime.discover().await;
-    let Ok(agent) = report.require("pi") else {
-        println!("SKIP {}", missing_line(&report, "pi"));
-        return;
-    };
+    let agent = report.require("pi").expect("pi is in the roster");
     let text = tokio::time::timeout(EVENT_TIMEOUT, runtime.generate(
         agent, options("pi", dir.path()).record_wire(&log),
         "Read context.txt using a tool, then return a short summary. If no tools are available, say that briefly.",
@@ -907,12 +920,13 @@ async fn a_question_round_trips() {
         // translation is exercised if it ever does, without failing the run.
         // cursor's Auto model has not fired `cursor/ask_question` in any
         // probe (2026-09-07); same best-effort arm as codex. Antigravity
-        // asks over its ACP server; the headless CLI cannot prompt.
+        // asks over its ACP server; the headless CLI cannot prompt. grok
+        // asks over `_x.ai/ask_user_question`.
         if !matches!(
             h,
-            "claude" | "codex" | "opencode" | "cursor" | "antigravity"
+            "claude" | "codex" | "opencode" | "cursor" | "antigravity" | "grok"
         ) {
-            println!("SKIP {h}: questions (claude, codex, opencode, cursor, antigravity)");
+            println!("SKIP {h}: questions (claude, codex, opencode, cursor, antigravity, grok)");
             continue;
         }
         if h == "antigravity" && HEADLESS_AGY.get().copied().unwrap_or(false) {
@@ -921,7 +935,7 @@ async fn a_question_round_trips() {
         }
         let (session, mut events, _dir) = open(h).await;
         session
-            .prompt("Ask me whether I prefer red or blue using your question tool (claude: AskUserQuestion; codex: request_user_input; opencode: question; cursor: ask_question; antigravity: ask_question), then answer with just my choice.")
+            .prompt("Ask me whether I prefer red or blue using your question tool (claude: AskUserQuestion; codex: request_user_input; opencode: question; cursor: ask_question; antigravity: ask_question; grok: ask_user_question), then answer with just my choice.")
             .await
             .unwrap();
         let mut text = String::new();
@@ -950,10 +964,13 @@ async fn a_question_round_trips() {
                 }
                 EventKind::TextDelta { text: t, .. } => text.push_str(&t),
                 // The question must surface only as a request, never also as
-                // a tool call (claude: AskUserQuestion; opencode: question).
+                // a tool call (claude: AskUserQuestion; opencode: question;
+                // grok: ask_user_question, then "Ask: <question>"). Matched
+                // by prefix: a tool search echoing the prompt is not one.
                 EventKind::ToolUpdated(tool) => {
+                    let title = tool.title.to_lowercase();
                     assert!(
-                        !tool.title.to_lowercase().contains("question"),
+                        !(title.starts_with("ask") || title == "question"),
                         "{h}: question surfaced as a tool: {}",
                         tool.title
                     );
@@ -1304,6 +1321,26 @@ async fn compact_summarizes_the_session_without_losing_it() {
         drain_to_turn_end(&session, &mut events, &format!("{h}: filler")).await;
 
         session.compact().await.unwrap();
+        // KNOWN (pi 0.84.4): compaction keeps the newest 20k tokens
+        // (`compaction.keepRecentTokens`) and refuses a session that fits
+        // inside them, so a short live session proves the refusal path:
+        // a diagnostic, and the turn still ends.
+        if h == "pi" {
+            let mut refused = false;
+            loop {
+                match next(&mut events, &format!("{h}: refusal")).await.kind {
+                    EventKind::Diagnostic(d) if d.message.contains("compaction refused") => {
+                        refused = true;
+                    }
+                    EventKind::TurnEnded { .. } => break,
+                    _ => {}
+                }
+            }
+            assert!(refused, "{h}: a small session compacted or hung");
+            session.close().await.unwrap();
+            pass(h, "KNOWN: small session refused, reported as a diagnostic");
+            continue;
+        }
         drain_to_compaction(&session, &mut events, &format!("{h}: compaction")).await;
 
         // Some agents answer their own compaction out loud, so the recall
@@ -1704,6 +1741,11 @@ fn options(harness: &str, dir: &std::path::Path) -> SessionOptions {
     if harness == "pi" {
         options = options.configure("model", PI_MODEL);
     }
+    // qwen opens in `auto`, where a classifier waves safe writes through;
+    // `default` asks for every edit and command.
+    if harness == "qwen" {
+        options = options.configure("mode", "default");
+    }
     // Headless agy auto-denies every gated tool in Ask mode; its ACP server
     // asks like any ACP agent.
     if harness == "antigravity" && HEADLESS_AGY.get().copied().unwrap_or(false) {
@@ -1741,7 +1783,14 @@ async fn drain_to_turn_end(session: &Session, events: &mut Events, step: &str) -
             EventKind::RequestOpened(request) => {
                 session.answer(request.id(), allow()).await.unwrap();
             }
-            EventKind::TurnEnded { .. } => return text,
+            // A failed turn names its reason here, not as empty text later.
+            EventKind::TurnEnded { stop, .. } => {
+                assert!(
+                    matches!(stop, StopReason::Completed { .. }),
+                    "{step}: turn ended {stop:?}"
+                );
+                return text;
+            }
             _ => {}
         }
     }
@@ -1866,6 +1915,12 @@ fn kill_child(harness: &str, session: &Session) {
         // own TUI never ends in `acp`.
         "cursor" => (&["-n", "-f"], "cursor-agent .*index.js acp$".to_owned()),
         "codex" => (&["-n", "-f"], "codex app-server".to_owned()),
+        // The user's own grok TUI never runs `agent ... stdio`.
+        "grok" => (&["-n", "-f"], "grok --no-auto-update agent".to_owned()),
+        // The npm shim runs node -> cli.js, which re-execs itself as a
+        // worker inheriting the pipes: both halves, as with kiro. The
+        // user's own TUI has no `--experimental-acp`.
+        "qwen" => (&["-f"], r"qwen-code/cli\.js --experimental-acp$".to_owned()),
         // pi overwrites its argv with its own process title, so there is no
         // command line to match: the exact name plus newest-first is ours.
         "pi" => (&["-n", "-x"], "pi".to_owned()),
@@ -1886,8 +1941,8 @@ fn kill_child(harness: &str, session: &Session) {
     if pids.is_empty() {
         panic!("{harness}: no process matched {pattern:?}");
     }
-    // kiro matches dispatcher + worker; kill every matched pid.
-    let last = if harness == "kiro" {
+    // kiro and qwen match dispatcher + worker; kill every matched pid.
+    let last = if matches!(harness, "kiro" | "qwen") {
         pids.clone()
     } else {
         vec![*pids.last().unwrap()]
