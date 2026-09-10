@@ -1893,7 +1893,10 @@ fn kill_child(harness: &str, session: &Session) {
         "kiro" => (&["-f"], r#"kiro-cli(-chat)?(\.exe)?"? acp$"#.to_owned()),
         // The launcher script execs node under its own name; the user's
         // own TUI never ends in `acp`.
-        "cursor" => (&["-n", "-f"], "cursor-agent .*index.js acp$".to_owned()),
+        // On windows the launcher is a .cmd -> .ps1 -> node chain, and the
+        // node leaf carries `cursor-agent\versions\...` -- a path separator
+        // where unix has a space.
+        "cursor" => (&["-n", "-f"], r"cursor-agent.*index\.js acp$".to_owned()),
         // The npm shim runs cmd -> node -> codex.exe, so the real agent is
         // the leaf: `codex.exe app-server` there, plain `codex app-server`
         // on unix. The node and cmd links carry `.js"`/`.cmd"` instead.
