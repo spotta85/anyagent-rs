@@ -6,7 +6,7 @@
 //! `Drive::run` turns commands into requests (`handle_command`) and
 //! notifications into events (`handle_frame`, `translate`, `on_*`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use agent_client_protocol_schema::v1 as acp;
@@ -151,6 +151,7 @@ impl Adapter for AcpAdapter {
                 events,
                 info: info.clone(),
                 tools: HashMap::new(),
+                hidden_tools: HashSet::new(),
                 permissions: HashMap::new(),
                 questions: HashMap::new(),
                 prompt_id: None,
@@ -463,6 +464,8 @@ fn replace_config_options(
     let ours = move |id: &str| id == "mode" || (first_class && matches!(id, "model" | "effort"));
     info.details.config_options.retain(|o| ours(o.id.as_str()));
     info.configuration.options.retain(|id, _| ours(id.as_str()));
+    // The new list may name effort differently, or plainly.
+    info.effort_wire = None;
     apply_session_config(info, None, Some(options));
     if kiro {
         sync_effort(info);
@@ -927,6 +930,9 @@ struct Drive {
     info: DriverInfo,
     /// Cumulative tool snapshots, merged from partial wire updates.
     tools: HashMap<String, ToolUpdate>,
+    /// Question tool calls dropped on arrival: their later updates are
+    /// dropped too (grok's completion update carries no tag).
+    hidden_tools: HashSet<String>,
     permissions: HashMap<RequestId, PendingPermission>,
     questions: HashMap<RequestId, PendingQuestion>,
     prompt_id: Option<u64>,
@@ -1245,7 +1251,10 @@ impl Drive {
             // A question is surfaced by its request alone (antigravity's
             // interaction permission, grok's `_x.ai/ask_user_question`);
             // the tool call around it is wire noise.
-            U::ToolCall(call) if self.is_question_tool(&call.tool_call_id.0, &call.meta) => None,
+            U::ToolCall(call) if self.is_question_tool(&call.tool_call_id.0, &call.meta) => {
+                self.hidden_tools.insert(call.tool_call_id.0.to_string());
+                None
+            }
             U::ToolCallUpdate(update)
                 if self.is_question_tool(&update.tool_call_id.0, &update.meta) =>
             {
@@ -1422,7 +1431,9 @@ impl Drive {
         let kind = meta
             .as_ref()
             .and_then(|m| m.get("x.ai/tool")?.get("kind")?.as_str());
-        kind == Some("ask_user") || self.is_interaction(tool_call_id)
+        kind == Some("ask_user")
+            || self.hidden_tools.contains(tool_call_id)
+            || self.is_interaction(tool_call_id)
     }
 
     /// Antigravity's question (see `QuestionWire::Interaction`): the title

@@ -544,7 +544,7 @@ async fn overlapping_configures_both_apply() {
     session.close().await.unwrap();
 }
 
-/// A thought-level option under another name (qwen: `reasoning_effort`) is advertised as `effort`, and a switch reaches the wire under the agent's own id.
+/// A thought-level option under another name (qwen: `reasoning_effort`) is advertised as `effort`, and a switch reaches the wire under the agent's own id; a replacement list that names it plainly resets that.
 #[tokio::test]
 async fn a_thought_level_option_under_another_name_is_effort() {
     let (session, mut events) = open(&["--qwen"]).await;
@@ -560,6 +560,17 @@ async fn a_thought_level_option_under_another_name_is_effort() {
     session.configure("effort", "high").await.unwrap();
     wait_options(&session, &mut events, |s| {
         option(s, "effort").and_then(|o| o.current) == Some(ConfigValue::Text("high".into()))
+    })
+    .await;
+    // A model whose list names it `effort` outright: no stale wire id.
+    session.configure("model", "opus").await.unwrap();
+    wait_options(&session, &mut events, |s| {
+        option(s, "model").and_then(|o| o.current) == Some(ConfigValue::Text("opus".into()))
+    })
+    .await;
+    session.configure("effort", "default").await.unwrap();
+    wait_options(&session, &mut events, |s| {
+        option(s, "effort").and_then(|o| o.current) == Some(ConfigValue::Text("default".into()))
     })
     .await;
 }

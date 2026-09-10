@@ -23,10 +23,12 @@ let nextId = 100, pending = {}, turn = null, mcpDecl = [], effort = 'high', spur
 let grokModel = 'grok-4.5', grokEffort = 'high';
 // --kiro adds a model without effort levels; --qwen adds its
 // `reasoning_effort` (category thought_level), as qwen 0.23.2 names it.
-let qwenEffort = 'default';
+let qwenEffort = 'default', qwenModel = 'sonnet';
+// --qwen: opus names its thought level plainly, as a later model list may.
+const qwenEffortId = () => qwenModel === 'opus' ? 'effort' : 'reasoning_effort';
 const configOptions = () => [
-  { id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'sonnet', options: [{ value: 'sonnet', name: 'Sonnet' }, { value: 'opus', name: 'Opus' }, ...(flag('--kiro') ? [{ value: 'claude-haiku-4.5', name: 'Haiku' }] : [])] },
-  ...(flag('--qwen') ? [{ id: 'reasoning_effort', name: 'Reasoning effort', category: 'thought_level', type: 'select', currentValue: qwenEffort, options: [{ value: 'default', name: 'Default' }, { value: 'high', name: 'High' }] }] : []),
+  { id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: qwenModel, options: [{ value: 'sonnet', name: 'Sonnet' }, { value: 'opus', name: 'Opus' }, ...(flag('--kiro') ? [{ value: 'claude-haiku-4.5', name: 'Haiku' }] : [])] },
+  ...(flag('--qwen') ? [{ id: qwenEffortId(), name: 'Reasoning effort', category: 'thought_level', type: 'select', currentValue: qwenEffort, options: [{ value: 'default', name: 'Default' }, { value: 'high', name: 'High' }] }] : []),
 ];
 const grokModels = () => ({ currentModelId: grokModel, availableModels: [
   { modelId: 'grok-4.5', name: 'Grok 4.5', description: 'fast', _meta: { reasoningEffort: 'high', reasoningEfforts: [{ value: 'low', label: 'Low Effort' }, { value: 'high', label: 'High Effort', description: 'default' }] } },
@@ -134,7 +136,8 @@ async function onRequest(m) {
       }
       // --qwen: the thought level is `reasoning_effort` on the wire, and a
       // switch answers with the full option list like any config response.
-      if (flag('--qwen') && m.params.configId === 'reasoning_effort') { qwenEffort = m.params.value; return reply({ configOptions: configOptions() }); }
+      if (flag('--qwen') && m.params.configId === qwenEffortId()) { qwenEffort = m.params.value; return reply({ configOptions: configOptions() }); }
+      if (flag('--qwen') && m.params.configId === 'model') { qwenModel = m.params.value; return reply({ configOptions: configOptions() }); }
       // Under --grok-models there is no model configOption: only set_model works.
       if (m.params.configId !== 'model' || flag('--grok-models')) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32602, message: `unknown config ${m.params.configId}` } });
       // --config-slow=N: delay the reply so a second configure overlaps it.
@@ -201,6 +204,8 @@ async function runTurn(m) {
     const q = await request('_x.ai/ask_user_question', { sessionId: sid, toolCallId: 'call_q', mode: 'default', questions: [{ id: 'q1', question: 'Pick a fruit', options: [{ id: 'g', label: 'Grape', description: 'purple' }, { label: 'Mango' }], multiSelect: false }] });
     const answers = q.result?.answers ? JSON.stringify(q.result.answers) : (q.result?.outcome ?? 'error');
     notify(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `q=${answers} ` } });
+    // The completion update for the question carries no tag (wire, 2026-09-09).
+    notify(sid, { sessionUpdate: 'tool_call_update', toolCallId: 'call_q', status: 'completed' });
     done('end_turn');
     return;
   }
