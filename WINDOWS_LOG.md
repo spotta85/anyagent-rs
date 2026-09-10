@@ -254,6 +254,10 @@ if either returns, the model swap is the first thing to suspect.
 
 ## Step 6 — the rest — 2026-09-09
 
+**Rebased onto main** (2026-09-10), picking up #18 (grok and qwen in the live
+matrix) and #19 (discovery stops reporting login state). Items below that
+those PRs closed are marked in place.
+
 **Every harness ships for Windows.** Nothing to record as "not available":
 all ten in the catalog were installed, discovered and (bar cursor) reported
 their auth. Nine resolve through `Path`; only claude needs `extra_paths`. Ten
@@ -320,7 +324,9 @@ and version-directory sorting, where names carry no suffix.
 - Fix: `list.trim() == "all"`. Test-only, but it would have silently voided any
   windows `all` run.
 
-### B19 hermes auth lives in %LOCALAPPDATA%
+### B19 hermes auth lives in %LOCALAPPDATA% — **superseded by #19**
+The marker system this fixed no longer exists: discovery reports no login
+state, and probe is the only auth source. The `#[cfg]` went with it.
 - Symptom: `hermes: not authenticated`, while its own open-time view said
   `Authenticated { kind: ApiKey }`
 - Cause: hermes keeps `auth.json` in `~/.hermes` on macOS but in
@@ -340,7 +346,8 @@ and version-directory sorting, where names carry no suffix.
   (`acp-config.json` 2 B, `agent-cli-state.json` 94 B of tip flags), so cursor
   keeps its token in the OS credential store. The catalog's only non-env
   marker is `Keychain`, which is macOS-only. Reading Windows Credential
-  Manager is a feature, not a catalog tweak. **Open.**
+  Manager is a feature, not a catalog tweak. **Closed by #19**: discovery no
+  longer reads credentials, so there is no store to find.
 
 ### Cross-platform findings that Windows merely surfaced
 - **Late `SessionUpdated`**: reproduces on the Mac (1 PASS / 1 FAIL in two
@@ -348,27 +355,86 @@ and version-directory sorting, where names carry no suffix.
   can land after `TurnEnded`; `quiet()` sanctions `Diagnostic`,
   `PlanUsageUpdated` and `StatusChanged` but not `SessionUpdated`. Step 5's
   opencode instance was the same race — the model swap hid it, it did not fix
-  it. Loosening the contract is a product decision; **not changed**.
+  it. **Fixed** (Sid's call): `quiet()` now sanctions `SessionUpdated`, since
+  agents title a thread asynchronously after the first turn. `tests/live.rs`,
+  3 lines.
 - **pi is gated on a variable it does not need**: `build_roster` skips pi
   unless `OPENROUTER_API_KEY` is set, but pi is logged in through
   `~/.pi/agent/auth.json` on both machines. pi's profile has **no `ConfigFile`
   marker**, only `ApiKeyEnv` ones, so discovery cannot see that login. Setting
   the variable to pass the gate then makes an empty config home look
   authenticated and fails `config_home_isolates_login`. Two bugs stacked, both
-  cross-platform. **Owner: user.**
+  cross-platform. **Closed by #19**: the gate now runs `pi auth check`, and
+  with markers gone there is no `ConfigFile` to add.
 - **pi `compact`**: `compaction refused: Nothing to compact (session too
   small)` on both platforms once pi actually runs.
 - **grok and qwen have no live coverage anywhere** — they are in the catalog
   and discovered, but absent from `HARNESSES`, so `ANYAGENT_LIVE=all` covers
-  eight harnesses, not ten.
+  eight harnesses, not ten. **Closed by #18.**
 
 ### Environment note
 `OPENROUTER_API_KEY` was set as a User variable on the windows box during this
 step to get past the roster gate. It distorts pi's auth state and should be
 removed; the key itself should be rotated, having passed through a command
-line and a chat transcript.
+line and a chat transcript. **Removed** from `HKCU\Environment` on 2026-09-10
+(a fresh session no longer sees it); Sid rotates the key.
+
+## Step 6b — rerun on the rebased code — 2026-09-10
+
+First windows run of main's #18/#19. Offline 221 / 0 (Mac 223). fmt and
+clippy clean on both.
+
+`ANYAGENT_LIVE=all`: 19 passed / 13 failed, 1921 s. No new failure types:
+
+| cause | tests | status |
+|---|---|---|
+| grok `turn stopped: rate_limit` | 10 | quota, deferred to Sid's note |
+| pi kill pattern | 1 | B20, fixed |
+| qwen vision bridge | 1 | box config, see below |
+| kiro `effort` | 1 | known, model `auto` (step 6) |
+
+What #19 and the `quiet()` change bought on windows:
+- `discovery_finds_authenticated_harnesses`: all ten authenticated by probe,
+  cursor included.
+- `config_home_isolates_login`: pi passes (the key is gone, the gate asks pi).
+- `turn_events_are_bracketed_ordered_and_quiet_after_end`: all eight before
+  grok pass, hermes included. Mac: 3 / 3 runs on hermes and opencode.
+
+A panicking harness ends its test for everyone after it in `HARNESSES`, so
+grok's failures hid qwen, and kiro's effort failure hid pi and cursor. Those
+were rerun alone:
+
+| rerun | result |
+|---|---|
+| kill test, pi / cursor / antigravity / qwen | 4 PASS (B20 fixed) |
+| qwen, whole suite | 30 passed / 2 failed: image (below) and `generate` |
+| effort, pi / cursor | pi PASS; cursor SKIP (its model lists no levels) |
+
+qwen `generate` answered a correct title in Chinese (`如何重命名 Git 分支`),
+failing the `branch` check — model output from the box's `qwen3-coder`.
+Rerun gave the same answer, so it is a finding, not a flake: the same config
+gap as the image test below, and the same fix (a qwen model pin). No change.
+
+### B20 the pi kill pattern needs a command line on windows
+- Symptom: `pi: no process matched "pi"`
+- Cause: unix pi overwrites its argv with its process title, so the test
+  matched the exact name. Windows has no title: pi is the npm shim's
+  `node.exe`, and its command line is the only marker left.
+- Fix: `PI_MATCH` const pair — `-x pi` on unix,
+  `pi-coding-agent.*cli\.js"? --mode rpc` on windows. `tests/live.rs`,
+  7 lines, commit eec2346. Test-only. Mac still passes.
+
+### qwen image — config, not platform
+- Symptom: `Vision bridge (openai/gpt-oss-120b:free) failed`
+- Cause: the box's qwen model is `qwen/qwen3-coder` and every provider it
+  lists is text-only, so the vision bridge has nothing that sees images. The
+  Mac runs `z-ai/glm-5.3-flash`, which the box does not list. The suite pins
+  models for claude, codex, opencode and pi, but not qwen.
+- **No change.** Either align the box's qwen config or pin a qwen model both
+  machines list.
 
 ### Open — graceful shutdown has no cross-platform path
+The one open design item on this branch.
 Not a Windows-only issue. `CLOSE_GRACE` means "time to exit after being asked
 nicely", but the only ask is a unix SIGTERM. These agents speak JSON-lines over
 stdio, so dropping stdin (EOF) would be the portable ask — and would make unix
