@@ -62,7 +62,6 @@ pub struct AgentInstallation {
     pub name: String,
     pub executable_path: PathBuf,
     pub source: InstallationSource,
-    pub auth: Option<AuthStatus>,
     /// A richer runtime for this agent that is not installed (Antigravity's
     /// ACP server). `open` works without it with fewer capabilities; the
     /// record says what to install to get the rest.
@@ -81,7 +80,6 @@ impl AgentInstallation {
             id,
             executable_path: executable.into(),
             source: InstallationSource::Pinned,
-            auth: None,
             upgrade: None,
             acp_args: None,
         }
@@ -95,7 +93,6 @@ impl AgentInstallation {
             name,
             executable_path: executable.into(),
             source: InstallationSource::Pinned,
-            auth: None,
             upgrade: None,
             acp_args: Some(args),
         }

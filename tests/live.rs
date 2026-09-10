@@ -170,53 +170,23 @@ fn missing_line(report: &anyagent::DiscoveryReport, harness: &str) -> String {
 
 // -- the features -----------------------------------------------------------
 
-/// Discovery finds each enabled harness and authenticates it; pi/kiro verified via probe where offline markers are absent.
+/// Discovery finds each enabled harness, and `probe_auth` confirms its login.
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn discovery_finds_authenticated_harnesses() {
     for h in enabled().await {
-        let report = Runtime::new().discover().await;
+        let runtime = Runtime::new();
+        let report = runtime.discover().await;
         let agent = report
             .require(h)
             .unwrap_or_else(|_| panic!("{h}: not discovered"));
         assert!(agent.executable_path.exists(), "{h}: executable missing");
-        // pi writes an empty auth.json on first run, so its existence proves
-        // nothing, and qwen's provider key can live in settings.json: for
-        // both the only offline markers are the key env vars, and `probe`
-        // answers for real.
-        if matches!(h, "pi" | "qwen")
-            && !matches!(agent.auth, Some(AuthStatus::Authenticated { .. }))
-        {
-            assert!(
-                matches!(agent.auth, Some(AuthStatus::Unauthenticated { .. })),
-                "{h}: unexpected marker: {:?}",
-                agent.auth
-            );
-            let auth = Runtime::new().probe_auth(agent).await.unwrap();
-            assert!(
-                matches!(auth, AuthStatus::Authenticated { .. }),
-                "{h}: probe says not authenticated: {auth:?}"
-            );
-            pass(h, "discovered, authenticated by probe (no offline marker)");
-            continue;
-        }
-        // kiro has no honest offline marker (sqlite credential): discovery
-        // reports no auth and `probe` answers for real.
-        if h == "kiro" {
-            assert!(
-                agent.auth.is_none(),
-                "{h}: unexpected marker: {:?}",
-                agent.auth
-            );
-            pass(h, "discovered (auth unknown by design)");
-            continue;
-        }
+        let auth = runtime.probe_auth(agent).await.unwrap();
         assert!(
-            matches!(agent.auth, Some(AuthStatus::Authenticated { .. })),
-            "{h}: not authenticated: {:?}",
-            agent.auth
+            matches!(auth, AuthStatus::Authenticated { .. }),
+            "{h}: not authenticated: {auth:?}"
         );
-        pass(h, "discovered and authenticated");
+        pass(h, "discovered and authenticated by probe");
     }
 }
 
@@ -2025,11 +1995,8 @@ async fn config_home_isolates_login() {
         let report = runtime.discover().await;
         let agent = report.require(h).unwrap();
         // The real login is present, proving the default path is
-        // authenticated. pi has no offline marker, so its probe answers.
-        let auth = match h {
-            "pi" => runtime.probe_auth(agent).await.unwrap(),
-            _ => agent.auth.clone().unwrap(),
-        };
+        // authenticated.
+        let auth = runtime.probe_auth(agent).await.unwrap();
         assert!(
             matches!(auth, AuthStatus::Authenticated { .. }),
             "{h}: default login is not authenticated: {auth:?}"

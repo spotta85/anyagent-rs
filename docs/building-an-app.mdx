@@ -34,7 +34,7 @@ runtime.prewarm();                      // start scanning while the window opens
 
 let report = runtime.discover().await;
 for agent in &report.agents {
-    ui.agent_row(&agent.name, agent.auth.as_ref());   // auth here is a best-effort offline guess
+    ui.agent_row(&agent.name);   // login state comes from probe, not discovery
 }
 for missing in &report.missing {
     ui.install_row(&missing.name, &missing.install_hint);

@@ -41,8 +41,8 @@
 //!
 //! **Discovery.** [`Runtime::discover`] is read-only and instant: it finds
 //! executables (env overrides, PATH, the login-shell PATH, known install
-//! dirs) and offline login markers, and lists supported-but-missing agents
-//! with install hints. It never launches anything.
+//! dirs) and lists supported-but-missing agents with install hints. It
+//! never launches anything; login state comes from [`Runtime::probe`].
 //!
 //! **Probe.** [`Runtime::probe`] opens a throwaway session (~1 s) to learn
 //! what only the agent can tell you, returned as [`AgentDetails`]: version,

@@ -533,7 +533,7 @@ async fn probe_reports_the_same_details_as_open() {
 #[tokio::test]
 async fn a_logged_out_handshake_reports_unauthenticated_with_login_methods() {
     // The CLI sends an account object either way; only its contents separate
-    // a login from none, and a stale offline marker must not override it.
+    // a login from none.
     let agent = AgentInstallation::at("claude", wrapper("logged-out", "--logged-out"));
     let details = Runtime::new().probe(&agent).await.unwrap();
     let AuthStatus::Unauthenticated { login } = &details.auth else {

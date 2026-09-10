@@ -283,7 +283,7 @@ async fn handshake(
     let response = response
         .map_err(|e| e.into_error(&init.auth_methods, &request.installation.executable_path))?;
 
-    let mut info = driver_info(&init, &request.installation.auth, open_auth_kind);
+    let mut info = driver_info(&init, open_auth_kind);
     let first_class_models = response.get("models").cloned();
     let session_id = if session_id.is_empty() {
         let new: acp::NewSessionResponse = parse(response, "session/new response")?;
@@ -653,11 +653,7 @@ fn sync_first_class_models(info: &mut DriverInfo, models: &Value) {
 }
 
 /// What `initialize` tells us, folded into the engine's vocabulary.
-fn driver_info(
-    init: &acp::InitializeResponse,
-    auth: &Option<AuthStatus>,
-    open_auth_kind: Option<AuthKind>,
-) -> DriverInfo {
+fn driver_info(init: &acp::InitializeResponse, open_auth_kind: Option<AuthKind>) -> DriverInfo {
     // Plan and slash commands (sent as prompt text) are core ACP;
     // ContextUsage and Questions are added on first sight, since the
     // handshake does not say whether an agent sends them.
@@ -689,17 +685,15 @@ fn driver_info(
                 .as_ref()
                 .map(|i| i.version.clone())
                 .or_else(meta_version),
-            // ACP has no auth-status field on the wire. A marker with a kind
-            // wins (it knows subscription vs key); otherwise reaching this
-            // point proves login for agents that refuse to open logged out
-            // (`open_auth_kind`, probed per agent); the rest stay best-effort.
-            auth: match (auth, open_auth_kind) {
-                (Some(a @ AuthStatus::Authenticated { .. }), _) => a.clone(),
-                (_, Some(kind)) => AuthStatus::Authenticated {
+            // ACP has no auth-status field on the wire: reaching this point
+            // proves login for agents that refuse to open logged out
+            // (`open_auth_kind`, probed per agent); the rest are unknown.
+            auth: match open_auth_kind {
+                Some(kind) => AuthStatus::Authenticated {
                     kind,
                     account: None,
                 },
-                (a, None) => a.clone().unwrap_or(AuthStatus::Unknown),
+                None => AuthStatus::Unknown,
             },
             capabilities,
             config_options: Vec::new(),

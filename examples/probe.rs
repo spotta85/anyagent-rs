@@ -4,10 +4,10 @@
 //! cargo run --example probe
 //! ```
 //!
-//! `discover()` is read-only and instant — it finds executables and login
-//! markers without launching anything. `probe(agent)` opens a throwaway
-//! session (~1 s) to learn what only the agent itself can tell you: its real
-//! login state, version, capabilities, config options, and slash commands.
+//! `discover()` is read-only and instant — it finds executables without
+//! launching anything. `probe(agent)` opens a throwaway session (~1 s) to
+//! learn what only the agent itself can tell you: its login state, version,
+//! capabilities, config options, and slash commands.
 //! Apps typically discover at startup and probe on demand (a settings page,
 //! an agent picker).
 

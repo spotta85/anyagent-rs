@@ -309,8 +309,7 @@ async fn bind_session(http: &Http, request: &ConnectRequest) -> Result<Value, Ag
 
 /// opencode reports login only as which providers are connected; an empty
 /// list is the one honest "logged out" (probed 2026-09-03). A connected
-/// provider proves a working credential, not its kind — the offline
-/// marker's kind stands where discovery read one.
+/// provider proves a working credential, not its kind.
 fn auth_status(request: &ConnectRequest, connected: &Value) -> AuthStatus {
     let any = connected.as_array().is_some_and(|c| !c.is_empty());
     if !any {
@@ -318,12 +317,9 @@ fn auth_status(request: &ConnectRequest, connected: &Value) -> AuthStatus {
             login: login_methods(&request.installation, Some(&request.options)),
         };
     }
-    match &request.installation.auth {
-        Some(auth @ AuthStatus::Authenticated { .. }) => auth.clone(),
-        _ => AuthStatus::Authenticated {
-            kind: AuthKind::Other("connected provider".into()),
-            account: None,
-        },
+    AuthStatus::Authenticated {
+        kind: AuthKind::Other("connected provider".into()),
+        account: None,
     }
 }
 
