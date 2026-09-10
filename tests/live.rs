@@ -1877,6 +1877,14 @@ const KILLED_STATUS: &str = "9";
 #[cfg(windows)]
 const KILLED_STATUS: &str = "exit status: 1";
 
+/// How the kill finds pi: unix pi overwrites its argv with its process title,
+/// so only the exact name is left; windows has no title, so the npm shim's
+/// node leaf keeps its command line.
+#[cfg(unix)]
+const PI_MATCH: (&[&str], &str) = (&["-n", "-x"], "pi");
+#[cfg(windows)]
+const PI_MATCH: (&[&str], &str) = (&["-n", "-f"], r#"pi-coding-agent.*cli\.js"? --mode rpc"#);
+
 /// Kills the session's own agent process, found by a session-unique marker.
 fn kill_child(harness: &str, session: &Session) {
     // claude carries our minted session id in argv; opencode is matched by
@@ -1915,9 +1923,7 @@ fn kill_child(harness: &str, session: &Session) {
             &["-f"],
             r"qwen-code[/\\]cli\.js --experimental-acp$".to_owned(),
         ),
-        // pi overwrites its argv with its own process title, so there is no
-        // command line to match: the exact name plus newest-first is ours.
-        "pi" => (&["-n", "-x"], "pi".to_owned()),
+        "pi" => (PI_MATCH.0, PI_MATCH.1.to_owned()),
         // The CLI's wire flag, or the ACP server's own executable name.
         // Windows spawns the CLI as `"...\agy.exe" --input-format=...`.
         "antigravity" => (
