@@ -1851,8 +1851,9 @@ async fn expect_cancelled(events: &mut Events, step: &str) {
 /// Asserts no turn traffic arrives for `secs` seconds. Diagnostics (kiro
 /// emits metadata notifications between turns), plan-usage receipts
 /// (claude fetches usage after each result frame, so the receipt lands
-/// post-turn by design), and status flips (a turn end is followed by
-/// `StatusChanged(Idle)`) are the sanctioned out-of-turn events.
+/// post-turn by design), status flips (a turn end is followed by
+/// `StatusChanged(Idle)`), and session updates (agents title a thread
+/// asynchronously after the first turn) are the sanctioned out-of-turn events.
 async fn quiet(events: &mut Events, secs: u64, step: &str) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
     while let Ok(Some(event)) = tokio::time::timeout_at(deadline, events.next()).await {
@@ -1861,7 +1862,8 @@ async fn quiet(events: &mut Events, secs: u64, step: &str) {
             kind,
             Ok(EventKind::Diagnostic(_)
                 | EventKind::PlanUsageUpdated(_)
-                | EventKind::StatusChanged(_))
+                | EventKind::StatusChanged(_)
+                | EventKind::SessionUpdated(_))
         ) {
             panic!("expected quiet at {step}, got {kind:?}");
         }
