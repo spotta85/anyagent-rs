@@ -94,7 +94,18 @@ impl Adapter for AcpAdapter {
         .await?;
         let mut wire = Wire::over(&mut child, recorder);
 
-        let open_auth_kind = self.profile.and_then(|p| p.open_auth_kind.clone());
+        // ACP never says which credential opened the session: a documented
+        // API key in the env is taken as the one in use, else the catalog's
+        // proven kind.
+        let open_auth_kind = self.profile.and_then(|p| {
+            let keyed = p
+                .api_key_env
+                .iter()
+                .any(|var| std::env::var(var).is_ok_and(|v| !v.trim().is_empty()));
+            p.open_auth_kind
+                .clone()
+                .map(|kind| if keyed { AuthKind::ApiKey } else { kind })
+        });
         let adopt_login = self
             .profile
             .and_then(|p| p.upgrade.as_ref())

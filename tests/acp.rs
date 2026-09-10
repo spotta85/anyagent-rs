@@ -411,6 +411,23 @@ async fn probe_confirms_login_when_an_open_proves_it() {
     );
 }
 
+/// ACP cannot say which credential opened the session: with the profile's documented API key in the env, a proven open is reported as an API-key login, not the catalog's subscription.
+#[tokio::test]
+async fn an_api_key_in_the_env_is_reported_as_one() {
+    // std guards env access with its own lock, and no other test in this
+    // binary reads XAI_API_KEY.
+    unsafe { std::env::set_var("XAI_API_KEY", "xai-test") };
+    let agent = catalog_wrapper("grok", "api-key", "");
+    let details = Runtime::new().probe(&agent).await.unwrap();
+    assert_eq!(
+        details.auth,
+        AuthStatus::Authenticated {
+            kind: AuthKind::ApiKey,
+            account: None
+        }
+    );
+}
+
 /// Pre-protocol exit (kiro not logged in) mapped to Unauthenticated with terminal login method.
 #[tokio::test]
 async fn probe_maps_a_pre_protocol_exit_to_logged_out() {
