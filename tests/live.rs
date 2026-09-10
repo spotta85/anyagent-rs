@@ -1888,8 +1888,9 @@ fn kill_child(harness: &str, session: &Session) {
         // worker that inherits the pipes — killing only the dispatcher lets
         // the turn complete. Anchored so the user's Kiro apps' own
         // `kiro-cli acp --agent <name>` processes never match.
-        // Windows has no `-chat` worker, just `kiro-cli.exe acp`.
-        "kiro" => (&["-f"], r"kiro-cli(-chat)?(\.exe)? acp$".to_owned()),
+        // Windows has no `-chat` worker, and Command quotes the exe path:
+        // `"...\kiro-cli.exe" acp`.
+        "kiro" => (&["-f"], r#"kiro-cli(-chat)?(\.exe)?"? acp$"#.to_owned()),
         // The launcher script execs node under its own name; the user's
         // own TUI never ends in `acp`.
         "cursor" => (&["-n", "-f"], "cursor-agent .*index.js acp$".to_owned()),
