@@ -1618,6 +1618,7 @@ impl Drive {
         self.prompt_id = None;
         self.prompt_meta = None;
         self.tools.clear();
+        self.hidden_tools.clear();
         let stop = params["stopReason"].as_str().unwrap_or("end_turn");
         self.events
             .send(DriverEvent::TurnEnded(stop_reason(
@@ -1742,6 +1743,7 @@ impl Drive {
             }
             self.prompt_id = None;
             self.tools.clear();
+            self.hidden_tools.clear();
             // A switch queued behind this turn goes out before the turn is
             // reported over, however it ended, so the next prompt lines up
             // behind it.
