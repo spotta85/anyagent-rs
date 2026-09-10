@@ -113,11 +113,13 @@ async fn build_roster() -> Roster {
     let report = Runtime::new().discover().await;
     // The CLI is always `agy`; the upgrade is the server binary. Checking
     // the name also covers ANYAGENT_ANTIGRAVITY_BIN pinning the CLI while
-    // the server is installed.
+    // the server is installed. The stem, not the name: windows installs it
+    // as `agy.exe`, and the server as `agy_acp_server.par`, which keeps its
+    // own stem either way.
     let _ = HEADLESS_AGY.set(
         report
             .require("antigravity")
-            .map(|a| a.executable_path.file_name().is_some_and(|n| n == "agy"))
+            .map(|a| a.executable_path.file_stem().is_some_and(|n| n == "agy"))
             .unwrap_or(false),
     );
     let mut installed = Vec::new();
