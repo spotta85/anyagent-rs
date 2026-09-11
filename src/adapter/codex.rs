@@ -210,7 +210,10 @@ async fn launch(
     let mut args = mcp_overrides(&request.options.mcp_servers)?;
     args.push("app-server".into());
     // Lets `request_user_input` fire outside plan mode (live-verified 0.152.0).
-    args.extend(["-c".to_owned(), "features.default_mode_request_user_input=true".to_owned()]);
+    args.extend([
+        "-c".to_owned(),
+        "features.default_mode_request_user_input=true".to_owned(),
+    ]);
     let mut child = process::spawn(Spawn {
         exec_path: request.installation.executable_path.clone(),
         args,

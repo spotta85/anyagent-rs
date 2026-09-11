@@ -25,10 +25,14 @@ pub(crate) struct Spawn {
     pub env: Vec<(String, String)>,
 }
 
+/// The child's stdin, shared with the wire that writes to it so `shutdown`
+/// can close it: EOF is the one "please exit" every platform has.
+pub(crate) type SharedStdin = Arc<tokio::sync::Mutex<Option<ChildStdin>>>;
+
 /// A running agent process and the process group it leads. Dropping it
 /// without `shutdown` kills the whole group.
 pub(crate) struct Child {
-    pub stdin: Option<ChildStdin>,
+    pub stdin: SharedStdin,
     pub stdout: Option<ChildStdout>,
     /// Owns the group: a pgid on unix, a Job Object on windows. Killing it
     /// takes the workers with it, so no worker outlives the session.
@@ -80,7 +84,7 @@ pub(crate) async fn spawn(spec: Spawn) -> Result<Child, AgentError> {
         })
     });
     Ok(Child {
-        stdin: child.inner().stdin.take(),
+        stdin: Arc::new(tokio::sync::Mutex::new(child.inner().stdin.take())),
         stdout: child.inner().stdout.take(),
         finished: false,
         inner: child,
@@ -157,18 +161,18 @@ impl Child {
         let _ = self.inner.start_kill();
     }
 
-    /// SIGTERM to the group, then up to `grace` for the leader to exit.
-    #[cfg(unix)]
+    /// Closes stdin (EOF ends every stdio agent's read loop), adds SIGTERM
+    /// on unix for agents that do not read stdin, then waits up to `grace`
+    /// for the leader to exit.
     async fn request_exit(&mut self, grace: Duration) {
-        use command_group::{Signal, UnixChildExt};
-        let _ = self.inner.signal(Signal::SIGTERM);
+        self.stdin.lock().await.take();
+        #[cfg(unix)]
+        {
+            use command_group::{Signal, UnixChildExt};
+            let _ = self.inner.signal(Signal::SIGTERM);
+        }
         let _ = tokio::time::timeout(grace, self.inner.wait()).await;
     }
-
-    /// Windows has no signal that asks a process to exit, so there is nothing
-    /// to ask and nothing to wait for: `shutdown` goes straight to the kill.
-    #[cfg(windows)]
-    async fn request_exit(&mut self, _grace: Duration) {}
 }
 
 impl Drop for Child {
@@ -278,6 +282,22 @@ mod tests {
             path,
             OsString::from(joined(["/opt/agent/bin", "/usr/bin", "/home/u/.volta/bin"]))
         );
+    }
+
+    /// Shutdown asks with stdin EOF: a child that ignores signals and only
+    /// watches stdin still exits well inside the grace, on every platform.
+    #[tokio::test]
+    async fn shutdown_asks_with_stdin_eof() {
+        let mut child = spawn(node(
+            "process.on('SIGTERM', () => {}); process.stdin.on('end', () => process.exit(0)); \
+             process.stdin.resume(); setTimeout(() => {}, 30000)",
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let start = std::time::Instant::now();
+        child.shutdown(Duration::from_secs(10)).await;
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     /// Shutdown escalates to SIGKILL when child traps SIGTERM within grace.

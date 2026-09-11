@@ -727,7 +727,10 @@ impl Drive {
         }
         if self.throwaway {
             let path = format!("/session/{}", self.session_id);
-            self.http.request("DELETE", &path, None, Some(ACTION_TIMEOUT)).await.ok();
+            self.http
+                .request("DELETE", &path, None, Some(ACTION_TIMEOUT))
+                .await
+                .ok();
         }
         self.server.shutdown(CLOSE_GRACE).await;
     }

@@ -209,9 +209,7 @@ impl Runtime {
     /// handshake learned, and closes. A logged-out agent is a result, not
     /// an error.
     pub async fn probe(&self, agent: &AgentInstallation) -> Result<AgentDetails, AgentError> {
-        let opened = self
-            .open(agent, throwaway_options())
-            .await;
+        let opened = self.open(agent, throwaway_options()).await;
         // Not logged is reported as a detail.
         let (session, mut events) = match opened {
             Err(AgentError::AuthRequired { login }) => {
@@ -248,9 +246,7 @@ impl Runtime {
     /// Fast auth-only probe: does not wait for `availableCommands` (saves
     /// `PROBE_COMMANDS_WAIT`). Use when only `auth` is needed (e.g. kiro).
     pub async fn probe_auth(&self, agent: &AgentInstallation) -> Result<AuthStatus, AgentError> {
-        let opened = self
-            .open(agent, throwaway_options())
-            .await;
+        let opened = self.open(agent, throwaway_options()).await;
         match opened {
             Err(AgentError::AuthRequired { login }) => Ok(AuthStatus::Unauthenticated { login }),
             Err(e) => Err(e),

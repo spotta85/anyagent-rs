@@ -6,13 +6,12 @@
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::ChildStdin;
 use tokio::sync::mpsc;
 
 use crate::adapter::Emitter;
 use crate::agent::SessionOptions;
 use crate::event::DiagnosticLevel;
-use crate::process::Child;
+use crate::process::{Child, SharedStdin};
 
 /// Frames buffered between the reader task and the drive task.
 pub(crate) const FRAME_BUFFER: usize = 64;
@@ -20,7 +19,8 @@ pub(crate) const FRAME_BUFFER: usize = 64;
 /// One JSON object per line each way. Adapters add their own request ids
 /// and response matching on top.
 pub(crate) struct LineWire {
-    stdin: ChildStdin,
+    /// Shared with the child so `shutdown` can close it (EOF).
+    stdin: SharedStdin,
     /// Every frame the reader task parsed, in order; closes at stdout EOF.
     pub frames: mpsc::Receiver<Value>,
     recorder: Option<WireRecorder>,
@@ -30,7 +30,7 @@ impl LineWire {
     /// Takes the child's stdio and starts the line-reader task. Unparseable
     /// lines are skipped.
     pub(crate) fn over(child: &mut Child, recorder: Option<WireRecorder>) -> Self {
-        let stdin = child.stdin.take().expect("piped stdin");
+        let stdin = child.stdin.clone();
         let stdout = child.stdout.take().expect("piped stdout");
         let (tx, frames) = mpsc::channel(FRAME_BUFFER);
         let reader_recorder = recorder.clone();
@@ -55,14 +55,18 @@ impl LineWire {
         }
     }
 
-    /// Writes one frame as a line, recording it first.
+    /// Writes one frame as a line, recording it first. Fails with
+    /// `BrokenPipe` once shutdown has closed stdin.
     pub(crate) async fn write(&mut self, frame: Value) -> std::io::Result<()> {
         if let Some(recorder) = &self.recorder {
             recorder.record("out", &frame);
         }
         let mut line = frame.to_string();
         line.push('\n');
-        self.stdin.write_all(line.as_bytes()).await
+        match self.stdin.lock().await.as_mut() {
+            Some(stdin) => stdin.write_all(line.as_bytes()).await,
+            None => Err(std::io::ErrorKind::BrokenPipe.into()),
+        }
     }
 }
 
