@@ -47,6 +47,10 @@ use crate::process::{self, Spawn};
 /// How long a taken prompt may sit without the server going busy.
 const ADMIT_TIMEOUT: Duration = Duration::from_secs(10);
 const HEALTH_POLL: Duration = Duration::from_millis(100);
+/// How long one health poll waits for an answer: the first connection
+/// opencode accepts on Linux can go unanswered (1.18.30), so a poll gives
+/// up fast and the next one gets through.
+const HEALTH_ANSWER: Duration = Duration::from_millis(500);
 
 /// Launches `opencode serve` and speaks its HTTP wire.
 pub(crate) struct OpencodeAdapter;
@@ -305,7 +309,9 @@ async fn handshake(
 /// Polls `/global/health` until the server answers, returning its version.
 async fn await_health(http: &Http) -> Result<Option<String>, AgentError> {
     loop {
-        if let Ok(health) = http.get("/global/health").await {
+        if let Ok(Ok(health)) =
+            tokio::time::timeout(HEALTH_ANSWER, http.get("/global/health")).await
+        {
             return Ok(health["version"].as_str().map(str::to_owned));
         }
         tokio::time::sleep(HEALTH_POLL).await;

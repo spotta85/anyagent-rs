@@ -43,6 +43,24 @@ pub(crate) struct Child {
     stderr_task: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// Retries `spawn` for a moment while Linux reports the executable busy: a
+/// fork elsewhere in this process can hold a just-written file open until
+/// it execs, which makes a fresh shim or install briefly unlaunchable.
+pub(crate) async fn retry_busy<T>(
+    mut spawn: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let mut attempts = 0;
+    loop {
+        match spawn() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 20 => {
+                attempts += 1;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Launches an agent with a PATH suitable for GUI applications.
 pub(crate) async fn spawn(spec: Spawn) -> Result<Child, AgentError> {
     let path = compose_path(
@@ -63,10 +81,8 @@ pub(crate) async fn spawn(spec: Spawn) -> Result<Child, AgentError> {
     // Own group: agents that dispatch to a worker (kiro-cli spawns
     // kiro-cli-chat, which inherits the pipes; a windows `.cmd` shim runs
     // through cmd.exe) are then killed as a unit.
-    let mut child = command
-        .group()
-        .kill_on_drop(true)
-        .spawn()
+    let mut child = retry_busy(|| command.group().kill_on_drop(true).spawn())
+        .await
         .map_err(|e| AgentError::SpawnFailed(format!("{}: {e}", spec.exec_path.display())))?;
 
     let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));

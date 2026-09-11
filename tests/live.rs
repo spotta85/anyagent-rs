@@ -398,13 +398,16 @@ async fn effort_switches_live() {
                 .into_iter()
                 .find(|o| o.id.as_str() == "effort")
         };
-        // The pinned zen model has no variants; a free one with them also
-        // proves the option follows a live model switch.
-        if h == "opencode" {
-            session
-                .configure("model", "opencode/ling-3.0-flash-fin-free")
-                .await
-                .unwrap();
+        // The pinned zen model has no variants, and kiro's default `auto`
+        // has no effort; a model with levels also proves the option follows
+        // a live model switch.
+        let pin = match h {
+            "opencode" => Some("opencode/ling-3.0-flash-fin-free"),
+            "kiro" => Some("claude-opus-4.8"),
+            _ => None,
+        };
+        if let Some(model) = pin {
+            session.configure("model", model).await.unwrap();
             while option(&session).is_none() {
                 next(&mut events, "effort after model switch").await;
             }
@@ -441,8 +444,9 @@ async fn effort_switches_live() {
                 "{h}: levels"
             );
         }
-        // kiro reports the current level in a metadata frame right after open.
-        if h == "kiro" {
+        // kiro reports the current level in a metadata frame right after
+        // open; after a model switch it says nothing, so `current` stays empty.
+        if h == "kiro" && pin.is_none() {
             while option(&session).is_some_and(|o| o.current.is_none()) {
                 next(&mut events, "effort sync").await;
             }

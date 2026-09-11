@@ -260,7 +260,8 @@ async fn output(exe: &Path, args: &[&str], env: &[(String, String)]) -> Option<S
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    let out = tokio::time::timeout(SIDE_PROCESS_TIMEOUT, command.output())
+    let child = crate::process::retry_busy(|| command.spawn()).await.ok()?;
+    let out = tokio::time::timeout(SIDE_PROCESS_TIMEOUT, child.wait_with_output())
         .await
         .ok()?
         .ok()?;
