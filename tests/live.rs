@@ -444,8 +444,9 @@ async fn effort_switches_live() {
                 "{h}: levels"
             );
         }
-        // kiro reports the current level in a metadata frame right after open.
-        if h == "kiro" {
+        // kiro reports the current level in a metadata frame right after
+        // open; after a model switch it says nothing, so `current` stays empty.
+        if h == "kiro" && pin.is_none() {
             while option(&session).is_some_and(|o| o.current.is_none()) {
                 next(&mut events, "effort sync").await;
             }
