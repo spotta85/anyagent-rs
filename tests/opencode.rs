@@ -138,6 +138,30 @@ async fn the_handshake_fills_details() {
     session.close().await.unwrap();
 }
 
+/// A squatted port (the fixture dies with EADDRINUSE) is retried on a fresh
+/// port at once, not after a handshake timeout: three tries fail in seconds.
+#[tokio::test]
+async fn a_squatted_port_is_retried_without_waiting_for_the_handshake() {
+    let start = std::time::Instant::now();
+    let err = open_with(
+        "squat",
+        "--port-taken",
+        SessionOptions::in_dir(std::env::temp_dir()),
+    )
+    .await
+    .err()
+    .expect("three squatted ports fail");
+    assert!(
+        matches!(&err, AgentError::ProcessExited { stderr, .. } if stderr.contains("EADDRINUSE")),
+        "{err:?}"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "took {:?}",
+        start.elapsed()
+    );
+}
+
 /// No connected provider is the one honest logged-out; the session still opens.
 #[tokio::test]
 async fn logged_out_reports_unauthenticated_with_no_models() {

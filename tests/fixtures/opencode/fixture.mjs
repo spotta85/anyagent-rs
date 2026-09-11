@@ -11,6 +11,8 @@ import { createServer } from 'node:http';
 const flag = (name) => process.argv.includes(name);
 const argAfter = (name) => { const i = process.argv.indexOf(name); return i > -1 ? process.argv[i + 1] : undefined; };
 const port = Number(argAfter('--port'));
+// --port-taken: die at once the way a squatted port kills the real server.
+if (flag('--port-taken')) { process.stderr.write(`Error: listen EADDRINUSE: address already in use 127.0.0.1:${port}\n`); process.exit(1); }
 const secret = process.env.OPENCODE_SERVER_PASSWORD ?? '';
 const config = JSON.parse(process.env.OPENCODE_CONFIG_CONTENT ?? '{}');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
