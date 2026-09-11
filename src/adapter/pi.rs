@@ -134,7 +134,10 @@ fn launch_args(options: &SessionOptions) -> Result<Vec<String>, AgentError> {
     }
     let mut args = Vec::new();
     if options.no_tools {
-        args.extend(["--no-tools".into(), "--no-session".into()]);
+        args.push("--no-tools".into());
+    }
+    if options.throwaway {
+        args.push("--no-session".into());
     }
     match &options.start {
         SessionStart::New => {}

@@ -105,13 +105,14 @@ async fn handshake_reports_auth_version_options_and_token() {
         Capability::PlanUsage,
         Capability::Rollback,
         Capability::Images,
+        Capability::Questions,
     ] {
         assert!(caps.supports(cap.clone()), "missing {cap:?}");
     }
-    // Questions need codex's collaboration mode, which is not wired yet.
-    for cap in [Capability::Questions, Capability::RollbackFiles] {
-        assert!(!caps.supports(cap.clone()), "over-advertised {cap:?}");
-    }
+    assert!(
+        !caps.supports(Capability::RollbackFiles),
+        "over-advertised RollbackFiles"
+    );
 
     // Hidden models stay hidden; effort defaults to the model's default.
     let model = info

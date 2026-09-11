@@ -389,6 +389,9 @@ pub struct SessionOptions {
     pub(crate) start: SessionStart,
     pub(crate) permission_mode: PermissionMode,
     pub(crate) no_tools: bool,
+    /// Never persisted: keeps probes and one-shot generation out of the
+    /// user's session history.
+    pub(crate) throwaway: bool,
     pub(crate) quiet_window: Option<Duration>,
     pub(crate) stall_after: Option<Duration>,
     pub(crate) mcp_servers: Vec<McpServer>,
@@ -417,6 +420,7 @@ impl SessionOptions {
             start: SessionStart::New,
             permission_mode: PermissionMode::Ask,
             no_tools: false,
+            throwaway: false,
             quiet_window: None,
             stall_after: None,
             mcp_servers: Vec::new(),

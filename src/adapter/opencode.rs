@@ -77,6 +77,7 @@ impl Adapter for OpencodeAdapter {
                 events,
                 info: launched.info,
                 session_id: launched.session_id,
+                throwaway: request.options.throwaway,
                 windows: launched.windows,
                 variants: launched.variants,
                 login: login_methods(&request.installation, Some(&request.options)),
@@ -615,6 +616,8 @@ struct Drive {
     info: DriverInfo,
     /// The opencode `ses_…` id this session drives.
     session_id: String,
+    /// Deleted at close so it never shows in the user's session list.
+    throwaway: bool,
     /// Login methods for a mid-session credential loss.
     login: Vec<LoginMethod>,
     /// Context window per model, for `ContextUsage`.
@@ -721,6 +724,10 @@ impl Drive {
                     }
                 }
             }
+        }
+        if self.throwaway {
+            let path = format!("/session/{}", self.session_id);
+            self.http.request("DELETE", &path, None, Some(ACTION_TIMEOUT)).await.ok();
         }
         self.server.shutdown(CLOSE_GRACE).await;
     }

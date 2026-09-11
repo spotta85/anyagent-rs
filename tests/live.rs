@@ -880,16 +880,15 @@ async fn opencode_child_session_permissions_reach_the_caller() {
     pass("opencode", "child session permissions reached the caller");
 }
 
-/// Question request round-trips: choices presented, answer selected, and response echoed (claude/codex only; codex unverified).
+/// Question request round-trips: choices presented, answer selected, and response echoed.
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn a_question_round_trips() {
     for h in enabled().await {
-        // codex runs as a probe: `item/tool/requestUserInput` is
-        // schema-confirmed but has never fired live (ticket 10) — the
-        // translation is exercised if it ever does, without failing the run.
-        // cursor's Auto model has not fired `cursor/ask_question` in any
-        // probe (2026-09-07); same best-effort arm as codex. Antigravity
+        // codex fires `request_user_input` with the default-mode feature
+        // flag the adapter sets (verified 2026-09-10). cursor's Auto model
+        // has not fired `cursor/ask_question` in any probe (2026-09-07), so
+        // it runs best-effort. Antigravity
         // asks over its ACP server; the headless CLI cannot prompt. grok
         // asks over `_x.ai/ask_user_question`.
         if !matches!(
@@ -953,10 +952,7 @@ async fn a_question_round_trips() {
             }
         }
         if !asked {
-            assert!(
-                matches!(h, "codex" | "cursor"),
-                "{h}: no question request opened"
-            );
+            assert!(h == "cursor", "{h}: no question request opened");
             println!("SKIP {h}: the question request did not fire (unverified live)");
             session.close().await.unwrap();
             continue;

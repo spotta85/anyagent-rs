@@ -166,7 +166,9 @@ impl Runtime {
     /// pi) and every permission declined elsewhere, gathers the text until
     /// the turn ends, and closes. Requires a new session; a tool event or a
     /// question requiring a choice cancels generation. Include context
-    /// inline: path attachments cannot be opened without tools.
+    /// inline: path attachments cannot be opened without tools. Like the
+    /// probes, the session is never persisted (claude, codex, pi) or is
+    /// deleted at close (opencode), so it stays out of the user's history.
     pub async fn generate(
         &self,
         agent: &AgentInstallation,
@@ -182,6 +184,7 @@ impl Runtime {
         // the agent run tools before any request reached this loop.
         let mut options = options.permission_mode(PermissionMode::Ask);
         options.no_tools = true;
+        options.throwaway = true;
         let (session, mut events) = self.open(agent, options).await?;
         // Hands-off needs one of: tools switched off at launch, or every
         // tool gated by a permission request this loop can decline.
@@ -207,7 +210,7 @@ impl Runtime {
     /// an error.
     pub async fn probe(&self, agent: &AgentInstallation) -> Result<AgentDetails, AgentError> {
         let opened = self
-            .open(agent, SessionOptions::in_dir(std::env::temp_dir()))
+            .open(agent, throwaway_options())
             .await;
         // Not logged is reported as a detail.
         let (session, mut events) = match opened {
@@ -246,7 +249,7 @@ impl Runtime {
     /// `PROBE_COMMANDS_WAIT`). Use when only `auth` is needed (e.g. kiro).
     pub async fn probe_auth(&self, agent: &AgentInstallation) -> Result<AuthStatus, AgentError> {
         let opened = self
-            .open(agent, SessionOptions::in_dir(std::env::temp_dir()))
+            .open(agent, throwaway_options())
             .await;
         match opened {
             Err(AgentError::AuthRequired { login }) => Ok(AuthStatus::Unauthenticated { login }),
@@ -292,6 +295,13 @@ impl Runtime {
         });
         futures::future::join_all(probes).await
     }
+}
+
+/// Options for a probe: temp dir, never persisted.
+fn throwaway_options() -> SessionOptions {
+    let mut options = SessionOptions::in_dir(std::env::temp_dir());
+    options.throwaway = true;
+    options
 }
 
 /// Sends the prompt and gathers the agent's own text (not subagents') until

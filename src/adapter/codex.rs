@@ -209,6 +209,8 @@ async fn launch(
     }
     let mut args = mcp_overrides(&request.options.mcp_servers)?;
     args.push("app-server".into());
+    // Lets `request_user_input` fire outside plan mode (live-verified 0.152.0).
+    args.extend(["-c".to_owned(), "features.default_mode_request_user_input=true".to_owned()]);
     let mut child = process::spawn(Spawn {
         exec_path: request.installation.executable_path.clone(),
         args,
@@ -405,6 +407,10 @@ async fn open_thread(
         params["approvalPolicy"] = json!("untrusted");
         params["sandbox"] = json!("read-only");
     }
+    // Keeps the thread off disk and out of the user's thread list.
+    if request.options.throwaway {
+        params["ephemeral"] = json!(true);
+    }
     let method = match &request.options.start {
         SessionStart::New => "thread/start",
         SessionStart::Resume(token) => {
@@ -564,14 +570,11 @@ fn driver_info(
         details: AgentDetails {
             version,
             auth,
-            // Not advertised: Questions. `requestUserInput` only fires in
-            // codex's collaboration (plan) mode ("I can't use that tool in
-            // the current mode", probed 0.152.0); the translation exists for
-            // when `collaborationMode` is wired.
             capabilities: {
                 let mut capabilities = Capabilities::new([
                     Capability::Steer,
                     Capability::Permissions,
+                    Capability::Questions,
                     Capability::Images,
                     Capability::Resume,
                     Capability::Fork,
@@ -1268,8 +1271,6 @@ impl Drive {
                     detail: params["reason"].as_str().map(str::to_owned),
                 })
             }
-            // Schema-confirmed, never observed live on 0.147.0; translated
-            // defensively while `Capability::Questions` stays off.
             "item/tool/requestUserInput" => {
                 let questions = questions(&params["questions"]);
                 self.requests.insert(
