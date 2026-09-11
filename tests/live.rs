@@ -41,6 +41,10 @@ const HARNESSES: &[&str] = &[
 ];
 const EVENT_TIMEOUT: Duration = Duration::from_secs(120);
 const OPENCODE_MODEL: &str = "opencode/muse-spark-1.2-contributor-free";
+/// qwen models come from the box's `~/.qwen/settings.json`; every box
+/// in the matrix lists this OpenRouter entry (vision-capable, answers in
+/// English).
+const QWEN_MODEL: &str = "z-ai/glm-5.3-flash";
 /// The host config's default (`gpt-6-astra`) needs a newer CLI; luna is cheap and available.
 const CODEX_MODEL: &str = "gpt-5.6-luna";
 /// pi's model values are `provider/modelId`.
@@ -1711,7 +1715,9 @@ fn options(harness: &str, dir: &std::path::Path) -> SessionOptions {
     // qwen opens in `auto`, where a classifier waves safe writes through;
     // `default` asks for every edit and command.
     if harness == "qwen" {
-        options = options.configure("mode", "default");
+        options = options
+            .configure("mode", "default")
+            .configure("model", QWEN_MODEL);
     }
     // Headless agy auto-denies every gated tool in Ask mode; its ACP server
     // asks like any ACP agent.
