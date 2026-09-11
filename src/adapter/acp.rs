@@ -418,12 +418,21 @@ async fn cursor_about(
     installation: &AgentInstallation,
     options: &crate::agent::SessionOptions,
 ) -> Result<CursorAbout, AgentError> {
-    let output = tokio::process::Command::new(&installation.executable_path)
+    let mut command = tokio::process::Command::new(&installation.executable_path);
+    command
         .args(["about", "--format", "json"])
         .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(10), output).await else {
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(10), async {
+        crate::process::retry_busy(|| command.spawn())
+            .await?
+            .wait_with_output()
+            .await
+    })
+    .await
+    else {
         return Ok(CursorAbout::default());
     };
     let Ok(json) = serde_json::from_slice::<Value>(&output.stdout) else {
