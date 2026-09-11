@@ -96,8 +96,15 @@ Any other ACP agent works without a catalog entry via
 `AgentInstallation::acp(name, path, args)`.
 
 ## Docs
-**[Context7](https://context7.com/spotta85/anyagent-rs)**
 **[anyagent.mintlify.site](https://anyagent.mintlify.site)**
+
+Using an AI agent to build on anyagent? Point it at one of these:
+
+| Source | Use |
+|---|---|
+| [`docs/skill.md`](docs/skill.md) | Agent skill: drop into `.claude/skills/anyagent/SKILL.md` (or your agent's skills dir) |
+| [llms.txt](https://anyagent.mintlify.site/llms.txt) / [llms-full.txt](https://anyagent.mintlify.site/llms-full.txt) | Whole docs site as plain text |
+| [Context7](https://context7.com/spotta85/anyagent-rs) | `use context7` in Cursor, Claude Code, etc. |
 
 | Page | What it covers |
 |---|---|
