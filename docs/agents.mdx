@@ -210,6 +210,22 @@ ANYAGENT_CLAUDE_BIN=/path/to/claude cargo run --example probe
 
 Or skip discovery with `AgentInstallation::at(id, executable)`.
 
+## Windows
+
+Every catalog agent ships for Windows and every installer below puts its
+directory on `PATH`, so discovery finds them without extra configuration.
+npm installs are `.cmd` shims; discovery skips the bare bash shim next to
+them. Cursor's Windows installer is `irm 'https://cursor.com/install?win32=true' | iex`.
+
+| Agent | Installed via | Found at |
+|---|---|---|
+| Claude Code | native installer | `%USERPROFILE%\.local\bin\claude.exe` |
+| Codex, Grok, pi, Qwen Code, opencode | npm | `%APPDATA%\npm\<cli>.cmd` |
+| Antigravity | `agy install` | `%LOCALAPPDATA%\agy\bin\agy.exe` |
+| Cursor CLI | installer | `%LOCALAPPDATA%\cursor-agent\cursor-agent.cmd` |
+| Hermes Agent | installer | `%LOCALAPPDATA%\hermes\bin\hermes.exe` |
+| Kiro CLI | installer | `%LOCALAPPDATA%\Kiro-Cli\kiro-cli.exe` |
+
 ## Several logins of the same agent
 
 ```rust

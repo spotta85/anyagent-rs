@@ -488,7 +488,7 @@ pub(crate) fn auth_hinted(
     }
     // An ACP upgrade has no login of its own: the base CLI's is the flow.
     let exe = match &profile.upgrade {
-        Some(u) if exe.file_name().is_some_and(|n| n == u.cli) => Path::new(profile.cli),
+        Some(u) if crate::discovery::is_named(exe, u.cli) => Path::new(profile.cli),
         _ => exe,
     };
     let mut login = crate::discovery::login_methods(profile, exe);

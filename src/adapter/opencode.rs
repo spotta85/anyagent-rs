@@ -116,8 +116,24 @@ struct Launched {
 }
 
 /// Spawns the server, waits for health, subscribes to the event bus, binds
-/// the session, and reads the catalogs behind the advertised options.
+/// the session, and reads the catalogs behind the advertised options. A
+/// squatter on the picked port (the pick-then-bind race) kills the server at
+/// once with EADDRINUSE; that gets a fresh port, up to three tries.
 async fn launch(
+    request: &ConnectRequest,
+    recorder: Option<WireRecorder>,
+) -> Result<Launched, AgentError> {
+    for _ in 0..2 {
+        match launch_once(request, recorder.clone()).await {
+            Err(AgentError::ProcessExited { stderr, .. }) if stderr.contains("EADDRINUSE") => {}
+            outcome => return outcome,
+        }
+    }
+    launch_once(request, recorder).await
+}
+
+/// One try at `launch`, on one freshly picked port.
+async fn launch_once(
     request: &ConnectRequest,
     recorder: Option<WireRecorder>,
 ) -> Result<Launched, AgentError> {
@@ -149,16 +165,20 @@ async fn launch(
             handshake(&http, request, recorder, version).await?;
         Ok((frames, info, session_id, windows, variants))
     };
-    let outcome = tokio::time::timeout(HANDSHAKE_TIMEOUT, boot).await;
     // A squatter on the picked port (the pick-then-bind race) makes opencode
-    // exit at once, so whoever answered above was not our server.
+    // exit at once: the boot races that death so it costs no handshake
+    // timeout, and whoever answered the health poll was not our server.
+    let outcome = tokio::select! {
+        outcome = tokio::time::timeout(HANDSHAKE_TIMEOUT, boot) => Some(outcome),
+        _ = exited(&mut server) => None,
+    };
     if !server.is_running() {
         let status = server.exit_status(CLOSE_GRACE).await;
         let stderr = server.stderr_tail();
         return Err(AgentError::ProcessExited { status, stderr });
     }
     match outcome {
-        Ok(Ok((frames, info, session_id, windows, variants))) => Ok(Launched {
+        Some(Ok(Ok((frames, info, session_id, windows, variants)))) => Ok(Launched {
             server,
             http,
             frames,
@@ -167,15 +187,24 @@ async fn launch(
             windows,
             variants,
         }),
-        Ok(Err(e)) => {
+        Some(Ok(Err(e))) => {
             let e = crate::adapter::with_stderr(e, &server);
             server.shutdown(CLOSE_GRACE).await;
             Err(e)
         }
-        Err(_) => {
+        // `None` never gets here: a dead server returned above.
+        _ => {
             server.shutdown(CLOSE_GRACE).await;
             Err(AgentError::HandshakeTimeout)
         }
+    }
+}
+
+/// Resolves once the server process is gone. Polled: a death shows in
+/// `try_wait`, not on the HTTP port the boot is watching.
+async fn exited(server: &mut process::Child) {
+    while server.is_running() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 

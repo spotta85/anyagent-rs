@@ -21,9 +21,7 @@ pub(crate) async fn discover(profiles: &[AgentProfile]) -> DiscoveryReport {
     if profiles.is_empty() {
         return report;
     }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    let home = std::env::home_dir().unwrap_or_default();
     let path = std::env::var("PATH").ok();
     let login = login_shell_path().await;
     let scans = profiles
@@ -99,7 +97,7 @@ fn resolve_upgrade(
         upgrade
             .extra_paths
             .iter()
-            .map(|extra| (home.join(extra), InstallationSource::KnownLocation)),
+            .map(|extra| (under(home, extra), InstallationSource::KnownLocation)),
     );
     match resolve(upgrade.cli, &dirs) {
         Some((exe, source)) => Ok((
@@ -165,11 +163,28 @@ fn search_dirs(
         let dir = if dir.is_absolute() {
             dir.to_owned()
         } else {
-            home.join(dir)
+            under(home, extra)
         };
         add(dir, InstallationSource::KnownLocation);
     }
     dirs
+}
+
+/// Suffixes an executable can carry, in preference order. Windows installs
+/// are `.exe` (native) or `.cmd` / `.bat` shims (npm); the bare file there
+/// is a bash shim that cannot be spawned.
+#[cfg(unix)]
+const EXE_SUFFIXES: &[&str] = &[""];
+#[cfg(windows)]
+const EXE_SUFFIXES: &[&str] = &[".exe", ".cmd", ".bat"];
+
+/// Whether `path` is the executable named `cli`, suffix or not: an npm
+/// install of `agy_acp_server.par` is `agy_acp_server.par.cmd` on windows.
+pub(crate) fn is_named(path: &Path, cli: &str) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|name| name.strip_prefix(cli))
+        .is_some_and(|suffix| EXE_SUFFIXES.contains(&suffix))
 }
 
 /// First search dir that holds the executable.
@@ -178,30 +193,39 @@ fn resolve(
     dirs: &[(PathBuf, InstallationSource)],
 ) -> Option<(PathBuf, InstallationSource)> {
     dirs.iter().find_map(|(dir, source)| {
-        let exe = dir.join(cli);
-        is_executable(&exe).then(|| (exe, source.clone()))
+        EXE_SUFFIXES.iter().find_map(|suffix| {
+            let exe = dir.join(format!("{cli}{suffix}"));
+            is_executable(&exe).then(|| (exe, source.clone()))
+        })
     })
+}
+
+/// `home` plus a `/`-separated relative path, one component at a time, so
+/// the result carries the platform's own separator throughout.
+fn under(home: &Path, rel: &str) -> PathBuf {
+    rel.split('/')
+        .fold(home.to_path_buf(), |path, part| path.join(part))
 }
 
 /// Bin dirs of the common Node version managers, newest version first.
 fn version_manager_dirs(home: &Path) -> Vec<PathBuf> {
     let mut dirs = vec![
-        home.join(".volta/bin"),
-        home.join(".bun/bin"),
-        home.join(".local/share/pnpm"),
-        home.join("Library/pnpm"),
-        home.join(".npm-global/bin"),
+        under(home, ".volta/bin"),
+        under(home, ".bun/bin"),
+        under(home, ".local/share/pnpm"),
+        under(home, "Library/pnpm"),
+        under(home, ".npm-global/bin"),
     ];
     dirs.extend(versions_newest_first(
-        &home.join(".nvm/versions/node"),
+        &under(home, ".nvm/versions/node"),
         "bin",
     ));
     dirs.extend(versions_newest_first(
-        &home.join(".local/share/fnm/node-versions"),
+        &under(home, ".local/share/fnm/node-versions"),
         "installation/bin",
     ));
     dirs.extend(versions_newest_first(
-        &home.join("Library/Application Support/fnm/node-versions"),
+        &under(home, "Library/Application Support/fnm/node-versions"),
         "installation/bin",
     ));
     dirs
@@ -219,7 +243,7 @@ fn versions_newest_first(root: &Path, suffix: &str) -> Vec<PathBuf> {
     versions.sort_by(|a, b| b.0.cmp(&a.0));
     versions
         .into_iter()
-        .map(|(_, path)| path.join(suffix))
+        .map(|(_, path)| under(&path, suffix))
         .collect()
 }
 
@@ -231,12 +255,9 @@ fn version_key(name: &str) -> Vec<u64> {
         .collect()
 }
 
-/// The non-empty directories of a PATH string.
+/// The directories of a PATH string, empty ones included (callers filter).
 fn split_path(path: Option<&str>) -> impl Iterator<Item = PathBuf> + '_ {
-    path.unwrap_or_default()
-        .split(':')
-        .filter(|dir| !dir.is_empty())
-        .map(PathBuf::from)
+    std::env::split_paths(path.unwrap_or_default())
 }
 
 /// A regular file with an execute bit (any file on non-unix).
@@ -294,6 +315,7 @@ pub(crate) fn login_methods(profile: &AgentProfile, exe: &Path) -> Vec<LoginMeth
 mod tests {
     use super::*;
     use crate::catalog::Connection;
+    use crate::testutil::stub;
 
     fn profile() -> AgentProfile {
         AgentProfile {
@@ -313,21 +335,17 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
-    fn install(dir: &Path, name: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::create_dir_all(dir).unwrap();
-        let exe = dir.join(name);
-        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
-        exe
-    }
-
     /// search_dirs follows PATH > LoginShellPath > VersionManager > KnownLocation > extra_paths order.
     #[test]
     fn search_follows_the_resolution_order() {
         let home = Path::new("/h");
-        let dirs = search_dirs(&profile(), home, Some("/a:/b"), Some("/b:/c"));
+        let path = |dirs: [&str; 2]| std::env::join_paths(dirs).unwrap().into_string().unwrap();
+        let dirs = search_dirs(
+            &profile(),
+            home,
+            Some(&path(["/a", "/b"])),
+            Some(&path(["/b", "/c"])),
+        );
         let find = |path: &str| {
             dirs.iter()
                 .position(|(dir, _)| dir == Path::new(path))
@@ -349,16 +367,15 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     /// Resolves newest version-manager install (v20.1.0 over v9.9.9).
     #[test]
     fn resolves_the_newest_version_manager_install() {
         let home = tempfile::tempdir().unwrap();
-        install(
+        stub(
             &home.path().join(".nvm/versions/node/v9.9.9/bin"),
             "fake-agent",
         );
-        let newest = install(
+        let newest = stub(
             &home.path().join(".nvm/versions/node/v20.1.0/bin"),
             "fake-agent",
         );

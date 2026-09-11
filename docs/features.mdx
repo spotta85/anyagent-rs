@@ -37,6 +37,12 @@ let agent = report.require("claude")?;   // AgentError::NotInstalled if absent
 or `probe_auth` asks the agent.
 **Gates:** none. Call `runtime.prewarm()` at startup to scan early.
 
+**Not found?** `MissingAgent.searched` lists every directory that was checked,
+so an app can show it and offer a file picker. A user with an unusual install
+sets `ANYAGENT_<AGENT>_BIN` (see [Agents](/agents#pointing-at-a-specific-binary)).
+An installer that edits the user's `PATH` is invisible to an app that is
+already running: say "installed? restart the app", not "not found".
+
 Some agents have a richer, separately installed runtime (Antigravity's ACP
 server). When only the base CLI is found, `agent.upgrade` names what to
 install for more capabilities.

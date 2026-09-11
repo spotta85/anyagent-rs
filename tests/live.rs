@@ -14,8 +14,6 @@
 //! it hung at. Model-output flakes (wrong word from a weak model) are the
 //! operator's judgment call; structural failures fail hard.
 
-#![cfg(unix)]
-
 use std::num::NonZeroU32;
 use std::time::Duration;
 
@@ -42,7 +40,7 @@ const HARNESSES: &[&str] = &[
     "qwen",
 ];
 const EVENT_TIMEOUT: Duration = Duration::from_secs(120);
-const OPENCODE_MODEL: &str = "opencode/big-pickle";
+const OPENCODE_MODEL: &str = "opencode/muse-spark-1.2-contributor-free";
 /// The host config's default (`gpt-6-astra`) needs a newer CLI; luna is cheap and available.
 const CODEX_MODEL: &str = "gpt-5.6-luna";
 /// pi's model values are `provider/modelId`.
@@ -109,17 +107,19 @@ async fn build_roster() -> Roster {
     let selected: Vec<&'static str> = HARNESSES
         .iter()
         .copied()
-        .filter(|h| list == "all" || list.split(',').any(|p| p.trim() == *h))
+        .filter(|h| list.trim() == "all" || list.split(',').any(|p| p.trim() == *h))
         .collect();
 
     let report = Runtime::new().discover().await;
     // The CLI is always `agy`; the upgrade is the server binary. Checking
     // the name also covers ANYAGENT_ANTIGRAVITY_BIN pinning the CLI while
-    // the server is installed.
+    // the server is installed. The stem, not the name: windows installs it
+    // as `agy.exe`, and the server as `agy_acp_server.par`, which keeps its
+    // own stem either way.
     let _ = HEADLESS_AGY.set(
         report
             .require("antigravity")
-            .map(|a| a.executable_path.file_name().is_some_and(|n| n == "agy"))
+            .map(|a| a.executable_path.file_stem().is_some_and(|n| n == "agy"))
             .unwrap_or(false),
     );
     let mut installed = Vec::new();
@@ -1548,7 +1548,8 @@ async fn runtime_plan_usage_probes_without_a_session() {
     }
 }
 
-/// Killed (-9) agent maps to TurnEnded(Failed) + ProcessExited(status 9) and closes the session.
+/// Killed agent maps to TurnEnded(Failed) + ProcessExited(`KILLED_STATUS`)
+/// and closes the session.
 #[tokio::test]
 #[ignore = "live: talks to real agents"]
 async fn a_killed_agent_fails_the_turn_and_closes_the_session() {
@@ -1575,7 +1576,7 @@ async fn a_killed_agent_fails_the_turn_and_closes_the_session() {
                     let AgentError::ProcessExited { status, .. } = &error else {
                         panic!("{h}: stream error was {error}");
                     };
-                    assert!(status.contains('9'), "{h}: status was {status:?}");
+                    assert!(status.contains(KILLED_STATUS), "{h}: status was {status:?}");
                 }
                 Ok(None) => break,
                 Err(_) => panic!("{h}: hung after kill"),
@@ -1850,8 +1851,9 @@ async fn expect_cancelled(events: &mut Events, step: &str) {
 /// Asserts no turn traffic arrives for `secs` seconds. Diagnostics (kiro
 /// emits metadata notifications between turns), plan-usage receipts
 /// (claude fetches usage after each result frame, so the receipt lands
-/// post-turn by design), and status flips (a turn end is followed by
-/// `StatusChanged(Idle)`) are the sanctioned out-of-turn events.
+/// post-turn by design), status flips (a turn end is followed by
+/// `StatusChanged(Idle)`), and session updates (agents title a thread
+/// asynchronously after the first turn) are the sanctioned out-of-turn events.
 async fn quiet(events: &mut Events, secs: u64, step: &str) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
     while let Ok(Some(event)) = tokio::time::timeout_at(deadline, events.next()).await {
@@ -1860,14 +1862,30 @@ async fn quiet(events: &mut Events, secs: u64, step: &str) {
             kind,
             Ok(EventKind::Diagnostic(_)
                 | EventKind::PlanUsageUpdated(_)
-                | EventKind::StatusChanged(_))
+                | EventKind::StatusChanged(_)
+                | EventKind::SessionUpdated(_))
         ) {
             panic!("expected quiet at {step}, got {kind:?}");
         }
     }
 }
 
-/// kill -9 the session's own agent process, found by a session-unique marker.
+/// How an outright kill shows up in the exit status: the signal on unix, the
+/// exit code taskkill gives the process it terminates on windows.
+#[cfg(unix)]
+const KILLED_STATUS: &str = "9";
+#[cfg(windows)]
+const KILLED_STATUS: &str = "exit status: 1";
+
+/// How the kill finds pi: unix pi overwrites its argv with its process title,
+/// so only the exact name is left; windows has no title, so the npm shim's
+/// node leaf keeps its command line.
+#[cfg(unix)]
+const PI_MATCH: (&[&str], &str) = (&["-n", "-x"], "pi");
+#[cfg(windows)]
+const PI_MATCH: (&[&str], &str) = (&["-n", "-f"], r#"pi-coding-agent.*cli\.js"? --mode rpc"#);
+
+/// Kills the session's own agent process, found by a session-unique marker.
 fn kill_child(harness: &str, session: &Session) {
     // claude carries our minted session id in argv; opencode is matched by
     // its newest `opencode serve` process.
@@ -1880,34 +1898,44 @@ fn kill_child(harness: &str, session: &Session) {
         // worker that inherits the pipes — killing only the dispatcher lets
         // the turn complete. Anchored so the user's Kiro apps' own
         // `kiro-cli acp --agent <name>` processes never match.
-        "kiro" => (&["-f"], "kiro-cli(-chat)? acp$".to_owned()),
+        // Windows has no `-chat` worker, and Command quotes the exe path:
+        // `"...\kiro-cli.exe" acp`.
+        "kiro" => (&["-f"], r#"kiro-cli(-chat)?(\.exe)?"? acp$"#.to_owned()),
         // The launcher script execs node under its own name; the user's
         // own TUI never ends in `acp`.
-        "cursor" => (&["-n", "-f"], "cursor-agent .*index.js acp$".to_owned()),
-        "codex" => (&["-n", "-f"], "codex app-server".to_owned()),
+        // On windows the launcher is a .cmd -> .ps1 -> node chain, and the
+        // node leaf carries `cursor-agent\versions\...` -- a path separator
+        // where unix has a space.
+        "cursor" => (&["-n", "-f"], r"cursor-agent.*index\.js acp$".to_owned()),
+        // The npm shim runs cmd -> node -> codex.exe, so the real agent is
+        // the leaf: `codex.exe app-server` there, plain `codex app-server`
+        // on unix. The node and cmd links carry `.js"`/`.cmd"` instead.
+        "codex" => (&["-n", "-f"], r"codex(\.exe)? app-server".to_owned()),
         // The user's own grok TUI never runs `agent ... stdio`.
-        "grok" => (&["-n", "-f"], "grok --no-auto-update agent".to_owned()),
+        "grok" => (
+            &["-n", "-f"],
+            r#"grok(\.exe)?"? --no-auto-update agent"#.to_owned(),
+        ),
         // The npm shim runs node -> cli.js, which re-execs itself as a
         // worker inheriting the pipes: both halves, as with kiro. The
         // user's own TUI has no `--experimental-acp`.
-        "qwen" => (&["-f"], r"qwen-code/cli\.js --experimental-acp$".to_owned()),
-        // pi overwrites its argv with its own process title, so there is no
-        // command line to match: the exact name plus newest-first is ours.
-        "pi" => (&["-n", "-x"], "pi".to_owned()),
+        "qwen" => (
+            &["-f"],
+            r"qwen-code[/\\]cli\.js --experimental-acp$".to_owned(),
+        ),
+        "pi" => (PI_MATCH.0, PI_MATCH.1.to_owned()),
         // The CLI's wire flag, or the ACP server's own executable name.
+        // Windows spawns the CLI as `"...\agy.exe" --input-format=...`.
         "antigravity" => (
             &["-n", "-f"],
-            "agy( --input-format=stream-json|_acp_server)".to_owned(),
+            r#"agy(\.exe)?"?( --input-format=stream-json|_acp_server)"#.to_owned(),
         ),
-        _ => (&["-n", "-f"], "opencode serve".to_owned()),
+        // The npm shim leaves one opencode.exe, whose command line quotes the
+        // exe and pads before the argument: `opencode.exe"    serve`.
+        _ => (&["-n", "-f"], r#"opencode(\.exe)?"? +serve"#.to_owned()),
     };
-    let out = std::process::Command::new("pgrep")
-        .args(args)
-        .arg(&pattern)
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let pids: Vec<&str> = stdout.lines().collect();
+    let pids = matching_pids(args, &pattern);
+    let pids: Vec<&str> = pids.iter().map(String::as_str).collect();
     if pids.is_empty() {
         panic!("{harness}: no process matched {pattern:?}");
     }
@@ -1918,11 +1946,71 @@ fn kill_child(harness: &str, session: &Session) {
         vec![*pids.last().unwrap()]
     };
     for pid in last {
-        std::process::Command::new("kill")
-            .args(["-9", pid])
-            .status()
-            .unwrap();
+        kill_pid(pid);
     }
+}
+
+/// Pids matching `pattern`, oldest first: `-x` matches the executable name
+/// exactly, anything else the full command line, and `-n` keeps the newest.
+#[cfg(unix)]
+fn matching_pids(args: &[&str], pattern: &str) -> Vec<String> {
+    let out = std::process::Command::new("pgrep")
+        .args(args)
+        .arg(pattern)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[cfg(windows)]
+fn matching_pids(args: &[&str], pattern: &str) -> Vec<String> {
+    let test = if args.contains(&"-x") {
+        "($_.Name -replace '\\.exe$', '') -eq $p"
+    } else {
+        "$_.CommandLine -match $p"
+    };
+    let newest = if args.contains(&"-n") {
+        "| Select-Object -Last 1"
+    } else {
+        ""
+    };
+    // The pattern rides an env var: inlined, it would appear in this very
+    // query's own command line, which then matches itself.
+    let script = format!(
+        "$p = $env:ANYAGENT_KILL_PATTERN; Get-CimInstance Win32_Process \
+         | Where-Object {{ {test} }} | Sort-Object CreationDate \
+         | Select-Object -ExpandProperty ProcessId {newest}"
+    );
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .env("ANYAGENT_KILL_PATTERN", pattern)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|line| line.trim().to_owned())
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+/// Kills one pid outright, leaving any children of its own alone.
+#[cfg(unix)]
+fn kill_pid(pid: &str) {
+    std::process::Command::new("kill")
+        .args(["-9", pid])
+        .status()
+        .unwrap();
+}
+
+#[cfg(windows)]
+fn kill_pid(pid: &str) {
+    std::process::Command::new("taskkill")
+        .args(["/F", "/PID", pid])
+        .status()
+        .unwrap();
 }
 
 fn allow() -> Answer {
@@ -1959,8 +2047,8 @@ fn claude_transcripts() -> std::collections::BTreeSet<std::path::PathBuf> {
     let mut found = std::collections::BTreeSet::new();
     let home = match std::env::var_os("CLAUDE_CONFIG_DIR") {
         Some(dir) => std::path::PathBuf::from(dir),
-        None => match std::env::var_os("HOME") {
-            Some(home) => std::path::PathBuf::from(home).join(".claude"),
+        None => match std::env::home_dir() {
+            Some(home) => home.join(".claude"),
             None => return found,
         },
     };

@@ -2,8 +2,6 @@
 //! against the fixture agent (tests/fixtures/pi/fixture.mjs; needs `node`).
 //! A wrapper script pins the catalog's `pi` id to the fixture.
 
-#![cfg(unix)]
-
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -15,24 +13,12 @@ use anyagent::{
     ResumeToken, Runtime, Session, SessionOptions, StopReason, ToolInput, ToolKind, ToolStatus,
 };
 
+mod common;
+
 /// A `pi` stand-in: a script that execs the fixture with scenario flags,
 /// ignoring the real launch args appended after them.
 fn wrapper(name: &str, flags: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi/fixture.mjs");
-    let dir = std::env::temp_dir().join(format!("anyagent-pi-{name}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("pi");
-    std::fs::write(
-        &path,
-        format!(
-            "#!/bin/sh\nexec node {} {flags} \"$@\"\n",
-            fixture.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
+    common::wrapper("pi", "pi", name, flags)
 }
 
 async fn open_with(
@@ -195,7 +181,7 @@ async fn handshake_advertises_state_models_levels_and_commands() {
     assert!(
         info.resume_token
             .as_ref()
-            .is_some_and(|t| t.as_str().ends_with("sessions/s1.jsonl")),
+            .is_some_and(|t| Path::new(t.as_str()).ends_with("sessions/s1.jsonl")),
         "{:?}",
         info.resume_token
     );
@@ -573,7 +559,7 @@ async fn resume_binds_the_session_file_and_config_home_reaches_the_child() {
     let (session, _events) = open_with("home", "", options).await.unwrap();
     assert_eq!(
         session.info().resume_token.map(|t| t.as_str().to_owned()),
-        Some(dir.join("sessions/s1.jsonl").display().to_string())
+        Some(dir.join("sessions").join("s1.jsonl").display().to_string())
     );
 }
 

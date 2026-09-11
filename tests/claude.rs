@@ -2,8 +2,6 @@
 //! against the fixture agent (tests/fixtures/claude/fixture.mjs; needs `node`).
 //! A wrapper script pins the catalog's `claude` id to the fixture.
 
-#![cfg(unix)]
-
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -15,6 +13,8 @@ use anyagent::{
     PermissionChoice, PlanStatus, QuestionAnswer, Request, RollbackScope, Runtime, Session,
     SessionOptions, StopReason, ToolKind, ToolStatus, TurnOrigin,
 };
+
+mod common;
 
 /// A temp dir holding one inlineable png, one pdf, and nothing else.
 fn attachment_dir(name: &str) -> PathBuf {
@@ -28,21 +28,7 @@ fn attachment_dir(name: &str) -> PathBuf {
 /// A `claude` stand-in: a script that execs the fixture with scenario flags,
 /// ignoring the real launch flags appended after them.
 fn wrapper(name: &str, flags: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude/fixture.mjs");
-    let dir = std::env::temp_dir().join(format!("anyagent-claude-{name}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("claude");
-    std::fs::write(
-        &path,
-        format!(
-            "#!/bin/sh\nexec node {} {flags} \"$@\"\n",
-            fixture.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
+    common::wrapper("claude", "claude", name, flags)
 }
 
 async fn open(name: &str, flags: &str) -> (Session, Events) {

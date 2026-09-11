@@ -2,10 +2,8 @@
 //! interface, against the fixture server (tests/fixtures/opencode/fixture.mjs;
 //! needs `node`). A wrapper script pins the catalog's `opencode` id to it.
 
-#![cfg(unix)]
-
 use std::num::NonZeroU32;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -17,24 +15,12 @@ use anyagent::{
     TurnOrigin,
 };
 
+mod common;
+
 /// An `opencode` stand-in: a script that execs the fixture with scenario
 /// flags, then the real `serve --hostname … --port N` args.
 fn wrapper(name: &str, flags: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/opencode/fixture.mjs");
-    let dir = std::env::temp_dir().join(format!("anyagent-opencode-{name}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("opencode");
-    std::fs::write(
-        &path,
-        format!(
-            "#!/bin/sh\nexec node {} {flags} \"$@\"\n",
-            fixture.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
+    common::wrapper("opencode", "opencode", name, flags)
 }
 
 async fn open_with(
@@ -150,6 +136,30 @@ async fn the_handshake_fills_details() {
     assert_eq!(info.title, None, "the dated placeholder is not a title");
     assert_eq!(info.resume_token.unwrap().as_str(), "ses_1");
     session.close().await.unwrap();
+}
+
+/// A squatted port (the fixture dies with EADDRINUSE) is retried on a fresh
+/// port at once, not after a handshake timeout: three tries fail in seconds.
+#[tokio::test]
+async fn a_squatted_port_is_retried_without_waiting_for_the_handshake() {
+    let start = std::time::Instant::now();
+    let err = open_with(
+        "squat",
+        "--port-taken",
+        SessionOptions::in_dir(std::env::temp_dir()),
+    )
+    .await
+    .err()
+    .expect("three squatted ports fail");
+    assert!(
+        matches!(&err, AgentError::ProcessExited { stderr, .. } if stderr.contains("EADDRINUSE")),
+        "{err:?}"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "took {:?}",
+        start.elapsed()
+    );
 }
 
 /// No connected provider is the one honest logged-out; the session still opens.
