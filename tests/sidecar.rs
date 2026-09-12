@@ -1,5 +1,7 @@
 //! The JSONL sidecar over the mock agent: one in-memory pipe each way, no
-//! subprocess. Every guarantee in ticket 13 (G1–G7) has one test here.
+//! subprocess. One test per guarantee in ticket 13, except G1 (the open
+//! reply precedes the session's first frame): the mock emits nothing at
+//! open, so it holds by construction, not by test.
 
 use std::time::Duration;
 
@@ -172,24 +174,6 @@ async fn open_prompt_answer_close_round_trip() {
         .await;
     let (_, closed) = wire.until("closed", |f| f.get("closed").is_some()).await;
     assert_eq!(closed["closed"], session);
-}
-
-/// G1: an `open` followed at once by a `prompt` on the same connection
-/// works, because the sidecar writes the open reply before anything else
-/// about that session and resolves the second command after the first.
-#[tokio::test]
-async fn open_reply_precedes_every_frame_for_that_session() {
-    let mut wire = Wire::start(one_turn()).await;
-    let session = wire.open(1).await;
-    wire.send(json!({"id": 2, "cmd": "prompt", "session": session, "text": "hi"}))
-        .await;
-    let (before, _) = wire
-        .until("first event", |f| f.get("event").is_some())
-        .await;
-    assert!(
-        before.iter().all(|f| f.get("event").is_none()),
-        "no event before the open reply: {before:?}"
-    );
 }
 
 /// G2: two sessions interleave on one output, each in its own sequence

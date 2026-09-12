@@ -11,12 +11,9 @@
 //! out  {"closed": "s1"}                                         the stream ended
 //! ```
 //!
-//! Commands map one to one onto `Runtime` and `Session`. Events are the
-//! crate's own serialization, unchanged. Guarantees: the `open` reply is
-//! written before any frame for that session; frames for one session keep
-//! the crate's `sequence` order; a stream error is followed by `closed`;
-//! EOF on the input closes every session before `serve` returns; a bad
-//! line gets a `BadFrame` error and the loop continues.
+//! Commands map one to one onto `Runtime` and `Session`; events are the
+//! crate's own serialization, unchanged. The `open` reply always precedes
+//! that session's first frame, and EOF on the input closes every session.
 
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU32;
@@ -28,7 +25,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 
 use crate::{
     AgentError, AgentInstallation, Answer, ConfigId, ConfigValue, DiscoveryReport, Events, Input,
@@ -67,8 +63,7 @@ pub async fn serve(
                     // The open reply goes out before the first event.
                     let _ = out.send(reply_line(id, ok)).await;
                     if let Some((session, events)) = forward {
-                        let task = tokio::spawn(forward_events(session, events, out));
-                        state.forwarders.lock().unwrap().push(task);
+                        tokio::spawn(forward_events(session, events, out));
                     }
                 }
                 Err(fail) => {
@@ -77,10 +72,102 @@ pub async fn serve(
             }
         });
     }
+    // Each forwarder holds a sender, so the writer drains until the last
+    // `closed` is written.
     state.close_all().await;
     drop(out);
     let _ = writer.await;
     Ok(())
+}
+
+/// Dispatches one command to the crate.
+async fn handle(state: &State, cmd: Cmd) -> Result<Reply, Fail> {
+    match cmd {
+        Cmd::Discover => {
+            let report = state.runtime.discover().await;
+            let reply = Reply::ok(&report);
+            *state.report.lock().unwrap() = Some(report);
+            reply
+        }
+        Cmd::Probe { agent } => {
+            let agent = state.resolve(agent).await?;
+            Reply::ok(state.runtime.probe(&agent).await?)
+        }
+        Cmd::PlanUsage { agent } => {
+            let agent = state.resolve(agent).await?;
+            Reply::ok(state.runtime.plan_usage(&agent).await?)
+        }
+        Cmd::Generate { agent, dir, prompt } => {
+            let agent = state.resolve(agent).await?;
+            let options = SessionOptions::in_dir(dir);
+            Reply::ok(state.runtime.generate(&agent, options, prompt).await?)
+        }
+        Cmd::Open {
+            agent,
+            dir,
+            options,
+        } => {
+            let agent = state.resolve(agent).await?;
+            let options = options.into_session_options(dir);
+            let (session, events) = state.runtime.open(&agent, options).await?;
+            let (id, info) = (session.id().clone(), session.info());
+            state.sessions.lock().unwrap().insert(id.clone(), session);
+            Ok(Reply {
+                ok: serde_json::to_value(info)?,
+                forward: Some((id, events)),
+            })
+        }
+        Cmd::Prompt {
+            session,
+            text,
+            attachments,
+        } => {
+            let input = attachments
+                .into_iter()
+                .fold(Input::text(text), |input, path| input.attach(path));
+            Reply::ok(state.session(&session)?.prompt(input).await?)
+        }
+        Cmd::Dequeue { session, prompt } => {
+            Reply::ok(state.session(&session)?.dequeue(prompt).await?)
+        }
+        Cmd::Answer {
+            session,
+            request,
+            answer,
+        } => Reply::ok(state.session(&session)?.answer(request, answer).await?),
+        Cmd::Configure {
+            session,
+            option,
+            value,
+        } => Reply::ok(state.session(&session)?.configure(option, value).await?),
+        Cmd::Rollback {
+            session,
+            turns,
+            scope,
+        } => Reply::ok(state.session(&session)?.rollback(turns, scope).await?),
+        Cmd::Compact { session } => Reply::ok(state.session(&session)?.compact().await?),
+        Cmd::Cancel {
+            session,
+            clear_queue,
+        } => Reply::ok(state.session(&session)?.cancel(clear_queue).await?),
+        Cmd::Info { session } => Reply::ok(state.session(&session)?.info()),
+        Cmd::Close { session } => Reply::ok(state.session(&session)?.close().await?),
+    }
+}
+
+/// Copies one session's events to the output. A stream error is written
+/// under the session's id; `closed` always follows the end of the stream.
+async fn forward_events(id: SessionId, mut events: Events, out: mpsc::Sender<String>) {
+    while let Some(event) = events.next().await {
+        let line = match event {
+            Ok(event) => json!({ "event": event }),
+            Err(e) => json!({ "session": id, "error": error_body(&e) }),
+        };
+        if out.send(line.to_string()).await.is_err() {
+            return;
+        }
+    }
+    let _ = out.send(json!({ "closed": id }).to_string()).await;
 }
 
 /// One line from the app: the id to reply to, and the command.
@@ -222,12 +309,10 @@ impl Reply {
     }
 }
 
-/// Why a command failed: the crate said so, or the sidecar could not
-/// route or encode it.
+/// Why a command failed: the crate said so, or the session id is unknown.
 enum Fail {
     Agent(AgentError),
     UnknownSession(SessionId),
-    Encode(serde_json::Error),
 }
 
 impl From<AgentError> for Fail {
@@ -236,9 +321,12 @@ impl From<AgentError> for Fail {
     }
 }
 
+/// A reply that will not encode is the crate's own protocol failure.
 impl From<serde_json::Error> for Fail {
     fn from(e: serde_json::Error) -> Self {
-        Self::Encode(e)
+        Self::Agent(AgentError::ProtocolFailed(format!(
+            "could not encode the reply: {e}"
+        )))
     }
 }
 
@@ -251,22 +339,16 @@ impl Fail {
                 "message": format!("no session {id}"),
                 "session": id,
             }),
-            Self::Encode(e) => json!({
-                "kind": "ProtocolFailed",
-                "message": format!("could not encode the reply: {e}"),
-                "detail": e.to_string(),
-            }),
         }
     }
 }
 
-/// Everything one `serve` call owns: the runtime, the last discovery, the
-/// open sessions, and the tasks copying their events out.
+/// Everything one `serve` call owns: the runtime, the last discovery, and
+/// the open sessions.
 struct State {
     runtime: Runtime,
     report: Mutex<Option<DiscoveryReport>>,
     sessions: Mutex<HashMap<SessionId, Session>>,
-    forwarders: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl State {
@@ -275,7 +357,6 @@ impl State {
             runtime,
             report: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
-            forwarders: Mutex::new(Vec::new()),
         }
     }
 
@@ -314,103 +395,11 @@ impl State {
             .ok_or_else(|| Fail::UnknownSession(id.clone()))
     }
 
-    /// Closes every session and waits until each has said `closed`.
+    /// Closes every session; each forwarder then writes its `closed`.
     async fn close_all(&self) {
         let sessions: Vec<Session> = self.sessions.lock().unwrap().values().cloned().collect();
         futures::future::join_all(sessions.iter().map(Session::close)).await;
-        let forwarders = std::mem::take(&mut *self.forwarders.lock().unwrap());
-        futures::future::join_all(forwarders).await;
     }
-}
-
-/// Dispatches one command to the crate.
-async fn handle(state: &State, cmd: Cmd) -> Result<Reply, Fail> {
-    match cmd {
-        Cmd::Discover => {
-            let report = state.runtime.discover().await;
-            let reply = Reply::ok(&report);
-            *state.report.lock().unwrap() = Some(report);
-            reply
-        }
-        Cmd::Probe { agent } => {
-            let agent = state.resolve(agent).await?;
-            Reply::ok(state.runtime.probe(&agent).await?)
-        }
-        Cmd::PlanUsage { agent } => {
-            let agent = state.resolve(agent).await?;
-            Reply::ok(state.runtime.plan_usage(&agent).await?)
-        }
-        Cmd::Generate { agent, dir, prompt } => {
-            let agent = state.resolve(agent).await?;
-            let options = SessionOptions::in_dir(dir);
-            Reply::ok(state.runtime.generate(&agent, options, prompt).await?)
-        }
-        Cmd::Open {
-            agent,
-            dir,
-            options,
-        } => {
-            let agent = state.resolve(agent).await?;
-            let options = options.into_session_options(dir);
-            let (session, events) = state.runtime.open(&agent, options).await?;
-            let (id, info) = (session.id().clone(), session.info());
-            state.sessions.lock().unwrap().insert(id.clone(), session);
-            Ok(Reply {
-                ok: serde_json::to_value(info)?,
-                forward: Some((id, events)),
-            })
-        }
-        Cmd::Prompt {
-            session,
-            text,
-            attachments,
-        } => {
-            let input = attachments
-                .into_iter()
-                .fold(Input::text(text), |input, path| input.attach(path));
-            Reply::ok(state.session(&session)?.prompt(input).await?)
-        }
-        Cmd::Dequeue { session, prompt } => {
-            Reply::ok(state.session(&session)?.dequeue(prompt).await?)
-        }
-        Cmd::Answer {
-            session,
-            request,
-            answer,
-        } => Reply::ok(state.session(&session)?.answer(request, answer).await?),
-        Cmd::Configure {
-            session,
-            option,
-            value,
-        } => Reply::ok(state.session(&session)?.configure(option, value).await?),
-        Cmd::Rollback {
-            session,
-            turns,
-            scope,
-        } => Reply::ok(state.session(&session)?.rollback(turns, scope).await?),
-        Cmd::Compact { session } => Reply::ok(state.session(&session)?.compact().await?),
-        Cmd::Cancel {
-            session,
-            clear_queue,
-        } => Reply::ok(state.session(&session)?.cancel(clear_queue).await?),
-        Cmd::Info { session } => Reply::ok(state.session(&session)?.info()),
-        Cmd::Close { session } => Reply::ok(state.session(&session)?.close().await?),
-    }
-}
-
-/// Copies one session's events to the output. A stream error is written
-/// under the session's id; `closed` always follows the end of the stream.
-async fn forward_events(id: SessionId, mut events: Events, out: mpsc::Sender<String>) {
-    while let Some(event) = events.next().await {
-        let line = match event {
-            Ok(event) => json!({ "event": event }),
-            Err(e) => json!({ "session": id, "error": error_body(&e) }),
-        };
-        if out.send(line.to_string()).await.is_err() {
-            return;
-        }
-    }
-    let _ = out.send(json!({ "closed": id }).to_string()).await;
 }
 
 /// Splits a line into its id and command. A line that is not a command
