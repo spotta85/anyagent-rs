@@ -103,6 +103,7 @@
           ]
         },
         {
+          "description": "The `SessionOptions` the wire exposes, as top-level fields of `open`\nand `generate`.",
           "type": "object",
           "properties": {
             "agent": {
@@ -113,6 +114,48 @@
             },
             "prompt": {
               "type": "string"
+            },
+            "resume": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "fork": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "fork_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "permission_mode": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/PermissionMode"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "mcp_servers": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/McpServer"
+              },
+              "default": []
+            },
+            "configure": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/ConfigValue"
+              },
+              "default": {}
             },
             "cmd": {
               "type": "string",
@@ -127,7 +170,7 @@
           ]
         },
         {
-          "description": "The `SessionOptions` the wire exposes, as top-level fields of `open`.",
+          "description": "The `SessionOptions` the wire exposes, as top-level fields of `open`\nand `generate`.",
           "type": "object",
           "properties": {
             "agent": {

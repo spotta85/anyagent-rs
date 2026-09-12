@@ -1,0 +1,3 @@
+# Release CI copies the built binary in here before npm publish.
+bin/*
+!bin/.gitkeep
