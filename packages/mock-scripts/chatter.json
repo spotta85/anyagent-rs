@@ -1,0 +1,14 @@
+{"turns": [
+  [
+    {"Emit": {"TextDelta": {"message_id": "m1", "text": "one"}}},
+    {"Emit": {"TextDelta": {"message_id": "m1", "text": "two"}}},
+    {"Emit": {"TextDelta": {"message_id": "m1", "text": "three"}}},
+    {"End": {"Completed": {"source": "Protocol"}}}
+  ],
+  [
+    {"Emit": {"TextDelta": {"message_id": "m2", "text": "one"}}},
+    {"Emit": {"TextDelta": {"message_id": "m2", "text": "two"}}},
+    {"Emit": {"TextDelta": {"message_id": "m2", "text": "three"}}},
+    {"End": {"Completed": {"source": "Protocol"}}}
+  ]
+]}

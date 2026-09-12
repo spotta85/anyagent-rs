@@ -1,0 +1,13 @@
+{"turns": [[
+  {"Emit": {"TextDelta": {"message_id": "m1", "text": "Let me check. "}}},
+  {"Emit": {"RequestOpened": {"Permission": {
+    "id": "r1",
+    "tool": {"id": "tool-1", "kind": "Execute", "title": "cargo test", "status": "Pending",
+             "input": {"Command": {"command": "cargo test", "cwd": null}},
+             "output": null, "diffs": [], "locations": [], "raw": null},
+    "options": ["AllowOnce", "DenyOnce"],
+    "detail": null}}}},
+  "AwaitAnswer",
+  {"Emit": {"TextDelta": {"message_id": "m1", "text": "Done."}}},
+  {"End": {"Completed": {"source": "Protocol"}}}
+]]}

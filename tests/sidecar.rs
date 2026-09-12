@@ -368,3 +368,68 @@ async fn events_are_the_crates_serde_output() {
         "{ended}"
     );
 }
+
+const SCRIPTS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/packages/mock-scripts");
+
+/// One of the shared wrapper scripts, parsed the way `serve --mock` does.
+fn script(name: &str) -> Script {
+    let path = format!("{SCRIPTS}/{name}.json");
+    let json = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    serde_json::from_str(&json).unwrap_or_else(|e| panic!("{path}: {e}"))
+}
+
+/// Every shared script parses, so a typo fails here and not in four wrappers.
+#[test]
+fn every_mock_script_parses() {
+    let mut count = 0;
+    for entry in std::fs::read_dir(SCRIPTS).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().and_then(|n| n.to_str());
+        if let Some(name) = name.and_then(|n| n.strip_suffix(".json")) {
+            script(name);
+            count += 1;
+        }
+    }
+    assert_eq!(count, 5, "scripts in {SCRIPTS}");
+}
+
+/// S8's script: 20 000 deltas, paced in batches, every one delivered
+/// before the turn ends.
+#[tokio::test]
+async fn the_flood_script_delivers_every_delta() {
+    let mut wire = Wire::start(script("flood")).await;
+    let session = wire.open(1).await;
+    wire.send(json!({"id": 2, "cmd": "prompt", "session": session, "text": "go"}))
+        .await;
+    let (before, _) = wire
+        .until("turn end", |f| kind_name(f) == Some("TurnEnded"))
+        .await;
+    let deltas = before
+        .iter()
+        .filter(|f| kind_name(f) == Some("TextDelta"))
+        .count();
+    assert_eq!(deltas, 20_000);
+}
+
+/// S10's script: `configure("model", "opus")` is accepted and comes back
+/// as a `SessionUpdated` carrying the new value.
+#[tokio::test]
+async fn the_configure_script_applies_the_model_option() {
+    let mut wire = Wire::start(script("configure")).await;
+    let session = wire.open(1).await;
+    wire.send(json!({"id": 2, "cmd": "configure", "session": session,
+        "option": "model", "value": "opus"}))
+        .await;
+    let (before, updated) = wire
+        .until("session updated", |f| {
+            kind_name(f) == Some("SessionUpdated")
+        })
+        .await;
+    let reply = match before.into_iter().find(|f| f["id"] == 2) {
+        Some(reply) => reply,
+        None => wire.reply(2).await,
+    };
+    assert_eq!(reply["ok"], Value::Null, "{reply}");
+    let options = &updated["event"]["kind"]["SessionUpdated"]["configuration"]["options"];
+    assert_eq!(options["model"], "opus", "{updated}");
+}

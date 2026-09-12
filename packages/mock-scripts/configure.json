@@ -1,0 +1,14 @@
+{
+  "options": [{
+    "id": "model", "name": "Model", "category": null,
+    "kind": {"Select": {"choices": [
+      {"value": "sonnet", "label": "Sonnet", "description": null},
+      {"value": "opus", "label": "Opus", "description": null}
+    ]}},
+    "current": "sonnet", "live": true
+  }],
+  "turns": [[
+    {"Emit": {"TextDelta": {"message_id": "m1", "text": "hi"}}},
+    {"End": {"Completed": {"source": "Protocol"}}}
+  ]]
+}

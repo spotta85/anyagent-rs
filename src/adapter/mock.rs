@@ -15,7 +15,8 @@ use crate::adapter::{
     Adapter, ConnectRequest, DriverCommand, DriverConnection, DriverEvent, DriverInfo,
 };
 use crate::agent::{
-    AgentDetails, AuthKind, AuthStatus, Capabilities, Capability, SessionConfiguration,
+    AgentDetails, AuthKind, AuthStatus, Capabilities, Capability, ConfigOption,
+    SessionConfiguration,
 };
 use crate::error::AgentError;
 use crate::event::{
@@ -36,12 +37,19 @@ pub enum Step {
     End(StopReason),
     /// The agent process dies here: exit status 9, then the stream ends.
     Die,
+    /// Wait this many milliseconds; paces a flood so a reader can keep up.
+    Sleep(u64),
+    /// Play `steps` this many times over.
+    Repeat {
+        times: u32,
+        steps: Vec<Step>,
+    },
 }
 
 /// What the mock agent will do, turn by turn. Deserializes from JSON with
 /// every field optional, so `anyagent serve --mock script.json` can load one.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Script {
     /// Each `StartTurn` pops the next list. An exhausted script hangs.
     pub turns: VecDeque<Vec<Step>>,
@@ -65,6 +73,8 @@ pub struct Script {
     /// Advertise compaction; `compact` then reports `ContextCompacted`.
     pub compact: bool,
     pub permissions: bool,
+    /// Advertised config options; `configure` sets one and reports it back.
+    pub options: Vec<ConfigOption>,
 }
 
 impl Default for Script {
@@ -81,6 +91,7 @@ impl Default for Script {
             stale_before_ack: None,
             compact: false,
             permissions: true,
+            options: Vec::new(),
         }
     }
 }
@@ -137,7 +148,7 @@ impl Adapter for MockAdapter {
             Arc::clone(&self.sent),
         ));
         Ok(DriverConnection {
-            info: info(&self.script),
+            info: info(&self.script, &initial_configuration(&self.script)),
             commands: cmd_tx,
             events: ev_rx,
         })
@@ -155,6 +166,7 @@ async fn drive(
     let mut steps: VecDeque<Step> = VecDeque::new();
     let mut waiting = false;
     let mut turn_open = false;
+    let mut configuration = initial_configuration(&script);
     let send = |ev: DriverEvent| {
         let events = events.clone();
         let sent = Arc::clone(&sent);
@@ -186,6 +198,21 @@ async fn drive(
                     })
                     .await;
                     return;
+                }
+                Step::Sleep(ms) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    true
+                }
+                Step::Repeat {
+                    times,
+                    steps: block,
+                } => {
+                    for _ in 0..times {
+                        for step in block.iter().rev() {
+                            steps.push_front(step.clone());
+                        }
+                    }
+                    true
                 }
             };
             if !ok {
@@ -234,14 +261,20 @@ async fn drive(
                     return;
                 }
             }
-            DriverCommand::Cancel | DriverCommand::Configure(..) | DriverCommand::Rollback(..) => {}
+            DriverCommand::Configure(id, value) => {
+                configuration.options.insert(id, value);
+                if !send(DriverEvent::InfoChanged(info(&script, &configuration))).await {
+                    return;
+                }
+            }
+            DriverCommand::Cancel | DriverCommand::Rollback(..) => {}
             DriverCommand::Close if script.ignore_close => {}
             DriverCommand::Close => return,
         }
     }
 }
 
-fn info(script: &Script) -> DriverInfo {
+fn info(script: &Script, configuration: &SessionConfiguration) -> DriverInfo {
     let mut caps = vec![Capability::Questions];
     if script.permissions {
         caps.push(Capability::Permissions);
@@ -260,10 +293,10 @@ fn info(script: &Script) -> DriverInfo {
                 account: None,
             },
             capabilities: Capabilities::new(caps),
-            config_options: Vec::new(),
+            config_options: script.options.clone(),
             commands: Vec::new(),
         },
-        configuration: SessionConfiguration::default(),
+        configuration: configuration.clone(),
         resume_token: None,
         title: None,
         deterministic_turn_end: script.deterministic,
@@ -271,6 +304,16 @@ fn info(script: &Script) -> DriverInfo {
         tools_disabled: false,
         effort_wire: None,
     }
+}
+
+/// Each option's `current` value, as the session starts.
+fn initial_configuration(script: &Script) -> SessionConfiguration {
+    let options = script
+        .options
+        .iter()
+        .filter_map(|o| Some((o.id.clone(), o.current.clone()?)))
+        .collect();
+    SessionConfiguration { options }
 }
 
 // Event builders shared with the conformance tests.
