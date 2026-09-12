@@ -361,8 +361,8 @@ live("L7 resume recalls the codeword without replaying", async () => {
 
 live("L8 a killed agent: the turn fails, the stream throws ProcessExited, then closed", async () => {
   for (const agent of await enabled()) {
-    if (!["claude", "codex"].includes(agent)) {
-      log(agent, "SKIP kill (claude and codex prove the path here; tests/live.rs covers the rest)");
+    if (!["claude", "codex"].includes(agent) || process.platform === "win32") {
+      log(agent, "SKIP kill (claude and codex on unix prove the path here; tests/live.rs covers the rest, no pgrep on windows)");
       continue;
     }
     const { rt, session, stream } = await open(agent);
