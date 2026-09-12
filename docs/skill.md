@@ -5,7 +5,7 @@ license: MIT OR Apache-2.0
 compatibility: Rust 1.88+, Tokio runtime. Agents must be installed and logged in on the machine.
 metadata:
   author: spotta85
-  version: "0.0.1"
+  version: "0.0.2"
 ---
 
 # anyagent
