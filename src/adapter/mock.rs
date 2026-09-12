@@ -24,6 +24,10 @@ use crate::event::{
     RequestId, StopReason, ToolId, ToolInput, ToolKind, ToolStatus, ToolUpdate,
 };
 
+// ---------------------------------------------------------------------------
+// PUBLIC: scripts the tests and `--mock` write
+// ---------------------------------------------------------------------------
+
 /// One scripted action inside a turn.
 #[derive(Debug, Clone, Deserialize)]
 // Test scripts favor direct event construction over per-step heap allocation.
@@ -104,6 +108,10 @@ impl Script {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ADAPTER: the scripted agent behind `Runtime::with_mock`
+// ---------------------------------------------------------------------------
+
 pub struct MockAdapter {
     script: Script,
     /// Driver events delivered so far, for backpressure assertions.
@@ -154,6 +162,10 @@ impl Adapter for MockAdapter {
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// HELPERS: play the script, report what it advertises
+// ---------------------------------------------------------------------------
 
 /// Plays steps until the script waits for an answer or runs out, then
 /// services the next engine command.
@@ -328,7 +340,9 @@ fn initial_configuration(script: &Script) -> SessionConfiguration {
     SessionConfiguration { options }
 }
 
-// Event builders shared with the conformance tests.
+// ---------------------------------------------------------------------------
+// EVENT BUILDERS: shared with the conformance tests
+// ---------------------------------------------------------------------------
 
 /// A text delta on `message`.
 pub fn text(message: &str, text: &str) -> EventKind {

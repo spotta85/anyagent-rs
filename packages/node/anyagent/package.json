@@ -3,7 +3,7 @@
   "version": "0.0.3",
   "description": "One API over the coding agents installed on a machine: Claude Code, Codex, Cursor, and more.",
   "license": "MIT OR Apache-2.0",
-  "repository": { "type": "git", "url": "https://github.com/spotta85/anyagent-rs", "directory": "packages/node/anyagent" },
+  "repository": { "type": "git", "url": "git+https://github.com/spotta85/anyagent-rs.git", "directory": "packages/node/anyagent" },
   "homepage": "https://anyagent.mintlify.site/sidecar",
   "type": "module",
   "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },

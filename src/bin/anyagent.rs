@@ -169,6 +169,10 @@ async fn chat(id: &str) -> Fallible {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// HELPERS: one agent's line, and the mock runtime
+// ---------------------------------------------------------------------------
+
 /// One agent, one line: login state, version, models, commands, capabilities.
 async fn describe(runtime: &Runtime, agent: &AgentInstallation) -> String {
     let details = match runtime.probe(agent).await {
