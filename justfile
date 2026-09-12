@@ -18,6 +18,10 @@ features:
 live harness feature='':
     ANYAGENT_LIVE={{harness}} cargo test --test live {{feature}} -- --ignored --nocapture --test-threads=1
 
+# Regenerate packages/schema.json after a wire type changes.
+schema:
+    cargo run -q --example schema --features schema > packages/schema.json
+
 # Discover installed agents and probe what each can do.
 list:
     cargo run -- list

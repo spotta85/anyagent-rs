@@ -172,6 +172,7 @@ async fn forward_events(id: SessionId, mut events: Events, out: mpsc::Sender<Str
 
 /// One line from the app: the id to reply to, and the command.
 #[derive(Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct Frame {
     id: u64,
     #[serde(flatten)]
@@ -180,6 +181,7 @@ struct Frame {
 
 /// Every command, named after the crate call it makes.
 #[derive(Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 enum Cmd {
     Discover,
@@ -243,6 +245,7 @@ enum Cmd {
 
 /// A catalog id like `"claude"`, or an ACP agent the catalog does not know.
 #[derive(Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(untagged)]
 enum AgentRef {
     Id(String),
@@ -250,6 +253,7 @@ enum AgentRef {
 }
 
 #[derive(Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct AcpSpec {
     name: String,
     path: PathBuf,
@@ -259,6 +263,7 @@ struct AcpSpec {
 
 /// The `SessionOptions` the wire exposes, as top-level fields of `open`.
 #[derive(Deserialize, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct OpenOptions {
     resume: Option<ResumeToken>,
     fork: Option<ResumeToken>,
@@ -460,4 +465,39 @@ async fn write_lines(mut output: impl AsyncWrite + Unpin, mut rx: mpsc::Receiver
             return;
         }
     }
+}
+
+/// Every wire type in one JSON schema (draft 7), so each wrapper's types
+/// come from the same file: `cargo run --example schema --features schema`.
+#[cfg(feature = "schema")]
+pub fn schema() -> schemars::Schema {
+    schemars::generate::SchemaSettings::draft07()
+        .into_generator()
+        .into_root_schema_for::<Protocol>()
+}
+
+/// The wire's entry points; each field puts one type under `definitions`.
+#[cfg(feature = "schema")]
+#[derive(schemars::JsonSchema)]
+#[allow(dead_code)]
+struct Protocol {
+    command: Frame,
+    event: crate::Event,
+    error: ErrorBody,
+    discovery: DiscoveryReport,
+    details: crate::AgentDetails,
+    plan_usage: crate::PlanUsage,
+    session_info: crate::SessionInfo,
+    delivery: crate::Delivery,
+}
+
+/// The `error` object: `kind`, `message`, and the variant's own fields.
+#[cfg(feature = "schema")]
+#[derive(schemars::JsonSchema)]
+#[allow(dead_code)]
+struct ErrorBody {
+    kind: String,
+    message: String,
+    #[serde(flatten)]
+    fields: BTreeMap<String, Value>,
 }

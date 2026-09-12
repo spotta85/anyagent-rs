@@ -1,0 +1,2304 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Protocol",
+  "description": "The wire's entry points; each field puts one type under `definitions`.",
+  "type": "object",
+  "properties": {
+    "command": {
+      "$ref": "#/definitions/Frame"
+    },
+    "event": {
+      "$ref": "#/definitions/Event"
+    },
+    "error": {
+      "$ref": "#/definitions/ErrorBody"
+    },
+    "discovery": {
+      "$ref": "#/definitions/DiscoveryReport"
+    },
+    "details": {
+      "$ref": "#/definitions/AgentDetails"
+    },
+    "plan_usage": {
+      "$ref": "#/definitions/PlanUsage"
+    },
+    "session_info": {
+      "$ref": "#/definitions/SessionInfo"
+    },
+    "delivery": {
+      "$ref": "#/definitions/Delivery"
+    }
+  },
+  "required": [
+    "command",
+    "event",
+    "error",
+    "discovery",
+    "details",
+    "plan_usage",
+    "session_info",
+    "delivery"
+  ],
+  "definitions": {
+    "Frame": {
+      "description": "One line from the app: the id to reply to, and the command.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "cmd": {
+              "type": "string",
+              "const": "discover"
+            }
+          },
+          "required": [
+            "cmd"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "agent": {
+              "$ref": "#/definitions/AgentRef"
+            },
+            "cmd": {
+              "type": "string",
+              "const": "probe"
+            }
+          },
+          "required": [
+            "cmd",
+            "agent"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "agent": {
+              "$ref": "#/definitions/AgentRef"
+            },
+            "cmd": {
+              "type": "string",
+              "const": "plan_usage"
+            }
+          },
+          "required": [
+            "cmd",
+            "agent"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "agent": {
+              "$ref": "#/definitions/AgentRef"
+            },
+            "dir": {
+              "type": "string"
+            },
+            "prompt": {
+              "type": "string"
+            },
+            "cmd": {
+              "type": "string",
+              "const": "generate"
+            }
+          },
+          "required": [
+            "cmd",
+            "agent",
+            "dir",
+            "prompt"
+          ]
+        },
+        {
+          "description": "The `SessionOptions` the wire exposes, as top-level fields of `open`.",
+          "type": "object",
+          "properties": {
+            "agent": {
+              "$ref": "#/definitions/AgentRef"
+            },
+            "dir": {
+              "type": "string"
+            },
+            "resume": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "fork": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "fork_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "permission_mode": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/PermissionMode"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "mcp_servers": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/McpServer"
+              },
+              "default": []
+            },
+            "configure": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/ConfigValue"
+              },
+              "default": {}
+            },
+            "cmd": {
+              "type": "string",
+              "const": "open"
+            }
+          },
+          "required": [
+            "cmd",
+            "agent",
+            "dir"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "session": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "attachments": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "default": []
+            },
+            "cmd": {
+              "type": "string",
+              "const": "prompt"
+            }
+          },
+          "required": [
+            "cmd",
+            "session",
+            "text"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "session": {
+              "type": "string"
+            },
+            "prompt": {
+              "type": "string"
+            },
+            "cmd": {
+              "type": "string",
+              "const": "dequeue"
+            }
+          },
+          "required": [
+            "cmd",
+            "session",
+            "prompt"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "session": {
+              "type": "string"
+            },
+            "request": {
+              "type": "string"
+            },
+            "answer": {
+              "$ref": "#/definitions/Answer"
+            },
+            "cmd": {
+              "type": "string",
+              "const": "answer"
+            }
+          },
+          "required": [
+            "cmd",
+            "session",
+            "request",
+            "answer"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "session": {
+              "type": "string"
+            },
+            "option": {
+              "type": "string"
+            },
+            "value": {
+              "$ref": "#/definitions/ConfigValue"
+            },
+            "cmd": {
+              "type": "string",
+              "const": "configure"
+            }
+          },
+          "required": [
+            "cmd",
+            "session",
+            "option",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "session": {
+              "type": "string"
+            },
+            "turns": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 1
+            },
+            "scope": {
+              "$ref": "#/definitions/RollbackScope"
+            },
+            "cmd": {
+              "type": "string",
+              "const": "rollback"
+            }
+          },
+          "required": [
+            "cmd",
+            "session",
+            "turns",
+            "scope"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "session": {
+              "type": "string"
+            },
+            "cmd": {
+              "type": "string",
+              "const": "compact"
+            }
+          },
+          "required": [
+            "cmd",
+            "session"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "session": {
+              "type": "string"
+            },
+            "clear_queue": {
+              "type": "boolean",
+              "default": false
+            },
+            "cmd": {
+              "type": "string",
+              "const": "cancel"
+            }
+          },
+          "required": [
+            "cmd",
+            "session"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "session": {
+              "type": "string"
+            },
+            "cmd": {
+              "type": "string",
+              "const": "info"
+            }
+          },
+          "required": [
+            "cmd",
+            "session"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "session": {
+              "type": "string"
+            },
+            "cmd": {
+              "type": "string",
+              "const": "close"
+            }
+          },
+          "required": [
+            "cmd",
+            "session"
+          ]
+        }
+      ]
+    },
+    "AgentRef": {
+      "description": "A catalog id like `\"claude\"`, or an ACP agent the catalog does not know.",
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "acp": {
+              "$ref": "#/definitions/AcpSpec"
+            }
+          },
+          "required": [
+            "acp"
+          ]
+        }
+      ]
+    },
+    "AcpSpec": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        }
+      },
+      "required": [
+        "name",
+        "path"
+      ]
+    },
+    "PermissionMode": {
+      "description": "How anyagent handles tool permission requests.",
+      "oneOf": [
+        {
+          "description": "Forward each request to the application.",
+          "type": "string",
+          "const": "Ask"
+        },
+        {
+          "description": "Allow each permission request once without forwarding it.",
+          "type": "string",
+          "const": "AutoApprove"
+        }
+      ]
+    },
+    "McpServer": {
+      "description": "A client-owned MCP server the agent should connect to, forwarded at open.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "connection": {
+          "$ref": "#/definitions/McpConnection"
+        }
+      },
+      "required": [
+        "name",
+        "connection"
+      ]
+    },
+    "McpConnection": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "Stdio": {
+              "type": "object",
+              "properties": {
+                "command": {
+                  "type": "string"
+                },
+                "args": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "env": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "string"
+                  }
+                }
+              },
+              "required": [
+                "command",
+                "args",
+                "env"
+              ]
+            }
+          },
+          "required": [
+            "Stdio"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Http": {
+              "type": "object",
+              "properties": {
+                "url": {
+                  "type": "string"
+                },
+                "headers": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "string"
+                  }
+                }
+              },
+              "required": [
+                "url",
+                "headers"
+              ]
+            }
+          },
+          "required": [
+            "Http"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Sse": {
+              "type": "object",
+              "properties": {
+                "url": {
+                  "type": "string"
+                },
+                "headers": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "string"
+                  }
+                }
+              },
+              "required": [
+                "url",
+                "headers"
+              ]
+            }
+          },
+          "required": [
+            "Sse"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ConfigValue": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "boolean"
+        }
+      ]
+    },
+    "Answer": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "Permission": {
+              "$ref": "#/definitions/PermissionChoice"
+            }
+          },
+          "required": [
+            "Permission"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "One entry per question, in order.",
+          "type": "object",
+          "properties": {
+            "Question": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/QuestionAnswer"
+              }
+            }
+          },
+          "required": [
+            "Question"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "PermissionChoice": {
+      "type": "string",
+      "enum": [
+        "AllowOnce",
+        "AllowAlways",
+        "DenyOnce",
+        "DenyAlways"
+      ]
+    },
+    "QuestionAnswer": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "Choices": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "Choices"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "Text"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "RollbackScope": {
+      "description": "What `rollback` rewinds: conversation context only, or also the files\nthe agent changed in the dropped turns (requires `RollbackFiles`).",
+      "type": "string",
+      "enum": [
+        "Conversation",
+        "ConversationAndFiles"
+      ]
+    },
+    "Event": {
+      "description": "One normalized event produced by anyagent.",
+      "type": "object",
+      "properties": {
+        "sequence": {
+          "description": "Starts at 1 and increases for every session event.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "occurred_at": {
+          "description": "When the engine produced this event — wall-clock, so transcripts can\nbe stored and merged without the app stamping receive time. Order\nacross events is guaranteed by `sequence`, not by this clock. A\ntranscript stored before this field existed reads as the epoch.",
+          "default": {
+            "secs_since_epoch": 0,
+            "nanos_since_epoch": 0
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/SystemTime"
+            }
+          ]
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "turn_info": {
+          "description": "Present when the event belongs to a turn.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TurnContext"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "kind": {
+          "$ref": "#/definitions/EventKind"
+        },
+        "extensions": {
+          "description": "Provider-specific data that has not been normalized.",
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "sequence",
+        "session_id",
+        "kind",
+        "extensions"
+      ]
+    },
+    "SystemTime": {
+      "type": "object",
+      "properties": {
+        "secs_since_epoch": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "nanos_since_epoch": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "secs_since_epoch",
+        "nanos_since_epoch"
+      ]
+    },
+    "TurnContext": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "parent_tool_id": {
+          "description": "Present for events produced by a subagent spawned from this tool call.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "EventKind": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "TurnStarted": {
+              "type": "object",
+              "properties": {
+                "origin": {
+                  "$ref": "#/definitions/TurnOrigin"
+                }
+              },
+              "required": [
+                "origin"
+              ]
+            }
+          },
+          "required": [
+            "TurnStarted"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "TextDelta": {
+              "type": "object",
+              "properties": {
+                "message_id": {
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "message_id",
+                "text"
+              ]
+            }
+          },
+          "required": [
+            "TextDelta"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ReasoningDelta": {
+              "type": "object",
+              "properties": {
+                "message_id": {
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "message_id",
+                "text"
+              ]
+            }
+          },
+          "required": [
+            "ReasoningDelta"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "Provider-originated user-role content, e.g. a parent agent steering\na subagent. Never a replay of the caller's own prompt.",
+          "type": "object",
+          "properties": {
+            "UserMessage": {
+              "type": "object",
+              "properties": {
+                "message_id": {
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "message_id",
+                "text"
+              ]
+            }
+          },
+          "required": [
+            "UserMessage"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "No more deltas will arrive for this message.",
+          "type": "object",
+          "properties": {
+            "MessageEnded": {
+              "type": "object",
+              "properties": {
+                "message_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "message_id"
+              ]
+            }
+          },
+          "required": [
+            "MessageEnded"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "Cumulative snapshot of one tool call: start, each change, completion.",
+          "type": "object",
+          "properties": {
+            "ToolUpdated": {
+              "$ref": "#/definitions/ToolUpdate"
+            }
+          },
+          "required": [
+            "ToolUpdated"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "Streamed output of a running command tool.",
+          "type": "object",
+          "properties": {
+            "ToolOutputDelta": {
+              "type": "object",
+              "properties": {
+                "tool_id": {
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "tool_id",
+                "text"
+              ]
+            }
+          },
+          "required": [
+            "ToolOutputDelta"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "The agent's full current task list; replaces the previous one.",
+          "type": "object",
+          "properties": {
+            "PlanUpdated": {
+              "type": "object",
+              "properties": {
+                "entries": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/PlanEntry"
+                  }
+                }
+              },
+              "required": [
+                "entries"
+              ]
+            }
+          },
+          "required": [
+            "PlanUpdated"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "RequestOpened": {
+              "$ref": "#/definitions/Request"
+            }
+          },
+          "required": [
+            "RequestOpened"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "RequestClosed": {
+              "type": "object",
+              "properties": {
+                "request_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "request_id"
+              ]
+            }
+          },
+          "required": [
+            "RequestClosed"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "SessionUpdated": {
+              "$ref": "#/definitions/SessionInfo"
+            }
+          },
+          "required": [
+            "SessionUpdated"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "The session's UI state flipped: working, needing input, or idle.\nEmitted only on change; `session.status()` answers without the stream.",
+          "type": "object",
+          "properties": {
+            "StatusChanged": {
+              "$ref": "#/definitions/SessionStatus"
+            }
+          },
+          "required": [
+            "StatusChanged"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "Context-window occupancy for this session.",
+          "type": "object",
+          "properties": {
+            "ContextUsage": {
+              "type": "object",
+              "properties": {
+                "used_tokens": {
+                  "type": "integer",
+                  "format": "uint64",
+                  "minimum": 0
+                },
+                "window_tokens": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "uint64",
+                  "minimum": 0
+                },
+                "cost_usd": {
+                  "type": [
+                    "number",
+                    "null"
+                  ],
+                  "format": "double"
+                }
+              },
+              "required": [
+                "used_tokens"
+              ]
+            }
+          },
+          "required": [
+            "ContextUsage"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "The agent compacted its context; the next `ContextUsage` drops.",
+          "type": "string",
+          "const": "ContextCompacted"
+        },
+        {
+          "description": "Plan quota for the account, pushed by the adapter.",
+          "type": "object",
+          "properties": {
+            "PlanUsageUpdated": {
+              "$ref": "#/definitions/PlanUsage"
+            }
+          },
+          "required": [
+            "PlanUsageUpdated"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Diagnostic": {
+              "$ref": "#/definitions/Diagnostic"
+            }
+          },
+          "required": [
+            "Diagnostic"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "TurnEnded": {
+              "type": "object",
+              "properties": {
+                "stop": {
+                  "$ref": "#/definitions/StopReason"
+                },
+                "background": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "required": [
+                "stop",
+                "background"
+              ]
+            }
+          },
+          "required": [
+            "TurnEnded"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "TurnOrigin": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Agent"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Prompt": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "Prompt"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ToolUpdate": {
+      "description": "Cumulative snapshot of one tool call.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/definitions/ToolKind"
+        },
+        "title": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/definitions/ToolStatus"
+        },
+        "input": {
+          "$ref": "#/definitions/ToolInput"
+        },
+        "output": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "diffs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/FileDiff"
+          }
+        },
+        "locations": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "raw": {
+          "description": "Agent's own tool name and raw input, for unknown or MCP tools.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RawTool"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "title",
+        "status",
+        "input",
+        "diffs",
+        "locations"
+      ]
+    },
+    "ToolKind": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Read",
+            "Edit",
+            "Delete",
+            "Move",
+            "Search",
+            "Execute",
+            "Fetch",
+            "Think",
+            "Other"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Mcp": {
+              "type": "object",
+              "properties": {
+                "server": {
+                  "type": "string"
+                },
+                "tool": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "server",
+                "tool"
+              ]
+            }
+          },
+          "required": [
+            "Mcp"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "Spawned a subagent; nested events carry this id in `parent_tool_id`.",
+          "type": "string",
+          "const": "Subagent"
+        }
+      ]
+    },
+    "ToolStatus": {
+      "type": "string",
+      "enum": [
+        "Pending",
+        "Running",
+        "Completed",
+        "Failed",
+        "Cancelled"
+      ]
+    },
+    "ToolInput": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "None"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "Path"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Command": {
+              "type": "object",
+              "properties": {
+                "command": {
+                  "type": "string"
+                },
+                "cwd": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "command"
+              ]
+            }
+          },
+          "required": [
+            "Command"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Pattern": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "Pattern"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "Url"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Query": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "Query"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "Text"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "FileDiff": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "old_text": {
+          "description": "`None` means a new file.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "new_text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "new_text"
+      ]
+    },
+    "RawTool": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "input": true
+      },
+      "required": [
+        "name",
+        "input"
+      ]
+    },
+    "PlanEntry": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/definitions/PlanStatus"
+        }
+      },
+      "required": [
+        "text",
+        "status"
+      ]
+    },
+    "PlanStatus": {
+      "type": "string",
+      "enum": [
+        "Pending",
+        "InProgress",
+        "Completed"
+      ]
+    },
+    "Request": {
+      "description": "Something the agent is waiting on the caller for. Answer once with\n`Session::answer`.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "Permission": {
+              "$ref": "#/definitions/PermissionRequest"
+            }
+          },
+          "required": [
+            "Permission"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Question": {
+              "$ref": "#/definitions/QuestionRequest"
+            }
+          },
+          "required": [
+            "Question"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "PermissionRequest": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "tool": {
+          "description": "The tool call awaiting approval, as the app already saw it.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ToolUpdate"
+            }
+          ]
+        },
+        "options": {
+          "description": "What the agent offers; answers outside this list are rejected.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/PermissionChoice"
+          }
+        },
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "tool",
+        "options"
+      ]
+    },
+    "QuestionRequest": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "questions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Question"
+          }
+        }
+      },
+      "required": [
+        "id",
+        "questions"
+      ]
+    },
+    "Question": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "header": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "choices": {
+          "description": "Empty means free text only.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Choice"
+          }
+        },
+        "multi_select": {
+          "type": "boolean"
+        },
+        "allows_free_text": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "text",
+        "choices",
+        "multi_select",
+        "allows_free_text"
+      ]
+    },
+    "Choice": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "label"
+      ]
+    },
+    "SessionInfo": {
+      "description": "Snapshot of a live session. Also carried by `EventKind::SessionUpdated`.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "agent": {
+          "$ref": "#/definitions/AgentInstallation"
+        },
+        "details": {
+          "$ref": "#/definitions/AgentDetails"
+        },
+        "configuration": {
+          "$ref": "#/definitions/SessionConfiguration"
+        },
+        "resume_token": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "description": "Agent-suggested title when the wire provides one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "description": "Current UI state; kept fresh by the engine.",
+          "default": "Idle",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SessionStatus"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "agent",
+        "details",
+        "configuration"
+      ]
+    },
+    "AgentInstallation": {
+      "description": "One installed agent, as returned by `Runtime::discover`.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "executable_path": {
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/definitions/InstallationSource"
+        },
+        "upgrade": {
+          "description": "A richer runtime for this agent that is not installed (Antigravity's\nACP server). `open` works without it with fewer capabilities; the\nrecord says what to install to get the rest.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MissingAgent"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acp_args": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "executable_path",
+        "source"
+      ]
+    },
+    "InstallationSource": {
+      "description": "Where discovery found an executable.",
+      "type": "string",
+      "enum": [
+        "EnvOverride",
+        "Path",
+        "LoginShellPath",
+        "VersionManager",
+        "KnownLocation",
+        "Pinned"
+      ]
+    },
+    "MissingAgent": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "searched": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "install_hint": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "searched",
+        "install_hint"
+      ]
+    },
+    "AgentDetails": {
+      "description": "What `probe` and `open` learn about an agent.",
+      "type": "object",
+      "properties": {
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "auth": {
+          "$ref": "#/definitions/AuthStatus"
+        },
+        "capabilities": {
+          "$ref": "#/definitions/Capabilities"
+        },
+        "config_options": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ConfigOption"
+          }
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SlashCommand"
+          }
+        }
+      },
+      "required": [
+        "auth",
+        "capabilities",
+        "config_options",
+        "commands"
+      ]
+    },
+    "AuthStatus": {
+      "description": "Whether, and how, an agent is logged in.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Unknown"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Authenticated": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "$ref": "#/definitions/AuthKind"
+                },
+                "account": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/definitions/AccountInfo"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "kind"
+              ]
+            }
+          },
+          "required": [
+            "Authenticated"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Unauthenticated": {
+              "type": "object",
+              "properties": {
+                "login": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/LoginMethod"
+                  }
+                }
+              },
+              "required": [
+                "login"
+              ]
+            }
+          },
+          "required": [
+            "Unauthenticated"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "AuthKind": {
+      "description": "The login kind decides which features exist (plan usage needs a subscription).",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Subscription",
+            "ApiKey",
+            "CloudProvider"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Other": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "Other"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "AccountInfo": {
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "plan": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "LoginMethod": {
+      "description": "A login method the application can show to the user.",
+      "oneOf": [
+        {
+          "description": "Run this full argv in a terminal the user can see.",
+          "type": "object",
+          "properties": {
+            "Terminal": {
+              "type": "object",
+              "properties": {
+                "command": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "env": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "string"
+                  }
+                },
+                "description": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "command",
+                "env",
+                "description"
+              ]
+            }
+          },
+          "required": [
+            "Terminal"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "Set this environment variable before `open`.",
+          "type": "object",
+          "properties": {
+            "EnvVar": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name"
+              ]
+            }
+          },
+          "required": [
+            "EnvVar"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Capabilities": {
+      "description": "Effective caller actions for one agent or session.",
+      "type": "object",
+      "properties": {
+        "features": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/definitions/Capability"
+          }
+        },
+        "mcp_transports": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/McpTransport"
+          }
+        }
+      },
+      "required": [
+        "features",
+        "mcp_transports"
+      ]
+    },
+    "Capability": {
+      "description": "Optional actions supported by an agent or session.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Images",
+            "Resume",
+            "Steer",
+            "Permissions",
+            "Questions",
+            "Rollback",
+            "Fork",
+            "SlashCommands",
+            "Plan",
+            "Subagents",
+            "ContextUsage",
+            "PlanUsage"
+          ]
+        },
+        {
+          "description": "`rollback` may also restore the files the dropped turns changed.",
+          "type": "string",
+          "const": "RollbackFiles"
+        },
+        {
+          "description": "`compact` can summarize the session's context on demand.",
+          "type": "string",
+          "const": "Compact"
+        }
+      ]
+    },
+    "McpTransport": {
+      "type": "string",
+      "enum": [
+        "Stdio",
+        "Http",
+        "Sse"
+      ]
+    },
+    "ConfigOption": {
+      "description": "A session setting the agent advertises. Well-known ids: `model`, `effort`,\n`mode`, `sandbox`, `fast` (boolean, lower latency with increased usage).",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "category": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/definitions/ConfigKind"
+        },
+        "current": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ConfigValue"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "live": {
+          "description": "Changeable through `Session::configure`; the adapter may resume internally.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "kind",
+        "live"
+      ]
+    },
+    "ConfigKind": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Boolean"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Select": {
+              "type": "object",
+              "properties": {
+                "choices": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/ConfigChoice"
+                  }
+                }
+              },
+              "required": [
+                "choices"
+              ]
+            }
+          },
+          "required": [
+            "Select"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ConfigChoice": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "value",
+        "label"
+      ]
+    },
+    "SlashCommand": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "input_hint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "description"
+      ]
+    },
+    "SessionConfiguration": {
+      "type": "object",
+      "properties": {
+        "options": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/ConfigValue"
+          }
+        }
+      },
+      "required": [
+        "options"
+      ]
+    },
+    "SessionStatus": {
+      "description": "What a UI should show for the session right now. Changes arrive as\n`EventKind::StatusChanged`; `Session::status` reads it without the stream.",
+      "oneOf": [
+        {
+          "description": "No turn running and nothing queued.",
+          "type": "string",
+          "const": "Idle"
+        },
+        {
+          "description": "A turn is running.",
+          "type": "string",
+          "const": "Working"
+        },
+        {
+          "description": "The agent is blocked on an answer to at least one open request.",
+          "type": "string",
+          "const": "NeedsInput"
+        }
+      ]
+    },
+    "PlanUsage": {
+      "description": "Plan quota windows for the logged-in account.",
+      "type": "object",
+      "properties": {
+        "plan": {
+          "description": "The plan the quota belongs to (\"max\", \"edu\"), when the agent names it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "windows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/UsageWindow"
+          }
+        },
+        "fetched_at": {
+          "$ref": "#/definitions/SystemTime"
+        }
+      },
+      "required": [
+        "windows",
+        "fetched_at"
+      ]
+    },
+    "UsageWindow": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "description": "\"Session\" (5h), \"Week\", or an agent-provided label.",
+          "type": "string"
+        },
+        "used_percent": {
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "resets_at": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SystemTime"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "label",
+        "used_percent"
+      ]
+    },
+    "Diagnostic": {
+      "type": "object",
+      "properties": {
+        "level": {
+          "$ref": "#/definitions/DiagnosticLevel"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "level",
+        "message"
+      ]
+    },
+    "DiagnosticLevel": {
+      "type": "string",
+      "enum": [
+        "Info",
+        "Warning",
+        "Error"
+      ]
+    },
+    "StopReason": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Cancelled",
+            "Refused"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Completed": {
+              "type": "object",
+              "properties": {
+                "source": {
+                  "$ref": "#/definitions/CompletionSource"
+                }
+              },
+              "required": [
+                "source"
+              ]
+            }
+          },
+          "required": [
+            "Completed"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Failed": {
+              "type": "object",
+              "properties": {
+                "message": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "message"
+              ]
+            }
+          },
+          "required": [
+            "Failed"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "CompletionSource": {
+      "oneOf": [
+        {
+          "description": "The provider protocol explicitly ended the turn.",
+          "type": "string",
+          "const": "Protocol"
+        },
+        {
+          "description": "Anyagent inferred completion after the provider went quiet.",
+          "type": "string",
+          "const": "Inferred"
+        }
+      ]
+    },
+    "ErrorBody": {
+      "description": "The `error` object: `kind`, `message`, and the variant's own fields.",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "message"
+      ],
+      "additionalProperties": true
+    },
+    "DiscoveryReport": {
+      "description": "What `discover` found and what it could not read.",
+      "type": "object",
+      "properties": {
+        "agents": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AgentInstallation"
+          }
+        },
+        "missing": {
+          "description": "Known agents that were not found, with where we looked and how to\ninstall them.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/MissingAgent"
+          }
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Diagnostic"
+          }
+        }
+      },
+      "required": [
+        "agents",
+        "missing",
+        "diagnostics"
+      ]
+    },
+    "Delivery": {
+      "description": "Immediate result of submitting a prompt.",
+      "type": "object",
+      "properties": {
+        "prompt_id": {
+          "description": "Stable across immediate delivery and later queue promotion.",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/definitions/DeliveryKind"
+        }
+      },
+      "required": [
+        "prompt_id",
+        "kind"
+      ]
+    },
+    "DeliveryKind": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "Started": {
+              "type": "object",
+              "properties": {
+                "turn_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "turn_id"
+              ]
+            }
+          },
+          "required": [
+            "Started"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Steered": {
+              "type": "object",
+              "properties": {
+                "turn_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "turn_id"
+              ]
+            }
+          },
+          "required": [
+            "Steered"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Queued": {
+              "type": "object",
+              "properties": {
+                "position": {
+                  "description": "Number of prompts ahead of this one.",
+                  "type": "integer",
+                  "format": "uint32",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "position"
+              ]
+            }
+          },
+          "required": [
+            "Queued"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

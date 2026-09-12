@@ -10,6 +10,7 @@ macro_rules! string_id {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
         #[serde(transparent)]
         pub struct $name(String);
 
@@ -45,6 +46,7 @@ string_id!(ResumeToken); // Opaque token owned by the agent.
 
 /// Where discovery found an executable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum InstallationSource {
     EnvOverride,
@@ -57,6 +59,7 @@ pub enum InstallationSource {
 
 /// One installed agent, as returned by `Runtime::discover`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AgentInstallation {
     pub id: AgentId,
     pub name: String,
@@ -101,6 +104,7 @@ impl AgentInstallation {
 
 /// Whether, and how, an agent is logged in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum AuthStatus {
     Authenticated {
@@ -115,6 +119,7 @@ pub enum AuthStatus {
 
 /// The login kind decides which features exist (plan usage needs a subscription).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum AuthKind {
     Subscription,
@@ -124,6 +129,7 @@ pub enum AuthKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AccountInfo {
     pub email: Option<String>,
     pub plan: Option<String>,
@@ -131,6 +137,7 @@ pub struct AccountInfo {
 
 /// A login method the application can show to the user.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum LoginMethod {
     /// Run this full argv in a terminal the user can see.
@@ -145,6 +152,7 @@ pub enum LoginMethod {
 
 /// Optional actions supported by an agent or session.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum Capability {
     Images,
@@ -168,12 +176,14 @@ pub enum Capability {
 /// What `rollback` rewinds: conversation context only, or also the files
 /// the agent changed in the dropped turns (requires `RollbackFiles`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum RollbackScope {
     Conversation,
     ConversationAndFiles,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum McpTransport {
     Stdio,
@@ -183,12 +193,14 @@ pub enum McpTransport {
 
 /// A client-owned MCP server the agent should connect to, forwarded at open.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct McpServer {
     pub(crate) name: String,
     pub(crate) connection: McpConnection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub(crate) enum McpConnection {
     Stdio {
@@ -268,6 +280,7 @@ impl McpServer {
 
 /// Effective caller actions for one agent or session.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Capabilities {
     features: BTreeSet<Capability>,
     pub mcp_transports: Vec<McpTransport>,
@@ -301,6 +314,7 @@ impl Capabilities {
 /// A session setting the agent advertises. Well-known ids: `model`, `effort`,
 /// `mode`, `sandbox`, `fast` (boolean, lower latency with increased usage).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ConfigOption {
     pub id: ConfigId,
     pub name: String,
@@ -312,6 +326,7 @@ pub struct ConfigOption {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum ConfigKind {
     Select { choices: Vec<ConfigChoice> },
@@ -319,6 +334,7 @@ pub enum ConfigKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ConfigChoice {
     pub value: String,
     pub label: String,
@@ -326,6 +342,7 @@ pub struct ConfigChoice {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(untagged)]
 pub enum ConfigValue {
     Text(String),
@@ -351,6 +368,7 @@ impl From<bool> for ConfigValue {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SlashCommand {
     pub name: String,
     pub description: String,
@@ -359,6 +377,7 @@ pub struct SlashCommand {
 
 /// What `probe` and `open` learn about an agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AgentDetails {
     pub version: Option<String>,
     pub auth: AuthStatus,
@@ -368,12 +387,14 @@ pub struct AgentDetails {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionConfiguration {
     pub options: BTreeMap<ConfigId, ConfigValue>,
 }
 
 /// How anyagent handles tool permission requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum PermissionMode {
     /// Forward each request to the application.
@@ -514,6 +535,7 @@ impl SessionOptions {
 
 /// One prompt: text plus optional attachments.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Input {
     pub(crate) text: String,
     pub(crate) attachments: Vec<PathBuf>,
