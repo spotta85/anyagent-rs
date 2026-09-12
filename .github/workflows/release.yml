@@ -1,0 +1,66 @@
+# Release binaries for every supported target, plus the wire schema.
+# A tag `v*` publishes a GitHub release; a pull request that touches this
+# file, or a manual run, builds everything and stops at the artifacts.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths: [".github/workflows/release.yml"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked --bin anyagent --target ${{ matrix.target }}
+      - name: Name the binary after its target
+        shell: bash
+        run: |
+          ext=""
+          [[ "${{ matrix.target }}" == *windows* ]] && ext=".exe"
+          mkdir dist
+          cp "target/${{ matrix.target }}/release/anyagent$ext" "dist/anyagent-${{ matrix.target }}$ext"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anyagent-${{ matrix.target }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: macos-latest # lipo
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Universal mac binary, schema, checksums
+        run: |
+          lipo -create dist/anyagent-x86_64-apple-darwin dist/anyagent-aarch64-apple-darwin -output dist/anyagent-macos-universal
+          cp packages/schema.json dist/schema.json
+          (cd dist && shasum -a 256 * > SHA256SUMS && cat SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: dist/*
+      - if: startsWith(github.ref, 'refs/tags/')
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
