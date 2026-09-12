@@ -31,7 +31,7 @@ the same `id` back, so several commands can be in flight.
 
 | Direction | Frame | When |
 |---|---|---|
-| out | `{"hello": {"protocol": 1, "anyagent": "0.0.2"}}` | first line |
+| out | `{"hello": {"protocol": 1, "anyagent": "0.0.3"}}` | first line |
 | in | `{"id": 1, "cmd": "open", "agent": "claude", "dir": "."}` | any command |
 | out | `{"id": 1, "ok": {..SessionInfo..}}` | the command's result |
 | out | `{"id": 1, "error": {"kind": "AuthRequired", "message": "..", "login": [..]}}` | it failed |

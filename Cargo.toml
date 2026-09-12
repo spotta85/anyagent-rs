@@ -1,6 +1,6 @@
 [package]
 name = "anyagent"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 rust-version = "1.88"
 description = "One Rust interface to the coding agents installed on a machine."
