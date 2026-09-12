@@ -24,7 +24,7 @@ API — `Runtime`, `Session`, and a stream of `Events`**.
 
 ```toml
 [dependencies]
-anyagent = "0.0.2"
+anyagent = "0.0.3"
 ```
 
 ```rust
