@@ -39,9 +39,9 @@ the same `id` back, so several commands can be in flight.
 | out | `{"session": "s1", "error": {..}}` | that session's stream failed; `closed` follows |
 | out | `{"closed": "s1"}` | that session's stream ended |
 
-Events are the crate's own serialization, unchanged: `{"kind": {"TextDelta":
-{"message_id": "m1", "text": "hi"}}}`, and a unit variant is a bare string,
-`{"kind": "ContextCompacted"}`.
+Events are the crate's own serialization, unchanged: a variant with fields is
+`{"kind": {"TextDelta": {"message_id": "m1", "text": "hi"}}}`, and a unit
+variant is a bare string, `{"kind": "ContextCompacted"}`.
 
 What the sidecar guarantees:
 
