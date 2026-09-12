@@ -7,11 +7,11 @@ postinstall) and talks to it over JSON lines. Every rule lives in the
 binary; the package is a thin, typed pipe.
 
 ```bash
-npm install anyagent
+npm install anyagent-ts
 ```
 
 ```ts
-import { Runtime, is } from "anyagent";
+import { Runtime, is } from "anyagent-ts";
 
 const rt = await Runtime.start();
 const session = await rt.open("claude", { dir: process.cwd() });

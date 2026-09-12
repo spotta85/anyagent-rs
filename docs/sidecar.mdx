@@ -109,13 +109,13 @@ echo '{"id": 1, "cmd": "discover"}' | ./target/debug/anyagent serve --mock packa
 
 | Language | Install | Status |
 |---|---|---|
-| TypeScript / Node ≥ 22.6 | `npm install anyagent` | ready; the binary comes from an `@anyagent-ts/<os>-<arch>` package, no postinstall |
+| TypeScript / Node ≥ 22.6 | `npm install anyagent-ts` | ready; the binary comes from an `@anyagent-ts/<os>-<arch>` package, no postinstall |
 | Python | `pip install anyagent` | next |
 | Swift | Swift package `Anyagent` | next |
 | Go | `go get` | next |
 
 ```ts
-import { Runtime, is } from "anyagent";
+import { Runtime, is } from "anyagent-ts";
 
 const rt = await Runtime.start();
 const session = await rt.open("claude", { dir: process.cwd() });
