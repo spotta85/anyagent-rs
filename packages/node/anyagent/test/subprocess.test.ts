@@ -165,7 +165,7 @@ test("S8b a consumer that stops reading gets ConsumerLagged, and the runtime sur
   await session.prompt("go");
   let n = 0;
   for await (const _ of session.events()) if (++n === 10) break;
-  await sleep(1500);
+  await sleep(2500); // 4096 events arrive in ~0.8 s at the flood's pace
   await rejects(until(session, "TurnEnded"), "ConsumerLagged");
   assert.equal((await rt.discover()).agents[0]!.id, "mock");
   await rt.close();
