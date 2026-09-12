@@ -290,7 +290,7 @@ function resolveBinary(bin?: string): string {
   const target = `${process.platform}-${process.arch}`;
   const exe = process.platform === "win32" ? ".exe" : "";
   try {
-    return createRequire(import.meta.url).resolve(`@anyagent/${target}/bin/anyagent${exe}`);
+    return createRequire(import.meta.url).resolve(`@anyagent-ts/${target}/bin/anyagent${exe}`);
   } catch {
     throw new Error(`no anyagent binary for ${target}: set ANYAGENT_BIN, or use one of ${TARGETS.join(", ")}`);
   }

@@ -1,5 +1,5 @@
 {
-  "name": "@anyagent/linux-x64",
+  "name": "@anyagent-ts/linux-x64",
   "version": "0.0.3",
   "description": "The anyagent binary for Linux x64. Installed by the anyagent package; do not depend on it directly.",
   "license": "MIT OR Apache-2.0",

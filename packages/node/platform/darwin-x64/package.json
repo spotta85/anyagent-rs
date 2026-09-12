@@ -1,5 +1,5 @@
 {
-  "name": "@anyagent/darwin-x64",
+  "name": "@anyagent-ts/darwin-x64",
   "version": "0.0.3",
   "description": "The anyagent binary for macOS x64. Installed by the anyagent package; do not depend on it directly.",
   "license": "MIT OR Apache-2.0",
