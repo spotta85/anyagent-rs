@@ -11,6 +11,7 @@ cargo install anyagent
 anyagent list            # installed agents: login state, models, commands, capabilities
 anyagent chat claude     # prompt, stream, permissions allowed; /set model sonnet
 anyagent serve           # the API as JSON lines on stdin and stdout
+echo "one-line title for this diff" | anyagent chat codex   # one turn, then exits
 ```
 
 `list` and `chat` are for a terminal. `serve` is for an app: it speaks the
@@ -48,7 +49,7 @@ What the sidecar guarantees:
 - Frames for one session keep the crate's `sequence` order; sessions interleave.
 - A session error is terminal: `closed` follows it, after the engine's last bookkeeping events.
 - `closed` is written exactly once per opened session.
-- EOF on stdin closes every open session, writes their `closed`, and exits 0. Closing is "close stdin, wait".
+- EOF on stdin closes every open session, even one whose `open` was still in flight, writes their `closed`, and exits 0. Closing is "close stdin, wait". A stdout that stops accepting writes ends `serve` with that error.
 - A line that is not a command gets `{"id": null, "error": {"kind": "BadFrame", ..}}` and the loop continues.
 - The reader must keep up. A session whose events are not read within 1024 of production is closed by the crate, the same rule a Rust caller lives with.
 
@@ -82,8 +83,9 @@ session gets the crate's `SessionClosed`.
 
 `packages/schema.json` is a JSON schema (draft 7) of every wire type,
 generated from the Rust types with `just schema` and checked by
-`tests/schema.rs`. The command type is `Frame`; events are `Event` and
-`EventKind`; errors are `ErrorBody`. Feed it to a generator:
+`tests/schema.rs`. The command type is `Frame`; every output line is a
+`Line`; events are `Event` and `EventKind`; errors are `ErrorBody`. Feed it
+to a generator:
 
 ```bash
 npx json-schema-to-typescript packages/schema.json      # TypeScript

@@ -7,6 +7,9 @@
     "command": {
       "$ref": "#/definitions/Frame"
     },
+    "line": {
+      "$ref": "#/definitions/Line"
+    },
     "event": {
       "$ref": "#/definitions/Event"
     },
@@ -31,6 +34,7 @@
   },
   "required": [
     "command",
+    "line",
     "event",
     "error",
     "discovery",
@@ -628,6 +632,107 @@
       "enum": [
         "Conversation",
         "ConversationAndFiles"
+      ]
+    },
+    "Line": {
+      "description": "One line to the app. Untagged, so each variant is a flat object.",
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "hello": {
+              "$ref": "#/definitions/Hello"
+            }
+          },
+          "required": [
+            "hello"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "ok": true
+          },
+          "required": [
+            "id",
+            "ok"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
+            "error": true
+          },
+          "required": [
+            "error"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "$ref": "#/definitions/Event"
+            }
+          },
+          "required": [
+            "event"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "session": {
+              "type": "string"
+            },
+            "error": true
+          },
+          "required": [
+            "session",
+            "error"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "closed": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "closed"
+          ]
+        }
+      ]
+    },
+    "Hello": {
+      "description": "The first line: which protocol, from which crate version.",
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "anyagent": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocol",
+        "anyagent"
       ]
     },
     "Event": {

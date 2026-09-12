@@ -44,15 +44,22 @@ pub async fn serve(
 ) -> std::io::Result<()> {
     let (out, rx) = mpsc::channel::<String>(256);
     let writer = tokio::spawn(write_lines(output, rx));
-    let _ = out.send(hello_line()).await;
+    let hello = Hello {
+        protocol: PROTOCOL,
+        anyagent: env!("CARGO_PKG_VERSION"),
+    };
+    let _ = out.send(Line::Hello { hello }.json()).await;
 
     let state = Arc::new(State::new(runtime));
     let mut lines = input.lines();
     while let Some(line) = lines.next_line().await? {
+        if out.is_closed() {
+            break;
+        }
         let (id, cmd) = match parse(&line) {
             Ok(frame) => frame,
-            Err((id, body)) => {
-                let _ = out.send(error_line(id, body)).await;
+            Err((id, error)) => {
+                let _ = out.send(Line::Error { id, error }.json()).await;
                 continue;
             }
         };
@@ -61,13 +68,22 @@ pub async fn serve(
             match handle(&state, cmd).await {
                 Ok(Reply { ok, forward }) => {
                     // The open reply goes out before the first event.
-                    let _ = out.send(reply_line(id, ok)).await;
+                    let _ = out.send(Line::Reply { id, ok }.json()).await;
                     if let Some((session, events)) = forward {
                         tokio::spawn(forward_events(session, events, out));
                     }
                 }
                 Err(fail) => {
-                    let _ = out.send(error_line(Some(id), fail.body())).await;
+                    let error = fail.body();
+                    let _ = out
+                        .send(
+                            Line::Error {
+                                id: Some(id),
+                                error,
+                            }
+                            .json(),
+                        )
+                        .await;
                 }
             }
         });
@@ -76,8 +92,7 @@ pub async fn serve(
     // `closed` is written.
     state.close_all().await;
     drop(out);
-    let _ = writer.await;
-    Ok(())
+    writer.await.map_err(std::io::Error::other)?
 }
 
 /// Dispatches one command to the crate.
@@ -111,7 +126,9 @@ async fn handle(state: &State, cmd: Cmd) -> Result<Reply, Fail> {
             let options = options.into_session_options(dir);
             let (session, events) = state.runtime.open(&agent, options).await?;
             let (id, info) = (session.id().clone(), session.info());
-            state.sessions.lock().unwrap().insert(id.clone(), session);
+            if !state.register(session.clone()) {
+                let _ = session.close().await;
+            }
             Ok(Reply {
                 ok: serde_json::to_value(info)?,
                 forward: Some((id, events)),
@@ -160,14 +177,46 @@ async fn handle(state: &State, cmd: Cmd) -> Result<Reply, Fail> {
 async fn forward_events(id: SessionId, mut events: Events, out: mpsc::Sender<String>) {
     while let Some(event) = events.next().await {
         let line = match event {
-            Ok(event) => json!({ "event": event }),
-            Err(e) => json!({ "session": id, "error": error_body(&e) }),
+            Ok(event) => Line::Event { event },
+            Err(e) => Line::SessionError {
+                session: id.clone(),
+                error: error_body(&e),
+            },
         };
-        if out.send(line.to_string()).await.is_err() {
+        if out.send(line.json()).await.is_err() {
             return;
         }
     }
-    let _ = out.send(json!({ "closed": id }).to_string()).await;
+    let _ = out.send(Line::Closed { closed: id }.json()).await;
+}
+
+/// One line to the app. Untagged, so each variant is a flat object.
+#[derive(Serialize)]
+// Built, serialized, dropped: the size gap between variants costs nothing.
+#[allow(clippy::large_enum_variant)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(untagged)]
+enum Line {
+    Hello { hello: Hello },
+    Reply { id: u64, ok: Value },
+    Error { id: Option<u64>, error: Value },
+    Event { event: crate::Event },
+    SessionError { session: SessionId, error: Value },
+    Closed { closed: SessionId },
+}
+
+impl Line {
+    fn json(&self) -> String {
+        serde_json::to_string(self).expect("wire types serialize")
+    }
+}
+
+/// The first line: which protocol, from which crate version.
+#[derive(Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+struct Hello {
+    protocol: u32,
+    anyagent: &'static str,
 }
 
 /// One line from the app: the id to reply to, and the command.
@@ -349,11 +398,11 @@ impl Fail {
 }
 
 /// Everything one `serve` call owns: the runtime, the last discovery, and
-/// the open sessions.
+/// the open sessions. `sessions` is `None` once the input has ended.
 struct State {
     runtime: Runtime,
     report: Mutex<Option<DiscoveryReport>>,
-    sessions: Mutex<HashMap<SessionId, Session>>,
+    sessions: Mutex<Option<HashMap<SessionId, Session>>>,
 }
 
 impl State {
@@ -361,7 +410,19 @@ impl State {
         Self {
             runtime,
             report: Mutex::new(None),
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(Some(HashMap::new())),
+        }
+    }
+
+    /// Keeps a session's handle. `false` once the input has ended, so the
+    /// caller closes the session instead of leaving it running.
+    fn register(&self, session: Session) -> bool {
+        match self.sessions.lock().unwrap().as_mut() {
+            Some(open) => {
+                open.insert(session.id().clone(), session);
+                true
+            }
+            None => false,
         }
     }
 
@@ -395,15 +456,17 @@ impl State {
         self.sessions
             .lock()
             .unwrap()
-            .get(id)
+            .as_ref()
+            .and_then(|open| open.get(id))
             .cloned()
             .ok_or_else(|| Fail::UnknownSession(id.clone()))
     }
 
-    /// Closes every session; each forwarder then writes its `closed`.
+    /// Stops taking sessions and closes every open one; each forwarder
+    /// then writes its `closed`.
     async fn close_all(&self) {
-        let sessions: Vec<Session> = self.sessions.lock().unwrap().values().cloned().collect();
-        futures::future::join_all(sessions.iter().map(Session::close)).await;
+        let open = self.sessions.lock().unwrap().take().unwrap_or_default();
+        futures::future::join_all(open.values().map(Session::close)).await;
     }
 }
 
@@ -444,27 +507,18 @@ fn error_body(e: &AgentError) -> Value {
     body
 }
 
-fn hello_line() -> String {
-    json!({ "hello": { "protocol": PROTOCOL, "anyagent": env!("CARGO_PKG_VERSION") } }).to_string()
-}
-
-fn reply_line(id: u64, ok: Value) -> String {
-    json!({ "id": id, "ok": ok }).to_string()
-}
-
-fn error_line(id: Option<u64>, body: Value) -> String {
-    json!({ "id": id, "error": body }).to_string()
-}
-
 /// The single writer: every line on the output goes through here, so
 /// replies and events never interleave mid-line.
-async fn write_lines(mut output: impl AsyncWrite + Unpin, mut rx: mpsc::Receiver<String>) {
+async fn write_lines(
+    mut output: impl AsyncWrite + Unpin,
+    mut rx: mpsc::Receiver<String>,
+) -> std::io::Result<()> {
     while let Some(mut line) = rx.recv().await {
         line.push('\n');
-        if output.write_all(line.as_bytes()).await.is_err() || output.flush().await.is_err() {
-            return;
-        }
+        output.write_all(line.as_bytes()).await?;
+        output.flush().await?;
     }
+    Ok(())
 }
 
 /// Every wire type in one JSON schema (draft 7), so each wrapper's types
@@ -482,6 +536,7 @@ pub fn schema() -> schemars::Schema {
 #[allow(dead_code)]
 struct Protocol {
     command: Frame,
+    line: Line,
     event: crate::Event,
     error: ErrorBody,
     discovery: DiscoveryReport,

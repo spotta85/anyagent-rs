@@ -269,6 +269,42 @@ async fn eof_closes_every_open_session_and_returns() {
         .unwrap();
 }
 
+/// An `open` still in flight when the input ends is closed once it lands:
+/// the session still says `closed`, and `serve` returns.
+#[tokio::test]
+async fn eof_during_an_open_still_closes_it() {
+    let mut wire = Wire::start(Script::default()).await;
+    wire.send(json!({"id": 1, "cmd": "open", "agent": "mock", "dir": wire.dir()}))
+        .await;
+    wire.hang_up();
+    let (_, closed) = wire.until("closed", |f| f.get("closed").is_some()).await;
+    assert!(closed["closed"].is_string(), "{closed}");
+    tokio::time::timeout(Duration::from_secs(5), wire.serve)
+        .await
+        .expect("serve returns")
+        .unwrap()
+        .unwrap();
+}
+
+/// A broken output is `serve`'s error, not a silent success.
+#[tokio::test]
+async fn a_broken_output_is_reported() {
+    let (client_in, serve_in) = tokio::io::duplex(1024);
+    let (serve_out, client_out) = tokio::io::duplex(1024);
+    drop(client_out);
+    let serve = tokio::spawn(anyagent::sidecar::serve(
+        Runtime::with_mock(Script::default()),
+        BufReader::new(serve_in),
+        serve_out,
+    ));
+    drop(client_in);
+    let result = tokio::time::timeout(Duration::from_secs(5), serve)
+        .await
+        .expect("serve returns")
+        .unwrap();
+    assert!(result.is_err(), "{result:?}");
+}
+
 /// G6: a client that stops reading loses only the session it starved,
 /// the way the crate closes a lagging consumer. The sidecar survives.
 #[tokio::test]
@@ -430,6 +466,11 @@ async fn the_configure_script_applies_the_model_option() {
         None => wire.reply(2).await,
     };
     assert_eq!(reply["ok"], Value::Null, "{reply}");
-    let options = &updated["event"]["kind"]["SessionUpdated"]["configuration"]["options"];
-    assert_eq!(options["model"], "opus", "{updated}");
+    let info = &updated["event"]["kind"]["SessionUpdated"];
+    assert_eq!(
+        info["configuration"]["options"]["model"], "opus",
+        "{updated}"
+    );
+    let option = &info["details"]["config_options"][0];
+    assert_eq!(option["current"], "opus", "current follows: {updated}");
 }

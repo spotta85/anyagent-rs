@@ -285,6 +285,18 @@ fn info(script: &Script, configuration: &SessionConfiguration) -> DriverInfo {
     if script.compact {
         caps.push(Capability::Compact);
     }
+    // Each option's `current` follows the configuration.
+    let config_options = script
+        .options
+        .iter()
+        .cloned()
+        .map(|mut option| {
+            if let Some(value) = configuration.options.get(&option.id) {
+                option.current = Some(value.clone());
+            }
+            option
+        })
+        .collect();
     DriverInfo {
         details: AgentDetails {
             version: Some("mock".into()),
@@ -293,7 +305,7 @@ fn info(script: &Script, configuration: &SessionConfiguration) -> DriverInfo {
                 account: None,
             },
             capabilities: Capabilities::new(caps),
-            config_options: script.options.clone(),
+            config_options,
             commands: Vec::new(),
         },
         configuration: configuration.clone(),

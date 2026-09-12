@@ -3,10 +3,12 @@
 
 use std::error::Error;
 use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyagent::{
     AgentInstallation, Answer, AuthStatus, Capability, ConfigKind, EventKind, PermissionChoice,
-    Request, Runtime, SessionOptions, StopReason,
+    Request, Runtime, SessionOptions, SessionStatus, StopReason,
 };
 use futures::StreamExt;
 use tokio::io::AsyncBufReadExt;
@@ -72,7 +74,8 @@ async fn list() -> Fallible {
 }
 
 /// `chat`: prompt from stdin, stream the answer, allow every permission.
-/// `/set <option> <value>` changes a live setting.
+/// `/set <option> <value>` changes a live setting. Ends once stdin has
+/// ended and the session is idle, so a piped prompt runs one turn and exits.
 async fn chat(id: &str) -> Fallible {
     let runtime = Runtime::new();
     let report = runtime.discover().await;
@@ -83,8 +86,10 @@ async fn chat(id: &str) -> Fallible {
     println!("· connected — type a message\n");
 
     // Prompt from one task, drain events in another; a line sent mid-turn
-    // steers the running turn.
-    let prompter = session.clone();
+    // steers the running turn. `eof` is set before the idle check, so an
+    // idle event can never slip between the two.
+    let eof = Arc::new(AtomicBool::new(false));
+    let (prompter, stdin_eof) = (session.clone(), Arc::clone(&eof));
     tokio::spawn(async move {
         let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -107,6 +112,10 @@ async fn chat(id: &str) -> Fallible {
                 eprintln!("! {e}");
             }
         }
+        stdin_eof.store(true, Ordering::SeqCst);
+        if prompter.status() == SessionStatus::Idle {
+            let _ = prompter.close().await;
+        }
     });
 
     while let Some(event) = events.next().await {
@@ -117,10 +126,24 @@ async fn chat(id: &str) -> Fallible {
             }
             EventKind::ToolUpdated(tool) => eprintln!("  [{:?}] {}", tool.status, tool.title),
             EventKind::RequestOpened(Request::Permission(request)) => {
-                eprintln!("  [allow] {}", request.tool.title);
-                session
-                    .answer(request.id, Answer::Permission(PermissionChoice::AllowOnce))
-                    .await?;
+                // The first allow the agent offers, else its first choice.
+                let choice = request
+                    .options
+                    .iter()
+                    .find(|c| {
+                        matches!(
+                            c,
+                            PermissionChoice::AllowOnce | PermissionChoice::AllowAlways
+                        )
+                    })
+                    .or(request.options.first())
+                    .cloned();
+                if let Some(choice) = choice {
+                    eprintln!("  [{choice:?}] {}", request.tool.title);
+                    session
+                        .answer(request.id, Answer::Permission(choice))
+                        .await?;
+                }
             }
             EventKind::SessionUpdated(info) => {
                 let set: Vec<String> = info
@@ -130,6 +153,11 @@ async fn chat(id: &str) -> Fallible {
                     .map(|(id, v)| format!("{id}={v:?}"))
                     .collect();
                 eprintln!("  [config] {}", set.join(" "));
+            }
+            // Stdin is gone and nothing is running: the turn's output is
+            // complete, so end the session and let the stream close.
+            EventKind::StatusChanged(SessionStatus::Idle) if eof.load(Ordering::SeqCst) => {
+                let _ = session.close().await;
             }
             EventKind::TurnEnded { stop, .. } => match stop {
                 StopReason::Completed { .. } => println!("\n"),
