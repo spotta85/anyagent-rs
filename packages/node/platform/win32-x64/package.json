@@ -1,5 +1,5 @@
 {
-  "name": "@anyagent/win32-x64",
+  "name": "@anyagent-ts/win32-x64",
   "version": "0.0.3",
   "description": "The anyagent binary for Windows x64. Installed by the anyagent package; do not depend on it directly.",
   "license": "MIT OR Apache-2.0",

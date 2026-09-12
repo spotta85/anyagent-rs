@@ -16,11 +16,11 @@
     "live": "node --test --test-timeout 120000 test/live.test.ts"
   },
   "optionalDependencies": {
-    "@anyagent/darwin-arm64": "0.0.3",
-    "@anyagent/darwin-x64": "0.0.3",
-    "@anyagent/linux-x64": "0.0.3",
-    "@anyagent/linux-arm64": "0.0.3",
-    "@anyagent/win32-x64": "0.0.3"
+    "@anyagent-ts/darwin-arm64": "0.0.3",
+    "@anyagent-ts/darwin-x64": "0.0.3",
+    "@anyagent-ts/linux-x64": "0.0.3",
+    "@anyagent-ts/linux-arm64": "0.0.3",
+    "@anyagent-ts/win32-x64": "0.0.3"
   },
   "devDependencies": {
     "@types/node": "^22",
