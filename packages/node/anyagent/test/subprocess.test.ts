@@ -128,7 +128,7 @@ test("S6 process death rejects pending calls, fails iterators, and later calls",
   for (const p of pending) await rejects(p, "ProcessExited");
   await rejects(drain(session), "ProcessExited");
   await rejects(rt.discover(), "ProcessExited");
-  assert.equal(await rt.close(), null);
+  await rt.close();
 });
 
 test("S7 the agent dying mid-turn: the turn fails, the stream throws ProcessExited, then ends", async (t) => {

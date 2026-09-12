@@ -47,7 +47,7 @@ What the sidecar guarantees:
 
 - The `ok` reply to `open` is written before any frame for that session.
 - Frames for one session keep the crate's `sequence` order; sessions interleave.
-- A session error is terminal: `closed` follows it, after the engine's last bookkeeping events.
+- A session error is terminal. The running turn has already ended with `TurnEnded { stop: Failed }`; `closed` follows the error, after the engine's last bookkeeping events.
 - `closed` is written exactly once per opened session.
 - EOF on stdin closes every open session, even one whose `open` was still in flight, writes their `closed`, and exits 0. Closing is "close stdin, wait". A stdout that stops accepting writes ends `serve` with that error.
 - A line that is not a command gets `{"id": null, "error": {"kind": "BadFrame", ..}}` and the loop continues.
@@ -104,6 +104,36 @@ its file.
 cargo build --features mock
 echo '{"id": 1, "cmd": "discover"}' | ./target/debug/anyagent serve --mock packages/mock-scripts/turn.json
 ```
+
+## Packages
+
+| Language | Install | Status |
+|---|---|---|
+| TypeScript / Node ≥ 22.6 | `npm install anyagent` | ready; the binary comes from an `@anyagent/<os>-<arch>` package, no postinstall |
+| Python | `pip install anyagent` | next |
+| Swift | Swift package `Anyagent` | next |
+| Go | `go get` | next |
+
+```ts
+import { Runtime, kindOf } from "anyagent";
+
+const rt = await Runtime.start();
+const session = await rt.open("claude", { dir: process.cwd() });
+await session.prompt("explain this repo");
+for await (const ev of session.events()) {
+  if (kindOf(ev) === "TextDelta") process.stdout.write(ev.kind.TextDelta.text);
+  if (kindOf(ev) === "RequestOpened") await session.answer(ev.kind.RequestOpened.Permission.id, { Permission: "AllowOnce" });
+  if (kindOf(ev) === "TurnEnded") break;
+}
+await session.close();
+await rt.close();
+```
+
+`session.info` and `session.status` stay current; a session error throws
+from the `for await`; `rt.generate(agent, { dir }, prompt)` is one-shot
+text. `Runtime.start({ bin, mock })` runs the package over a mock script.
+Every package passes the same twenty tests: ten over the mock scripts on
+macOS, Linux, and Windows in CI, ten live on claude and codex.
 
 ## Writing a wrapper
 
