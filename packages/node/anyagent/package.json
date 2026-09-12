@@ -1,5 +1,5 @@
 {
-  "name": "anyagent",
+  "name": "anyagent-ts",
   "version": "0.0.3",
   "description": "One API over the coding agents installed on a machine: Claude Code, Codex, Cursor, and more.",
   "license": "MIT OR Apache-2.0",
