@@ -30,6 +30,7 @@ name = "anyagent"
 version = "0.0.1"
 dependencies = [
  "agent-client-protocol-schema",
+ "anyagent",
  "async-trait",
  "command-group",
  "futures",

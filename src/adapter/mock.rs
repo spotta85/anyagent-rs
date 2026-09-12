@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
+use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use crate::adapter::{
@@ -23,7 +24,7 @@ use crate::event::{
 };
 
 /// One scripted action inside a turn.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 // Test scripts favor direct event construction over per-step heap allocation.
 #[allow(clippy::large_enum_variant)]
 pub enum Step {
@@ -33,10 +34,14 @@ pub enum Step {
     /// Report the turn ended. Steps after it play immediately, which is how
     /// a script models agent-originated continuation and trailing noise.
     End(StopReason),
+    /// The agent process dies here: exit status 9, then the stream ends.
+    Die,
 }
 
-/// What the mock agent will do, turn by turn.
-#[derive(Debug, Clone)]
+/// What the mock agent will do, turn by turn. Deserializes from JSON with
+/// every field optional, so `anyagent serve --mock script.json` can load one.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct Script {
     /// Each `StartTurn` pops the next list. An exhausted script hangs.
     pub turns: VecDeque<Vec<Step>>,
@@ -173,6 +178,14 @@ async fn drive(
                 Step::End(stop) => {
                     turn_open = false;
                     send(DriverEvent::TurnEnded(stop)).await
+                }
+                Step::Die => {
+                    send(DriverEvent::Exited {
+                        status: "9".into(),
+                        stderr: "mock died".into(),
+                    })
+                    .await;
+                    return;
                 }
             };
             if !ok {

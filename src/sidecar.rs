@@ -1,0 +1,474 @@
+//! The public API over a pair of byte streams, one JSON object per line.
+//! This is what the `anyagent serve` binary runs and what every language
+//! wrapper talks to, so the crate stays the only place with logic.
+//!
+//! ```text
+//! out  {"hello": {"protocol": 1, "anyagent": "0.0.2"}}          first line
+//! in   {"id": 1, "cmd": "open", "agent": "claude", "dir": "."}
+//! out  {"id": 1, "ok": {..SessionInfo..}}                       or {"id": 1, "error": {..}}
+//! out  {"event": {..Event..}}                                   carries session_id
+//! out  {"session": "s1", "error": {..}}                         the stream failed
+//! out  {"closed": "s1"}                                         the stream ended
+//! ```
+//!
+//! Commands map one to one onto `Runtime` and `Session`. Events are the
+//! crate's own serialization, unchanged. Guarantees: the `open` reply is
+//! written before any frame for that session; frames for one session keep
+//! the crate's `sequence` order; a stream error is followed by `closed`;
+//! EOF on the input closes every session before `serve` returns; a bad
+//! line gets a `BadFrame` error and the loop continues.
+
+use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroU32;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use futures::StreamExt;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+use crate::{
+    AgentError, AgentInstallation, Answer, ConfigId, ConfigValue, DiscoveryReport, Events, Input,
+    McpServer, MessageId, PermissionMode, PromptId, RequestId, ResumeToken, RollbackScope, Runtime,
+    Session, SessionId, SessionOptions,
+};
+
+/// Bumped only when a frame or command changes shape incompatibly.
+pub const PROTOCOL: u32 = 1;
+
+/// Runs the sidecar until `input` ends. Reads command lines, writes reply
+/// and event lines to `output`, then closes every open session.
+pub async fn serve(
+    runtime: Runtime,
+    input: impl AsyncBufRead + Unpin,
+    output: impl AsyncWrite + Unpin + Send + 'static,
+) -> std::io::Result<()> {
+    let (out, rx) = mpsc::channel::<String>(256);
+    let writer = tokio::spawn(write_lines(output, rx));
+    let _ = out.send(hello_line()).await;
+
+    let state = Arc::new(State::new(runtime));
+    let mut lines = input.lines();
+    while let Some(line) = lines.next_line().await? {
+        let (id, cmd) = match parse(&line) {
+            Ok(frame) => frame,
+            Err((id, body)) => {
+                let _ = out.send(error_line(id, body)).await;
+                continue;
+            }
+        };
+        let (state, out) = (Arc::clone(&state), out.clone());
+        tokio::spawn(async move {
+            match handle(&state, cmd).await {
+                Ok(Reply { ok, forward }) => {
+                    // The open reply goes out before the first event.
+                    let _ = out.send(reply_line(id, ok)).await;
+                    if let Some((session, events)) = forward {
+                        let task = tokio::spawn(forward_events(session, events, out));
+                        state.forwarders.lock().unwrap().push(task);
+                    }
+                }
+                Err(fail) => {
+                    let _ = out.send(error_line(Some(id), fail.body())).await;
+                }
+            }
+        });
+    }
+    state.close_all().await;
+    drop(out);
+    let _ = writer.await;
+    Ok(())
+}
+
+/// One line from the app: the id to reply to, and the command.
+#[derive(Deserialize)]
+struct Frame {
+    id: u64,
+    #[serde(flatten)]
+    cmd: Cmd,
+}
+
+/// Every command, named after the crate call it makes.
+#[derive(Deserialize)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+enum Cmd {
+    Discover,
+    Probe {
+        agent: AgentRef,
+    },
+    PlanUsage {
+        agent: AgentRef,
+    },
+    Generate {
+        agent: AgentRef,
+        dir: PathBuf,
+        prompt: String,
+    },
+    Open {
+        agent: AgentRef,
+        dir: PathBuf,
+        #[serde(flatten)]
+        options: OpenOptions,
+    },
+    Prompt {
+        session: SessionId,
+        text: String,
+        #[serde(default)]
+        attachments: Vec<PathBuf>,
+    },
+    Dequeue {
+        session: SessionId,
+        prompt: PromptId,
+    },
+    Answer {
+        session: SessionId,
+        request: RequestId,
+        answer: Answer,
+    },
+    Configure {
+        session: SessionId,
+        option: ConfigId,
+        value: ConfigValue,
+    },
+    Rollback {
+        session: SessionId,
+        turns: NonZeroU32,
+        scope: RollbackScope,
+    },
+    Compact {
+        session: SessionId,
+    },
+    Cancel {
+        session: SessionId,
+        #[serde(default)]
+        clear_queue: bool,
+    },
+    Info {
+        session: SessionId,
+    },
+    Close {
+        session: SessionId,
+    },
+}
+
+/// A catalog id like `"claude"`, or an ACP agent the catalog does not know.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AgentRef {
+    Id(String),
+    Acp { acp: AcpSpec },
+}
+
+#[derive(Deserialize)]
+struct AcpSpec {
+    name: String,
+    path: PathBuf,
+    #[serde(default)]
+    args: Vec<String>,
+}
+
+/// The `SessionOptions` the wire exposes, as top-level fields of `open`.
+#[derive(Deserialize, Default)]
+struct OpenOptions {
+    resume: Option<ResumeToken>,
+    fork: Option<ResumeToken>,
+    fork_at: Option<MessageId>,
+    permission_mode: Option<PermissionMode>,
+    #[serde(default)]
+    mcp_servers: Vec<McpServer>,
+    #[serde(default)]
+    configure: BTreeMap<ConfigId, ConfigValue>,
+}
+
+impl OpenOptions {
+    /// Applies each given field through the crate's builder.
+    fn into_session_options(self, dir: PathBuf) -> SessionOptions {
+        let mut options = SessionOptions::in_dir(dir);
+        if let Some(token) = self.resume {
+            options = options.resume(token);
+        }
+        if let Some(token) = self.fork {
+            options = options.fork_from(token, self.fork_at);
+        }
+        if let Some(mode) = self.permission_mode {
+            options = options.permission_mode(mode);
+        }
+        for server in self.mcp_servers {
+            options = options.mcp_server(server);
+        }
+        for (id, value) in self.configure {
+            options = options.configure(id, value);
+        }
+        options
+    }
+}
+
+/// What a command produced: the `ok` payload and, for `open`, the stream
+/// to start forwarding once the reply is written.
+struct Reply {
+    ok: Value,
+    forward: Option<(SessionId, Events)>,
+}
+
+impl Reply {
+    fn ok(value: impl Serialize) -> Result<Self, Fail> {
+        Ok(Self {
+            ok: serde_json::to_value(value)?,
+            forward: None,
+        })
+    }
+}
+
+/// Why a command failed: the crate said so, or the sidecar could not
+/// route or encode it.
+enum Fail {
+    Agent(AgentError),
+    UnknownSession(SessionId),
+    Encode(serde_json::Error),
+}
+
+impl From<AgentError> for Fail {
+    fn from(e: AgentError) -> Self {
+        Self::Agent(e)
+    }
+}
+
+impl From<serde_json::Error> for Fail {
+    fn from(e: serde_json::Error) -> Self {
+        Self::Encode(e)
+    }
+}
+
+impl Fail {
+    fn body(self) -> Value {
+        match self {
+            Self::Agent(e) => error_body(&e),
+            Self::UnknownSession(id) => json!({
+                "kind": "UnknownSession",
+                "message": format!("no session {id}"),
+                "session": id,
+            }),
+            Self::Encode(e) => json!({
+                "kind": "ProtocolFailed",
+                "message": format!("could not encode the reply: {e}"),
+                "detail": e.to_string(),
+            }),
+        }
+    }
+}
+
+/// Everything one `serve` call owns: the runtime, the last discovery, the
+/// open sessions, and the tasks copying their events out.
+struct State {
+    runtime: Runtime,
+    report: Mutex<Option<DiscoveryReport>>,
+    sessions: Mutex<HashMap<SessionId, Session>>,
+    forwarders: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl State {
+    fn new(runtime: Runtime) -> Self {
+        Self {
+            runtime,
+            report: Mutex::new(None),
+            sessions: Mutex::new(HashMap::new()),
+            forwarders: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// A catalog id resolves against the last discovery, running one if
+    /// needed; an inline ACP spec needs no lookup.
+    async fn resolve(&self, agent: AgentRef) -> Result<AgentInstallation, Fail> {
+        let id = match agent {
+            AgentRef::Acp { acp } => {
+                return Ok(AgentInstallation::acp(acp.name, acp.path, acp.args));
+            }
+            AgentRef::Id(id) => id,
+        };
+        let cached = self
+            .report
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|report| report.require(&id).ok().cloned());
+        if let Some(agent) = cached {
+            return Ok(agent);
+        }
+        let report = self.runtime.discover().await;
+        let found = report.require(&id).cloned();
+        *self.report.lock().unwrap() = Some(report);
+        Ok(found?)
+    }
+
+    /// The handle for an opened session. Closed sessions stay in the map
+    /// so a late command gets the crate's `SessionClosed`, not `UnknownSession`.
+    fn session(&self, id: &SessionId) -> Result<Session, Fail> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| Fail::UnknownSession(id.clone()))
+    }
+
+    /// Closes every session and waits until each has said `closed`.
+    async fn close_all(&self) {
+        let sessions: Vec<Session> = self.sessions.lock().unwrap().values().cloned().collect();
+        futures::future::join_all(sessions.iter().map(Session::close)).await;
+        let forwarders = std::mem::take(&mut *self.forwarders.lock().unwrap());
+        futures::future::join_all(forwarders).await;
+    }
+}
+
+/// Dispatches one command to the crate.
+async fn handle(state: &State, cmd: Cmd) -> Result<Reply, Fail> {
+    match cmd {
+        Cmd::Discover => {
+            let report = state.runtime.discover().await;
+            let reply = Reply::ok(&report);
+            *state.report.lock().unwrap() = Some(report);
+            reply
+        }
+        Cmd::Probe { agent } => {
+            let agent = state.resolve(agent).await?;
+            Reply::ok(state.runtime.probe(&agent).await?)
+        }
+        Cmd::PlanUsage { agent } => {
+            let agent = state.resolve(agent).await?;
+            Reply::ok(state.runtime.plan_usage(&agent).await?)
+        }
+        Cmd::Generate { agent, dir, prompt } => {
+            let agent = state.resolve(agent).await?;
+            let options = SessionOptions::in_dir(dir);
+            Reply::ok(state.runtime.generate(&agent, options, prompt).await?)
+        }
+        Cmd::Open {
+            agent,
+            dir,
+            options,
+        } => {
+            let agent = state.resolve(agent).await?;
+            let options = options.into_session_options(dir);
+            let (session, events) = state.runtime.open(&agent, options).await?;
+            let (id, info) = (session.id().clone(), session.info());
+            state.sessions.lock().unwrap().insert(id.clone(), session);
+            Ok(Reply {
+                ok: serde_json::to_value(info)?,
+                forward: Some((id, events)),
+            })
+        }
+        Cmd::Prompt {
+            session,
+            text,
+            attachments,
+        } => {
+            let input = attachments
+                .into_iter()
+                .fold(Input::text(text), |input, path| input.attach(path));
+            Reply::ok(state.session(&session)?.prompt(input).await?)
+        }
+        Cmd::Dequeue { session, prompt } => {
+            Reply::ok(state.session(&session)?.dequeue(prompt).await?)
+        }
+        Cmd::Answer {
+            session,
+            request,
+            answer,
+        } => Reply::ok(state.session(&session)?.answer(request, answer).await?),
+        Cmd::Configure {
+            session,
+            option,
+            value,
+        } => Reply::ok(state.session(&session)?.configure(option, value).await?),
+        Cmd::Rollback {
+            session,
+            turns,
+            scope,
+        } => Reply::ok(state.session(&session)?.rollback(turns, scope).await?),
+        Cmd::Compact { session } => Reply::ok(state.session(&session)?.compact().await?),
+        Cmd::Cancel {
+            session,
+            clear_queue,
+        } => Reply::ok(state.session(&session)?.cancel(clear_queue).await?),
+        Cmd::Info { session } => Reply::ok(state.session(&session)?.info()),
+        Cmd::Close { session } => Reply::ok(state.session(&session)?.close().await?),
+    }
+}
+
+/// Copies one session's events to the output. A stream error is written
+/// under the session's id; `closed` always follows the end of the stream.
+async fn forward_events(id: SessionId, mut events: Events, out: mpsc::Sender<String>) {
+    while let Some(event) = events.next().await {
+        let line = match event {
+            Ok(event) => json!({ "event": event }),
+            Err(e) => json!({ "session": id, "error": error_body(&e) }),
+        };
+        if out.send(line.to_string()).await.is_err() {
+            return;
+        }
+    }
+    let _ = out.send(json!({ "closed": id }).to_string()).await;
+}
+
+/// Splits a line into its id and command. A line that is not a command
+/// yields the id it carried, if any, so the app can match the error.
+fn parse(line: &str) -> Result<(u64, Cmd), (Option<u64>, Value)> {
+    let value: Value = serde_json::from_str(line).map_err(|e| (None, bad_frame(e)))?;
+    let id = value.get("id").and_then(Value::as_u64);
+    let frame: Frame = serde_json::from_value(value).map_err(|e| (id, bad_frame(e)))?;
+    Ok((frame.id, frame.cmd))
+}
+
+fn bad_frame(e: serde_json::Error) -> Value {
+    json!({ "kind": "BadFrame", "message": format!("not a command: {e}"), "detail": e.to_string() })
+}
+
+/// `kind`, `message`, and the variant's own fields, so nothing typed is lost.
+fn error_body(e: &AgentError) -> Value {
+    let (kind, mut body) = match e {
+        AgentError::NotInstalled(agent) => ("NotInstalled", json!({ "agent": agent })),
+        AgentError::SpawnFailed(d) => ("SpawnFailed", json!({ "detail": d })),
+        AgentError::AuthRequired { login } => ("AuthRequired", json!({ "login": login })),
+        AgentError::HandshakeTimeout => ("HandshakeTimeout", json!({})),
+        AgentError::UnsupportedFeature(d) => ("UnsupportedFeature", json!({ "detail": d })),
+        AgentError::InvalidConfiguration(d) => ("InvalidConfiguration", json!({ "detail": d })),
+        AgentError::InvalidRequest(d) => ("InvalidRequest", json!({ "detail": d })),
+        AgentError::ResumeFailed(d) => ("ResumeFailed", json!({ "detail": d })),
+        AgentError::SessionBusy => ("SessionBusy", json!({})),
+        AgentError::ProtocolFailed(d) => ("ProtocolFailed", json!({ "detail": d })),
+        AgentError::ProcessExited { status, stderr } => (
+            "ProcessExited",
+            json!({ "status": status, "stderr": stderr }),
+        ),
+        AgentError::SessionClosed => ("SessionClosed", json!({})),
+    };
+    body["kind"] = json!(kind);
+    body["message"] = json!(e.to_string());
+    body
+}
+
+fn hello_line() -> String {
+    json!({ "hello": { "protocol": PROTOCOL, "anyagent": env!("CARGO_PKG_VERSION") } }).to_string()
+}
+
+fn reply_line(id: u64, ok: Value) -> String {
+    json!({ "id": id, "ok": ok }).to_string()
+}
+
+fn error_line(id: Option<u64>, body: Value) -> String {
+    json!({ "id": id, "error": body }).to_string()
+}
+
+/// The single writer: every line on the output goes through here, so
+/// replies and events never interleave mid-line.
+async fn write_lines(mut output: impl AsyncWrite + Unpin, mut rx: mpsc::Receiver<String>) {
+    while let Some(mut line) = rx.recv().await {
+        line.push('\n');
+        if output.write_all(line.as_bytes()).await.is_err() || output.flush().await.is_err() {
+            return;
+        }
+    }
+}
