@@ -25,6 +25,10 @@ import type {
 
 export type * from "./types.ts";
 
+// ---------------------------------------------------------------------------
+// PUBLIC TYPES
+// ---------------------------------------------------------------------------
+
 /** A command line without its `id`. */
 export type Command = Frame1;
 /** What `open` accepts besides the agent. */
@@ -40,6 +44,10 @@ export interface StartOptions {
   /** Environment for the binary and the agents it spawns; default: this process's. */
   env?: NodeJS.ProcessEnv;
 }
+
+// ---------------------------------------------------------------------------
+// RUNTIME: one `anyagent serve` process
+// ---------------------------------------------------------------------------
 
 type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void; settle?: (ok: unknown) => unknown };
 
@@ -108,6 +116,7 @@ export class Runtime {
     return this.exited;
   }
 
+  // Used by Session; not part of the API.
   /** Writes one command line; resolves with the reply's `ok`, or `settle(ok)`. */
   call<T>(cmd: Command, settle?: (ok: unknown) => T): Promise<T> {
     if (this.dead) return Promise.reject(this.dead); // W4
@@ -159,6 +168,10 @@ export class Runtime {
   }
 }
 
+// ---------------------------------------------------------------------------
+// SESSION: one open session
+// ---------------------------------------------------------------------------
+
 /** Unread events a session may hold before it is closed as lagging (W6). */
 const CAP = 4096;
 
@@ -175,6 +188,7 @@ export class Session {
   private error?: Error;
   private rt: Runtime;
 
+  // Built by Runtime.open; not part of the API.
   constructor(rt: Runtime, info: SessionInfo) {
     this.rt = rt;
     this.id = info.id;
@@ -228,6 +242,7 @@ export class Session {
     }
   }
 
+  // push, fail and end are called by Runtime.onLine/onExit; not part of the API.
   /** From Runtime.onLine: keeps info and status live (W2), applies the cap (W6). */
   push(ev: Event) {
     if (this.error || this.done) return;
@@ -258,6 +273,10 @@ export class Session {
   }
 }
 
+// ---------------------------------------------------------------------------
+// HELPERS
+// ---------------------------------------------------------------------------
+
 /** The variant name of `event.kind`, for both `{TextDelta: {..}}` and `"ContextCompacted"` (W7). */
 export function kindOf(ev: Event): EventKindName {
   return (typeof ev.kind === "string" ? ev.kind : Object.keys(ev.kind)[0]) as EventKindName;
@@ -280,6 +299,10 @@ export class AnyagentError extends Error {
     this.data = data;
   }
 }
+
+// ---------------------------------------------------------------------------
+// INTERNAL: finding the binary
+// ---------------------------------------------------------------------------
 
 const TARGETS = ["darwin-arm64", "darwin-x64", "linux-x64", "linux-arm64", "win32-x64"];
 

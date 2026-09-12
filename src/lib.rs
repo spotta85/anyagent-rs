@@ -13,7 +13,8 @@
 //! - [`Events`] — the stream everything arrives on, as the same typed
 //!   [`EventKind`]s for every agent.
 //!
-//! The `examples/` directory shows the patterns; `chat.rs` is the core loop:
+//! The core loop is below. `anyagent chat` (src/bin/anyagent.rs) is that
+//! loop in a terminal; `examples/sessions.rs` drives several sessions at once:
 //!
 //! ```no_run
 //! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {

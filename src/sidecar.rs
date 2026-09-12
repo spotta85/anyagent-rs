@@ -3,7 +3,7 @@
 //! wrapper talks to, so the crate stays the only place with logic.
 //!
 //! ```text
-//! out  {"hello": {"protocol": 1, "anyagent": "0.0.2"}}          first line
+//! out  {"hello": {"protocol": 1, "anyagent": "0.0.3"}}          first line
 //! in   {"id": 1, "cmd": "open", "agent": "claude", "dir": "."}
 //! out  {"id": 1, "ok": {..SessionInfo..}}                       or {"id": 1, "error": {..}}
 //! out  {"event": {..Event..}}                                   carries session_id
@@ -31,6 +31,10 @@ use crate::{
     McpServer, MessageId, PermissionMode, PromptId, RequestId, ResumeToken, RollbackScope, Runtime,
     Session, SessionId, SessionOptions,
 };
+
+// ---------------------------------------------------------------------------
+// PUBLIC: the protocol version, the serve loop, the wire schema
+// ---------------------------------------------------------------------------
 
 /// Bumped only when a frame or command changes shape incompatibly.
 pub const PROTOCOL: u32 = 1;
@@ -94,6 +98,19 @@ pub async fn serve(
     drop(out);
     writer.await.map_err(std::io::Error::other)?
 }
+
+/// Every wire type in one JSON schema (draft 7), so each wrapper's types
+/// come from the same file: `cargo run --example schema --features schema`.
+#[cfg(feature = "schema")]
+pub fn schema() -> schemars::Schema {
+    schemars::generate::SchemaSettings::draft07()
+        .into_generator()
+        .into_root_schema_for::<Protocol>()
+}
+
+// ---------------------------------------------------------------------------
+// SERVE HELPERS: one command in, one session's events out
+// ---------------------------------------------------------------------------
 
 /// Dispatches one command to the crate.
 async fn handle(state: &State, cmd: Cmd) -> Result<Reply, Fail> {
@@ -194,6 +211,10 @@ async fn forward_events(id: SessionId, mut events: Events, out: mpsc::Sender<Str
     }
     let _ = out.send(Line::Closed { closed: id }.json()).await;
 }
+
+// ---------------------------------------------------------------------------
+// WIRE TYPES: the lines out and the commands in
+// ---------------------------------------------------------------------------
 
 /// One line to the app. Untagged, so each variant is a flat object.
 #[derive(Serialize)]
@@ -355,6 +376,10 @@ impl OpenOptions {
     }
 }
 
+// ---------------------------------------------------------------------------
+// REPLIES AND ERRORS: what a command produced, or why it failed
+// ---------------------------------------------------------------------------
+
 /// What a command produced: the `ok` payload and, for `open`, the stream
 /// to start forwarding once the reply is written.
 struct Reply {
@@ -404,6 +429,38 @@ impl Fail {
         }
     }
 }
+
+/// `kind`, `message`, and the variant's own fields, so nothing typed is lost.
+fn error_body(e: &AgentError) -> Value {
+    let (kind, mut body) = match e {
+        AgentError::NotInstalled(agent) => ("NotInstalled", json!({ "agent": agent })),
+        AgentError::SpawnFailed(d) => ("SpawnFailed", json!({ "detail": d })),
+        AgentError::AuthRequired { login } => ("AuthRequired", json!({ "login": login })),
+        AgentError::HandshakeTimeout => ("HandshakeTimeout", json!({})),
+        AgentError::UnsupportedFeature(d) => ("UnsupportedFeature", json!({ "detail": d })),
+        AgentError::InvalidConfiguration(d) => ("InvalidConfiguration", json!({ "detail": d })),
+        AgentError::InvalidRequest(d) => ("InvalidRequest", json!({ "detail": d })),
+        AgentError::ResumeFailed(d) => ("ResumeFailed", json!({ "detail": d })),
+        AgentError::SessionBusy => ("SessionBusy", json!({})),
+        AgentError::ProtocolFailed(d) => ("ProtocolFailed", json!({ "detail": d })),
+        AgentError::ProcessExited { status, stderr } => (
+            "ProcessExited",
+            json!({ "status": status, "stderr": stderr }),
+        ),
+        AgentError::SessionClosed => ("SessionClosed", json!({})),
+    };
+    body["kind"] = json!(kind);
+    body["message"] = json!(e.to_string());
+    body
+}
+
+fn bad_frame(e: serde_json::Error) -> Value {
+    json!({ "kind": "BadFrame", "message": format!("not a command: {e}"), "detail": e.to_string() })
+}
+
+// ---------------------------------------------------------------------------
+// STATE: the runtime, the last discovery, the open sessions
+// ---------------------------------------------------------------------------
 
 /// Everything one `serve` call owns: the runtime, the last discovery, and
 /// the open sessions. `sessions` is `None` once the input has ended.
@@ -478,6 +535,10 @@ impl State {
     }
 }
 
+// ---------------------------------------------------------------------------
+// LINE HELPERS: parse one line in, write every line out
+// ---------------------------------------------------------------------------
+
 /// Splits a line into its id and command. A line that is not a command
 /// yields the id it carried, if any, so the app can match the error.
 fn parse(line: &str) -> Result<(u64, Cmd), (Option<u64>, Value)> {
@@ -485,34 +546,6 @@ fn parse(line: &str) -> Result<(u64, Cmd), (Option<u64>, Value)> {
     let id = value.get("id").and_then(Value::as_u64);
     let frame: Frame = serde_json::from_value(value).map_err(|e| (id, bad_frame(e)))?;
     Ok((frame.id, frame.cmd))
-}
-
-fn bad_frame(e: serde_json::Error) -> Value {
-    json!({ "kind": "BadFrame", "message": format!("not a command: {e}"), "detail": e.to_string() })
-}
-
-/// `kind`, `message`, and the variant's own fields, so nothing typed is lost.
-fn error_body(e: &AgentError) -> Value {
-    let (kind, mut body) = match e {
-        AgentError::NotInstalled(agent) => ("NotInstalled", json!({ "agent": agent })),
-        AgentError::SpawnFailed(d) => ("SpawnFailed", json!({ "detail": d })),
-        AgentError::AuthRequired { login } => ("AuthRequired", json!({ "login": login })),
-        AgentError::HandshakeTimeout => ("HandshakeTimeout", json!({})),
-        AgentError::UnsupportedFeature(d) => ("UnsupportedFeature", json!({ "detail": d })),
-        AgentError::InvalidConfiguration(d) => ("InvalidConfiguration", json!({ "detail": d })),
-        AgentError::InvalidRequest(d) => ("InvalidRequest", json!({ "detail": d })),
-        AgentError::ResumeFailed(d) => ("ResumeFailed", json!({ "detail": d })),
-        AgentError::SessionBusy => ("SessionBusy", json!({})),
-        AgentError::ProtocolFailed(d) => ("ProtocolFailed", json!({ "detail": d })),
-        AgentError::ProcessExited { status, stderr } => (
-            "ProcessExited",
-            json!({ "status": status, "stderr": stderr }),
-        ),
-        AgentError::SessionClosed => ("SessionClosed", json!({})),
-    };
-    body["kind"] = json!(kind);
-    body["message"] = json!(e.to_string());
-    body
 }
 
 /// The single writer: every line on the output goes through here, so
@@ -529,14 +562,9 @@ async fn write_lines(
     Ok(())
 }
 
-/// Every wire type in one JSON schema (draft 7), so each wrapper's types
-/// come from the same file: `cargo run --example schema --features schema`.
-#[cfg(feature = "schema")]
-pub fn schema() -> schemars::Schema {
-    schemars::generate::SchemaSettings::draft07()
-        .into_generator()
-        .into_root_schema_for::<Protocol>()
-}
+// ---------------------------------------------------------------------------
+// SCHEMA TYPES: the shapes the generated schema needs
+// ---------------------------------------------------------------------------
 
 /// The wire's entry points; each field puts one type under `definitions`.
 #[cfg(feature = "schema")]

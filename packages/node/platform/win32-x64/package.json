@@ -3,7 +3,7 @@
   "version": "0.0.3",
   "description": "The anyagent binary for Windows x64. Installed by the anyagent package; do not depend on it directly.",
   "license": "MIT OR Apache-2.0",
-  "repository": { "type": "git", "url": "https://github.com/spotta85/anyagent-rs", "directory": "packages/node/platform/win32-x64" },
+  "repository": { "type": "git", "url": "git+https://github.com/spotta85/anyagent-rs.git", "directory": "packages/node/platform/win32-x64" },
   "os": ["win32"],
   "cpu": ["x64"],
   "files": ["bin"]
