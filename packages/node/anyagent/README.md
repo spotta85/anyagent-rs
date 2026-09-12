@@ -11,28 +11,25 @@ npm install anyagent
 ```
 
 ```ts
-import { Runtime, kindOf } from "anyagent";
+import { Runtime, is } from "anyagent";
 
 const rt = await Runtime.start();
 const session = await rt.open("claude", { dir: process.cwd() });
 
 await session.prompt("explain this repo");
 for await (const ev of session.events()) {
-  switch (kindOf(ev)) {
-    case "TextDelta":
-      process.stdout.write(ev.kind.TextDelta.text);
-      break;
-    case "RequestOpened": {
-      const req = ev.kind.RequestOpened.Permission;
-      await session.answer(req.id, { Permission: "AllowOnce" });
-      break;
-    }
+  if (is(ev, "TextDelta")) process.stdout.write(ev.kind.TextDelta.text);
+  if (is(ev, "RequestOpened") && "Permission" in ev.kind.RequestOpened) {
+    await session.answer(ev.kind.RequestOpened.Permission.id, { Permission: "AllowOnce" });
   }
-  if (kindOf(ev) === "TurnEnded") break;
+  if (is(ev, "TurnEnded")) break;
 }
 await session.close();
 await rt.close();
 ```
+
+`is(ev, "TextDelta")` narrows `ev.kind` to that variant; `kindOf(ev)` gives
+the variant name for a `switch` or a log line.
 
 `session.info` and `session.status` stay current. A session error
 (`AuthRequired`, `ProcessExited`) throws from the `for await`; a reader that

@@ -115,15 +115,17 @@ echo '{"id": 1, "cmd": "discover"}' | ./target/debug/anyagent serve --mock packa
 | Go | `go get` | next |
 
 ```ts
-import { Runtime, kindOf } from "anyagent";
+import { Runtime, is } from "anyagent";
 
 const rt = await Runtime.start();
 const session = await rt.open("claude", { dir: process.cwd() });
 await session.prompt("explain this repo");
 for await (const ev of session.events()) {
-  if (kindOf(ev) === "TextDelta") process.stdout.write(ev.kind.TextDelta.text);
-  if (kindOf(ev) === "RequestOpened") await session.answer(ev.kind.RequestOpened.Permission.id, { Permission: "AllowOnce" });
-  if (kindOf(ev) === "TurnEnded") break;
+  if (is(ev, "TextDelta")) process.stdout.write(ev.kind.TextDelta.text);
+  if (is(ev, "RequestOpened") && "Permission" in ev.kind.RequestOpened) {
+    await session.answer(ev.kind.RequestOpened.Permission.id, { Permission: "AllowOnce" });
+  }
+  if (is(ev, "TurnEnded")) break;
 }
 await session.close();
 await rt.close();
@@ -132,14 +134,14 @@ await rt.close();
 `session.info` and `session.status` stay current; a session error throws
 from the `for await`; `rt.generate(agent, { dir }, prompt)` is one-shot
 text. `Runtime.start({ bin, mock })` runs the package over a mock script.
-Every package passes the same twenty tests: ten over the mock scripts on
-macOS, Linux, and Windows in CI, ten live on claude and codex.
+Every package passes the same twenty-one tests: eleven over the mock scripts
+on macOS, Linux, and Windows in CI, ten live on claude and codex.
 
 ## Writing a wrapper
 
 The wrapper is a pipe: spawn, write lines, route lines by `id` or
 `session_id`, buffer events per session. These rules keep every wrapper
-honest, and the same ten subprocess tests and ten live tests run in each.
+honest, and the same eleven subprocess tests and ten live tests run in each.
 
 | Rule | Why |
 |---|---|
@@ -152,3 +154,4 @@ honest, and the same ten subprocess tests and ten live tests run in each.
 | Offer `kindOf(event)` for both object and string forms of `kind` | Unit variants are strings |
 | Errors keep `kind`, `message`, and every extra field | Apps show the real login instructions |
 | Never interpret events beyond the second rule | Rules live in the crate |
+| Check the hello: a first line that is not a frame, or another `protocol`, fails start with `ProtocolFailed` and kills the binary | A wrong `ANYAGENT_BIN` must neither hang nor crash the app |

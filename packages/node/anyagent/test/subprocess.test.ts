@@ -1,4 +1,4 @@
-// S1–S10 from ticket 13: the wrapper against `anyagent serve --mock`.
+// S1–S11 from ticket 13: the wrapper against `anyagent serve --mock`.
 // Needs a mock-enabled binary: `cargo build --features mock` (or ANYAGENT_BIN).
 
 import { test, type TestContext } from "node:test";
@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
-import { AnyagentError, Runtime, Session, kindOf } from "../src/index.ts";
+import { AnyagentError, Runtime, Session, is, kindOf } from "../src/index.ts";
 import type { Event } from "../src/types.ts";
 
 const ROOT = join(import.meta.dirname, "../../../..");
@@ -41,7 +41,7 @@ async function until(session: Session, kind: string): Promise<Event[]> {
 }
 
 function texts(events: Event[]): string[] {
-  return events.flatMap((ev) => (typeof ev.kind === "object" && "TextDelta" in ev.kind ? [ev.kind.TextDelta.text] : []));
+  return events.flatMap((ev) => (is(ev, "TextDelta") ? [ev.kind.TextDelta.text] : []));
 }
 
 async function rejects(p: Promise<unknown>, kind: string): Promise<AnyagentError> {
@@ -188,4 +188,14 @@ test("S10 configure sends `option` and SessionUpdated updates info", async (t) =
   await until(session, "SessionUpdated");
   assert.equal(session.info.configuration.options["model"], "opus");
   await rt.close();
+});
+
+test("S11 a binary that does not speak the protocol fails start with ProtocolFailed", async () => {
+  // node stands in for the binary: it prints one stdout line, then exits.
+  const speaks = (line: string) => ({
+    bin: process.execPath,
+    env: { ...process.env, NODE_OPTIONS: `--import=data:text/javascript,process.stdout.write(${line}+'\\n',()=>process.exit())` },
+  });
+  await rejects(Runtime.start(speaks("'nope'")), "ProtocolFailed");
+  await rejects(Runtime.start(speaks("JSON.stringify({hello:{protocol:99,anyagent:'x'}})")), "ProtocolFailed");
 });

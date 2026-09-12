@@ -61,7 +61,7 @@ jobs:
           name: release
           path: dist/*
       - if: startsWith(github.ref, 'refs/tags/')
-        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes || gh release upload "$GITHUB_REF_NAME" dist/* --clobber
         env:
           GH_TOKEN: ${{ github.token }}
 
@@ -79,7 +79,7 @@ jobs:
         with:
           name: release
           path: dist
-      - name: Each binary into its platform package, then publish all six
+      - name: Each binary into its platform package, then publish all six (a rerun skips versions already on npm)
         working-directory: packages/node
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -90,5 +90,7 @@ jobs:
           cp ../../dist/anyagent-aarch64-unknown-linux-gnu platform/linux-arm64/bin/anyagent
           cp ../../dist/anyagent-x86_64-pc-windows-msvc.exe platform/win32-x64/bin/anyagent.exe
           chmod +x platform/*/bin/anyagent*
-          for p in platform/*/; do (cd "$p" && npm publish --access public); done
-          cd anyagent && npm ci && npm run build && npm publish --access public
+          (cd anyagent && npm ci && npm run build)
+          for p in platform/*/ anyagent/; do
+            (cd "$p" && npm view "$(jq -r '.name + "@" + .version' package.json)" version >/dev/null 2>&1 || npm publish --access public)
+          done

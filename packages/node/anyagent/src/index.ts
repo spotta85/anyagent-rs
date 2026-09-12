@@ -1,6 +1,6 @@
 // The anyagent binary as a TypeScript API: spawn `anyagent serve`, write
 // command lines, route reply and event lines. Every rule lives in the
-// binary; this file is a pipe (ticket 13, W1–W9).
+// binary; this file is a pipe (ticket 13, W1–W10).
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { createRequire } from "node:module";
@@ -43,6 +43,9 @@ export interface StartOptions {
 
 type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void; settle?: (ok: unknown) => unknown };
 
+/** The wire protocol this package speaks; the binary's hello must match. */
+const PROTOCOL = 1;
+
 /** One `anyagent serve` process. */
 export class Runtime {
   private child!: ChildProcess;
@@ -60,7 +63,7 @@ export class Runtime {
     rt.child = spawn(resolveBinary(opts.bin), args, { stdio: ["pipe", "pipe", "inherit"], env: opts.env });
     rt.child.stdin!.on("error", () => {}); // EPIPE after death; onExit reports it
     createInterface({ input: rt.child.stdout! }).on("line", (line) => rt.onLine(line));
-    rt.exited = new Promise((resolve) => rt.child.once("exit", (code) => resolve(code)));
+    rt.exited = new Promise((resolve) => rt.child.once("close", (code) => resolve(code))); // after stdout drains
     rt.exited.then((code) => rt.onExit(code)); // W4
     const hello = new Promise<void>((resolve, reject) => {
       rt.onHello = resolve;
@@ -115,8 +118,16 @@ export class Runtime {
 
   /** Routes one stdout line. Synchronous on purpose: W1 depends on it. */
   private onLine(line: string) {
-    const msg = JSON.parse(line);
-    if ("hello" in msg) return this.onHello?.();
+    if (this.dead) return;
+    let msg: Record<string, any> | undefined;
+    try {
+      msg = JSON.parse(line);
+    } catch {}
+    if (!msg || typeof msg !== "object") return this.abort(`not a frame: ${line}`);
+    if ("hello" in msg) {
+      if (msg.hello.protocol !== PROTOCOL) return this.abort(`protocol ${msg.hello.protocol}, this package speaks ${PROTOCOL}`);
+      return this.onHello?.();
+    }
     if (typeof msg.id === "number") {
       const p = this.pending.get(msg.id);
       this.pending.delete(msg.id);
@@ -132,9 +143,15 @@ export class Runtime {
     }
   }
 
+  /** A binary that does not speak the protocol (W10): kill it; onExit fails the rest. */
+  private abort(why: string) {
+    this.dead = new AnyagentError({ kind: "ProtocolFailed", message: why });
+    this.child.kill();
+  }
+
   /** Process gone: fail everything still waiting (W4). */
   private onExit(code: number | null) {
-    this.dead = new AnyagentError({ kind: "ProcessExited", message: `anyagent exited (${code})`, status: String(code), stderr: "" });
+    this.dead ??= new AnyagentError({ kind: "ProcessExited", message: `anyagent exited (${code})`, status: String(code), stderr: "" });
     for (const p of this.pending.values()) p.reject(this.dead);
     this.pending.clear();
     for (const s of this.sessions.values()) s.fail(this.dead);
@@ -244,6 +261,11 @@ export class Session {
 /** The variant name of `event.kind`, for both `{TextDelta: {..}}` and `"ContextCompacted"` (W7). */
 export function kindOf(ev: Event): EventKindName {
   return (typeof ev.kind === "string" ? ev.kind : Object.keys(ev.kind)[0]) as EventKindName;
+}
+
+/** Narrows to one variant: `if (is(ev, "TextDelta")) ev.kind.TextDelta.text` (W7). */
+export function is<K extends EventKindName>(ev: Event, kind: K): ev is Event & { kind: Extract<EventKind, K | Record<K, unknown>> } {
+  return kindOf(ev) === kind;
 }
 
 /** `kind`, `message`, and every extra field from the wire in `data` (W8). */
