@@ -1,0 +1,30 @@
+{
+  "name": "anyagent",
+  "version": "0.0.2",
+  "description": "One API over the coding agents installed on a machine: Claude Code, Codex, Cursor, and more.",
+  "license": "MIT OR Apache-2.0",
+  "repository": { "type": "git", "url": "https://github.com/spotta85/anyagent-rs", "directory": "packages/node/anyagent" },
+  "homepage": "https://anyagent.mintlify.site/sidecar",
+  "type": "module",
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "files": ["dist"],
+  "engines": { "node": ">=22.6" },
+  "scripts": {
+    "types": "json2ts ../../schema.json -o src/types.ts --additionalProperties false --bannerComment '/* Generated from packages/schema.json by npm run types. Do not edit. */'",
+    "build": "tsc",
+    "test": "node --test --test-timeout 30000 test/subprocess.test.ts",
+    "live": "node --test --test-timeout 120000 test/live.test.ts"
+  },
+  "optionalDependencies": {
+    "@anyagent/darwin-arm64": "0.0.2",
+    "@anyagent/darwin-x64": "0.0.2",
+    "@anyagent/linux-x64": "0.0.2",
+    "@anyagent/linux-arm64": "0.0.2",
+    "@anyagent/win32-x64": "0.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "json-schema-to-typescript": "^15",
+    "typescript": "^5.7"
+  }
+}

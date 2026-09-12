@@ -1,6 +1,6 @@
 {"turns": [[
-  {"Repeat": {"times": 200, "steps": [
-    {"Repeat": {"times": 100, "steps": [{"Emit": {"TextDelta": {"message_id": "m1", "text": "x"}}}]}},
+  {"Repeat": {"times": 400, "steps": [
+    {"Repeat": {"times": 50, "steps": [{"Emit": {"TextDelta": {"message_id": "m1", "text": "x"}}}]}},
     {"Sleep": 10}
   ]}},
   {"End": {"Completed": {"source": "Protocol"}}}

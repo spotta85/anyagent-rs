@@ -112,9 +112,14 @@ async fn handle(state: &State, cmd: Cmd) -> Result<Reply, Fail> {
             let agent = state.resolve(agent).await?;
             Reply::ok(state.runtime.plan_usage(&agent).await?)
         }
-        Cmd::Generate { agent, dir, prompt } => {
+        Cmd::Generate {
+            agent,
+            dir,
+            prompt,
+            options,
+        } => {
             let agent = state.resolve(agent).await?;
-            let options = SessionOptions::in_dir(dir);
+            let options = options.into_session_options(dir);
             Reply::ok(state.runtime.generate(&agent, options, prompt).await?)
         }
         Cmd::Open {
@@ -244,6 +249,8 @@ enum Cmd {
         agent: AgentRef,
         dir: PathBuf,
         prompt: String,
+        #[serde(flatten)]
+        options: OpenOptions,
     },
     Open {
         agent: AgentRef,
@@ -310,7 +317,8 @@ struct AcpSpec {
     args: Vec<String>,
 }
 
-/// The `SessionOptions` the wire exposes, as top-level fields of `open`.
+/// The `SessionOptions` the wire exposes, as top-level fields of `open`
+/// and `generate`.
 #[derive(Deserialize, Default)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 struct OpenOptions {
