@@ -130,6 +130,7 @@ mod event;
 mod process;
 mod runtime;
 mod session;
+pub mod sidecar;
 #[cfg(test)]
 #[path = "../tests/common/mod.rs"]
 mod testutil;

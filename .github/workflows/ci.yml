@@ -19,5 +19,5 @@ jobs:
         with:
           node-version: "22"
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --locked
+      - run: cargo clippy --all-targets --locked --features schema -- -D warnings
+      - run: cargo test --locked --features schema

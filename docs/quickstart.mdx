@@ -72,15 +72,17 @@ close()     →  ends the process
 you can prompt from one task while another drains `Events`.
 </Note>
 
-## Run the examples
+## Try it from a terminal
 
-The repo's [`examples/`](https://github.com/spotta85/anyagent-rs/tree/main/examples)
-folder has three small programs that run against the agents on your machine:
+The crate ships a binary. `list` and `chat` are the same calls as above,
+and their source is
+[`src/bin/anyagent.rs`](https://github.com/spotta85/anyagent-rs/blob/main/src/bin/anyagent.rs).
 
 ```bash
-cargo run --example chat -- claude      # prompt, stream, answer, steer
+cargo install anyagent
+anyagent list                           # what's installed, logged in, and capable
+anyagent chat claude                    # prompt, stream, answer, steer
 cargo run --example sessions -- claude  # several sessions at once, then resume
-cargo run --example probe               # what's installed, logged in, and capable
 ```
 
 ## Next

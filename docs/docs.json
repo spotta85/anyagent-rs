@@ -43,7 +43,8 @@
           "core-api",
           "features",
           "agents",
-          "building-an-app"
+          "building-an-app",
+          "sidecar"
         ]
       },
       {

@@ -69,17 +69,19 @@ token usage, permission requests, subagents, and turn boundaries — the same
 `EventKind`s for every agent. Anything provider-specific rides in
 `extensions` instead of leaking into the types.
 
-## Examples
+## Try it from a terminal
 
-[`examples/`](examples/) is the tour — small, commented programs that run
-against the agents on your machine:
+```bash
+cargo install anyagent
+anyagent list           # installed agents: login state, models, capabilities
+anyagent chat claude    # prompt, stream, permissions allowed, /set model sonnet
+```
 
-- [`chat.rs`](examples/chat.rs) — the core loop: prompt, stream events,
-  answer permissions. Typing mid-turn steers the running turn.
-- [`sessions.rs`](examples/sessions.rs) — several sessions at once, then
-  resuming one by token.
-- [`probe.rs`](examples/probe.rs) — discover installed agents and probe
-  their login state, models, commands, and capabilities.
+`anyagent serve` speaks the same API as JSON lines over stdin and stdout,
+for apps in other languages. The source of `chat` and `list` is
+[`src/bin/anyagent.rs`](src/bin/anyagent.rs);
+[`examples/sessions.rs`](examples/sessions.rs) shows several sessions at
+once and resuming one by token.
 
 ## Supported agents
 
@@ -114,6 +116,7 @@ Using an AI agent to build on anyagent? Point it at one of these:
 | [Agents](https://anyagent.mintlify.site/agents) | Catalog, capability matrix, per-agent quirks, custom ACP agents |
 | [Building an app](https://anyagent.mintlify.site/building-an-app) | Step-by-step chat app: threads, permissions, settings, persistence, usage |
 | [Architecture](https://anyagent.mintlify.site/architecture) | Layers, the engine/adapter seam, adding an agent |
+| [Binary and sidecar](https://anyagent.mintlify.site/sidecar) | `anyagent list` / `chat` / `serve`; the JSON-lines protocol and schema for other languages |
 
 Generated API reference, every type and signature: [docs.rs/anyagent](https://docs.rs/anyagent).
 

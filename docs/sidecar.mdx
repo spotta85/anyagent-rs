@@ -1,0 +1,124 @@
+---
+title: "Binary and sidecar"
+description: "anyagent list, anyagent chat, and anyagent serve: the crate's API as JSON lines, for apps in any language."
+icon: "terminal"
+---
+
+## The binary
+
+```bash
+cargo install anyagent
+anyagent list            # installed agents: login state, models, commands, capabilities
+anyagent chat claude     # prompt, stream, permissions allowed; /set model sonnet
+anyagent serve           # the API as JSON lines on stdin and stdout
+echo "one-line title for this diff" | anyagent chat codex   # one turn, then exits
+```
+
+`list` and `chat` are for a terminal. `serve` is for an app: it speaks the
+same `Runtime` and `Session` calls as one JSON object per line, so a
+TypeScript, Python, Swift, or Go app spawns the binary and talks to it.
+The crate stays the only place with logic.
+
+```text
+your app ──stdin──►  anyagent serve  ──►  anyagent crate  ──►  claude / codex / acp agents
+your app ◄─stdout──  replies · events · session errors · closed
+```
+
+## Frames
+
+Six shapes. Every command carries an `id` you choose; its reply carries
+the same `id` back, so several commands can be in flight.
+
+| Direction | Frame | When |
+|---|---|---|
+| out | `{"hello": {"protocol": 1, "anyagent": "0.0.2"}}` | first line |
+| in | `{"id": 1, "cmd": "open", "agent": "claude", "dir": "."}` | any command |
+| out | `{"id": 1, "ok": {..SessionInfo..}}` | the command's result |
+| out | `{"id": 1, "error": {"kind": "AuthRequired", "message": "..", "login": [..]}}` | it failed |
+| out | `{"event": {..Event..}}` | one per event; `event.session_id` names the session |
+| out | `{"session": "s1", "error": {..}}` | that session's stream failed; `closed` follows |
+| out | `{"closed": "s1"}` | that session's stream ended |
+
+Events are the crate's own serialization, unchanged: `{"kind": {"TextDelta":
+{"message_id": "m1", "text": "hi"}}}`, and a unit variant is a bare string,
+`{"kind": "ContextCompacted"}`.
+
+What the sidecar guarantees:
+
+- The `ok` reply to `open` is written before any frame for that session.
+- Frames for one session keep the crate's `sequence` order; sessions interleave.
+- A session error is terminal: `closed` follows it, after the engine's last bookkeeping events.
+- `closed` is written exactly once per opened session.
+- EOF on stdin closes every open session, even one whose `open` was still in flight, writes their `closed`, and exits 0. Closing is "close stdin, wait". A stdout that stops accepting writes ends `serve` with that error.
+- A line that is not a command gets `{"id": null, "error": {"kind": "BadFrame", ..}}` and the loop continues.
+- The reader must keep up. A session whose events are not read within 1024 of production is closed by the crate, the same rule a Rust caller lives with.
+
+## Commands
+
+One command per public call. `agent` is a catalog id such as `"claude"`;
+a custom ACP agent is `{"acp": {"name": "..", "path": "..", "args": [..]}}`.
+
+| cmd | fields | ok |
+|---|---|---|
+| `discover` | | `DiscoveryReport` |
+| `probe`, `plan_usage` | agent | `AgentDetails`, `PlanUsage` |
+| `generate` | agent, dir, prompt | string |
+| `open` | agent, dir, resume?, fork?, fork_at?, permission_mode?, mcp_servers?, configure? | `SessionInfo` |
+| `prompt` | session, text, attachments? | `Delivery` |
+| `answer` | session, request, answer | null |
+| `configure` | session, option, value | null |
+| `cancel` | session, clear_queue? | null |
+| `rollback` | session, turns, scope | null |
+| `dequeue` | session, prompt | null |
+| `compact`, `close` | session | null |
+| `info` | session | `SessionInfo` |
+
+An error body is `kind`, `message`, and the variant's own fields: `agent`
+for `NotInstalled`, `login` for `AuthRequired`, `status` and `stderr` for
+`ProcessExited`, `detail` for the rest. Two kinds are the sidecar's own:
+`BadFrame` and `UnknownSession` (with `session`). A command on a closed
+session gets the crate's `SessionClosed`.
+
+## Types for other languages
+
+`packages/schema.json` is a JSON schema (draft 7) of every wire type,
+generated from the Rust types with `just schema` and checked by
+`tests/schema.rs`. The command type is `Frame`; every output line is a
+`Line`; events are `Event` and `EventKind`; errors are `ErrorBody`. Feed it
+to a generator:
+
+```bash
+npx json-schema-to-typescript packages/schema.json      # TypeScript
+datamodel-codegen --input packages/schema.json           # Python TypedDicts
+quicktype packages/schema.json --lang swift              # Swift
+```
+
+## Testing an app without agents
+
+A build with `--features mock` accepts `serve --mock <script.json>`: the
+real engine over a scripted agent. The scripts every wrapper's tests use
+are in `packages/mock-scripts/`, with a README mapping each test case to
+its file.
+
+```bash
+cargo build --features mock
+echo '{"id": 1, "cmd": "discover"}' | ./target/debug/anyagent serve --mock packages/mock-scripts/turn.json
+```
+
+## Writing a wrapper
+
+The wrapper is a pipe: spawn, write lines, route lines by `id` or
+`session_id`, buffer events per session. These rules keep every wrapper
+honest, and the same ten subprocess tests and ten live tests run in each.
+
+| Rule | Why |
+|---|---|
+| Register a session inside the line reader, before the next line is read | Buffered lines can arrive before an awaiting `open()` resumes |
+| Keep `session.info` and `status` live from `SessionUpdated` and `StatusChanged` | Capability checks go stale after `configure` |
+| A session error makes that session's iterator raise, then end; `closed` ends it cleanly | Apps see `AuthRequired` and `ProcessExited` where they read |
+| Process death rejects every pending call and fails every iterator with `ProcessExited` | No hanging promises |
+| `close()` is graceful and idempotent: close stdin, wait up to 5 s, then kill | The sidecar closes sessions on EOF |
+| Per-session queues cap at 4096; past it, fail the session with `ConsumerLagged` and close it. Never pause reading stdout | One slow consumer must not stall the others; memory stays bounded |
+| Offer `kindOf(event)` for both object and string forms of `kind` | Unit variants are strings |
+| Errors keep `kind`, `message`, and every extra field | Apps show the real login instructions |
+| Never interpret events beyond the second rule | Rules live in the crate |

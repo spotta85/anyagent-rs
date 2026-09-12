@@ -45,6 +45,7 @@ changing code that calls anyagent:
 | Catalog, capability matrix, per-agent quirks, custom ACP agents | https://anyagent.mintlify.site/agents.md |
 | Threads, streaming, persistence in a real app | https://anyagent.mintlify.site/building-an-app.md |
 | Codebase map, adding an agent adapter | https://anyagent.mintlify.site/architecture.md |
+| The binary, and the JSON-lines sidecar for apps in other languages | https://anyagent.mintlify.site/sidecar.md |
 | Full signatures | https://docs.rs/anyagent |
 | Every page, one list | https://anyagent.mintlify.site/llms.txt |
 

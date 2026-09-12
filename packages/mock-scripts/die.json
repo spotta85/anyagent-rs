@@ -1,0 +1,4 @@
+{"turns": [[
+  {"Emit": {"TextDelta": {"message_id": "m1", "text": "hi"}}},
+  "Die"
+]]}

@@ -205,7 +205,7 @@ the catalog's verified quirks: launch flags, login commands, auth error hints.
 Every catalog entry reads `ANYAGENT_<AGENT>_BIN` first:
 
 ```bash
-ANYAGENT_CLAUDE_BIN=/path/to/claude cargo run --example probe
+ANYAGENT_CLAUDE_BIN=/path/to/claude anyagent list
 ```
 
 Or skip discovery with `AgentInstallation::at(id, executable)`.

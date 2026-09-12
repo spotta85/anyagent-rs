@@ -49,6 +49,7 @@ static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
 /// Snapshot of a live session. Also carried by `EventKind::SessionUpdated`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionInfo {
     pub id: SessionId,
     pub agent: AgentInstallation,
@@ -65,6 +66,7 @@ pub struct SessionInfo {
 /// What a UI should show for the session right now. Changes arrive as
 /// `EventKind::StatusChanged`; `Session::status` reads it without the stream.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum SessionStatus {
     /// No turn running and nothing queued.

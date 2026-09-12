@@ -25,6 +25,7 @@ pub type Extensions = BTreeMap<String, serde_json::Value>;
 
 /// One normalized event produced by anyagent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Event {
     /// Starts at 1 and increases for every session event.
     pub sequence: u64,
@@ -48,6 +49,7 @@ fn unix_epoch() -> SystemTime {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TurnContext {
     pub id: TurnId,
     /// Present for events produced by a subagent spawned from this tool call.
@@ -55,6 +57,7 @@ pub struct TurnContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum EventKind {
     TurnStarted {
@@ -115,6 +118,7 @@ pub enum EventKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum TurnOrigin {
     Prompt(PromptId),
@@ -122,6 +126,7 @@ pub enum TurnOrigin {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum StopReason {
     Completed { source: CompletionSource },
@@ -131,6 +136,7 @@ pub enum StopReason {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum CompletionSource {
     /// The provider protocol explicitly ended the turn.
@@ -145,6 +151,7 @@ pub enum CompletionSource {
 
 /// Cumulative snapshot of one tool call.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ToolUpdate {
     pub id: ToolId,
     pub kind: ToolKind,
@@ -159,6 +166,7 @@ pub struct ToolUpdate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum ToolKind {
     Read,
@@ -179,6 +187,7 @@ pub enum ToolKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum ToolStatus {
     Pending,
@@ -196,6 +205,7 @@ impl ToolStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum ToolInput {
     Path(PathBuf),
@@ -211,12 +221,14 @@ pub enum ToolInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RawTool {
     pub name: String,
     pub input: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FileDiff {
     pub path: PathBuf,
     /// `None` means a new file.
@@ -225,12 +237,14 @@ pub struct FileDiff {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PlanEntry {
     pub text: String,
     pub status: PlanStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum PlanStatus {
     Pending,
@@ -245,6 +259,7 @@ pub enum PlanStatus {
 /// Something the agent is waiting on the caller for. Answer once with
 /// `Session::answer`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 // Public request records stay by value; boxing would move allocation to callers.
 #[allow(clippy::large_enum_variant)]
@@ -264,6 +279,7 @@ impl Request {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PermissionRequest {
     pub id: RequestId,
     /// The tool call awaiting approval, as the app already saw it.
@@ -274,6 +290,7 @@ pub struct PermissionRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum PermissionChoice {
     AllowOnce,
@@ -283,12 +300,14 @@ pub enum PermissionChoice {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct QuestionRequest {
     pub id: RequestId,
     pub questions: Vec<Question>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Question {
     pub id: QuestionId,
     pub text: String,
@@ -300,6 +319,7 @@ pub struct Question {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Choice {
     pub id: ChoiceId,
     pub label: String,
@@ -307,6 +327,7 @@ pub struct Choice {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum Answer {
     Permission(PermissionChoice),
@@ -315,6 +336,7 @@ pub enum Answer {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum QuestionAnswer {
     Choices(Vec<ChoiceId>),
     Text(String),
@@ -326,6 +348,7 @@ pub enum QuestionAnswer {
 
 /// Plan quota windows for the logged-in account.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PlanUsage {
     /// The plan the quota belongs to ("max", "edu"), when the agent names it.
     pub plan: Option<String>,
@@ -334,6 +357,7 @@ pub struct PlanUsage {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UsageWindow {
     /// "Session" (5h), "Week", or an agent-provided label.
     pub label: String,
@@ -342,12 +366,14 @@ pub struct UsageWindow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Diagnostic {
     pub level: DiagnosticLevel,
     pub message: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum DiagnosticLevel {
     Info,
@@ -357,6 +383,7 @@ pub enum DiagnosticLevel {
 
 /// Immediate result of submitting a prompt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Delivery {
     /// Stable across immediate delivery and later queue promotion.
     pub prompt_id: PromptId,
@@ -364,6 +391,7 @@ pub struct Delivery {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub enum DeliveryKind {
     Started {

@@ -377,6 +377,7 @@ pub struct AgentPlanUsage {
 
 /// What `discover` found and what it could not read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DiscoveryReport {
     pub agents: Vec<AgentInstallation>,
     /// Known agents that were not found, with where we looked and how to
@@ -397,6 +398,7 @@ impl DiscoveryReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MissingAgent {
     pub id: AgentId,
     pub name: String,
